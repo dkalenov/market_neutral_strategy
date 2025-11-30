@@ -198,3 +198,24 @@ Altcoins show a **strong dependence** on BTC — they mostly move in the same di
 Therefore, analyzing **beta** neutrality should be done on **pairs**, not on single coins.
 
 
+
+
+
+
+### 2 Position Sizing
+
+Based on the **identified cointegrated pairs** and the computed statistical parameters  
+(β — hedge ratio, z-score — deviation from equilibrium),  
+we can generate **market-neutral long/short trading signals**.
+
+The pipeline proceeds as follows:
+- **Volatility-based Position Sizing**
+- **Quantity Conversion**
+
+Calculates USD allocations for both legs of a pair using inverse realized volatility
+over a rolling window. Ensures that both sides contribute equally to total risk
+(“volatility parity” principle). 
+
+Converts dollar allocations into trade quantities while enforcing
+a maximum notional exposure per pair (e.g., 5% of capital).
+Prevents over-leverage and keeps exposure consistent.
