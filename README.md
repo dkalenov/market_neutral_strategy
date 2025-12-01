@@ -219,3 +219,34 @@ over a rolling window. Ensures that both sides contribute equally to total risk
 Converts dollar allocations into trade quantities while enforcing
 a maximum notional exposure per pair (e.g., 5% of capital).
 Prevents over-leverage and keeps exposure consistent.
+
+
+
+### 3 Data Preparation and Log Transformation
+
+Since this strategy operates over **hundreds of trading pairs** and **long historical periods**, it is computationally expensive to repeatedly load and preprocess raw price data.  
+
+To make large-scale tests efficient, the data is **cached once** in a compact binary format. During research or parameter tuning, this cached version allows much faster access.  
+
+In live or production environments, however, data can be **fetched and transformed on the fly** directly from the exchange.
+
+
+The data preparation workflow includes:
+
+1. **Loading and Pivoting**  
+   Read the raw CSV (with `Date`, `Symbol`, `Close`) and reshape it into a matrix  
+   where each column corresponds to a symbol and each row to a timestamp.
+
+2. **Logarithmic Transformation**  
+   Apply `log(price)` to stabilize variance and make returns additive.  
+   Small shifts are added to handle zero or negative prices safely.
+
+3. **Caching for Efficiency**  
+   Store the processed arrays (`symbols`, `dates`, `logmat`, and `shifts`)  
+   into a compressed `.npz` file.  
+   This one-time operation significantly reduces preprocessing time  
+   when scanning thousands of pairs across rolling windows.
+
+This cached log matrix serves as the foundation for all subsequent  
+cointegration testing, rolling window evaluation, and multi-process analysis.
+
