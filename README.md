@@ -250,3 +250,16 @@ The data preparation workflow includes:
 This cached log matrix serves as the foundation for all subsequent  
 cointegration testing, rolling window evaluation, and multi-process analysis.
 
+
+### 4 Sequential search and signal generation
+
+Rolling Window Scanning
+
+After defining the core analytical functions for pair selection, signal generation, and position sizing, the next stage is to **run a large-scale search** across all possible symbol combinations. This process identifies which pairs are **statistically valid and tradable** under different market regimes.
+
+
+Instead of testing the entire history at once, it's better to use **rolling time windows** — each representing a local market period.  
+
+For every window, we check cointegration strength, estimate the hedge ratio, compute z-scores, and evaluate market neutrality (β to BTC).  
+
+This approach helps capture pairs that are **temporarily cointegrated** and detect when relationships **break down or reappear**.
