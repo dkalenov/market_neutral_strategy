@@ -263,3 +263,7 @@ Instead of testing the entire history at once, it's better to use **rolling time
 For every window, we check cointegration strength, estimate the hedge ratio, compute z-scores, and evaluate market neutrality (β to BTC).  
 
 This approach helps capture pairs that are **temporarily cointegrated** and detect when relationships **break down or reappear**.
+
+
+<img width="1590" height="1180" alt="image" src="https://github.com/user-attachments/assets/96d1f0b1-d6b8-4bd8-b0a7-ac2cd250a9fd" />
+
