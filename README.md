@@ -265,5 +265,26 @@ For every window, we check cointegration strength, estimate the hedge ratio, com
 This approach helps capture pairs that are **temporarily cointegrated** and detect when relationships **break down or reappear**.
 
 
-<img width="1590" height="1180" alt="image" src="https://github.com/user-attachments/assets/96d1f0b1-d6b8-4bd8-b0a7-ac2cd250a9fd" />
+
+
+<img width="2400" height="1800" alt="image" src="https://github.com/user-attachments/assets/28f94620-dab9-4721-a3e8-eef8f703ecd5" />
+
+
+
+
+
+**Observations**
+
+Both assets move together early, then diverge sharply around June 13 — the basis for a trade entry.
+BTC (orange) drops slightly during this time, but its trend does not align with the spread movement.
+The normalized prices show clear mean reversion independent of BTC.
+Z-score falls below −2 (entry), then reverts to 0 — a typical stationary spread.
+
+Conclusion
+- Beta to BTC is close to 0 → almost market-neutral.
+- Spread behavior driven by internal price divergence, not by BTC’s trend.
+- Z-score evolution confirms cointegration and mean reversion.
+
+The pair acts independently from BTC — a good example of a market-neutral, stationary relationship.
+
 
