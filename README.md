@@ -280,6 +280,7 @@ BTC (orange) drops slightly during this time, but its trend does not align with 
 The normalized prices show clear mean reversion independent of BTC.
 Z-score falls below −2 (entry), then reverts to 0 — a typical stationary spread.
 
+
 Conclusion
 - Beta to BTC is close to 0 → almost market-neutral.
 - Spread behavior driven by internal price divergence, not by BTC’s trend.
@@ -287,4 +288,15 @@ Conclusion
 
 The pair acts independently from BTC — a good example of a market-neutral, stationary relationship.
 
+
+
+The backtest represents a **simplified historical simulation** designed to evaluate signal performance under fixed entry and exit conditions.  
+The framework does **not** employ rolling windows or dynamic recalculation of cointegration relationships — all tested pairs are assumed to remain stable throughout the backtest period.  
+
+Trade logic is intentionally basic:  
+- **Entries and exits** are based solely on static Z-score thresholds.  
+- **No partial position closures**, stop or target adjustments, or dynamic position resizing are implemented.  
+- **No adaptive cointegration updates** or rolling parameter recalibrations are performed.
+
+Therefore, the results should be interpreted as a **baseline statistical validation** of the trading logic, rather than a fully dynamic or execution-accurate trading system.
 
