@@ -300,3 +300,24 @@ Trade logic is intentionally basic:
 
 Therefore, the results should be interpreted as a **baseline statistical validation** of the trading logic, rather than a fully dynamic or execution-accurate trading system.
 
+
+**Backtest summary**
+
+- CAGR: 3.53%
+- MDD: −0.90%
+- CAGR/MDD: 3.92
+- Sharpe: 1.92
+- Total trades: 50
+- Win rate: 54.2%
+- Final equity: 1,050,520  
+- Beta: -0.000754
+
+
+
+The strategy exhibits stable, low-volatility performance with minimal drawdowns and moderate annualized returns. Risk-adjusted metrics (Sharpe ≈ 1.9, CAGR/MDD ≈ 3.9) indicate strong efficiency and controlled exposure. The system behaves as a conservative market-neutral (Beta close to 0) model with consistent trade frequency and balanced win/loss distribution.
+
+However, the headline figures are likely slightly inflated due to optimistic assumptions on transaction costs, execution latency, and potential minor accounting biases. Further validation with corrected cost modeling, out-of-sample data, and robustness checks is recommended.
+
+Conclusion:
+Overall performance is solid and consistent with a mean-reversion pairs trading framework, offering stable returns and strong downside protection. The strategy can serve as a low-risk portfolio component but requires verification of execution realism and parameter robustness before live deployment.
+
