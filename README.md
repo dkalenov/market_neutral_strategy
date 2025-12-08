@@ -321,3 +321,7 @@ However, the headline figures are likely slightly inflated due to optimistic ass
 Conclusion:
 Overall performance is solid and consistent with a mean-reversion pairs trading framework, offering stable returns and strong downside protection. The strategy can serve as a low-risk portfolio component but requires verification of execution realism and parameter robustness before live deployment.
 
+
+<img width="1588" height="790" alt="image" src="https://github.com/user-attachments/assets/5653d243-2f53-4b47-b8a3-75683954de93" />
+
+
