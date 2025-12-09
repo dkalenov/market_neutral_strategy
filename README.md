@@ -325,3 +325,6 @@ Overall performance is solid and consistent with a mean-reversion pairs trading 
 <img width="1588" height="790" alt="image" src="https://github.com/user-attachments/assets/5653d243-2f53-4b47-b8a3-75683954de93" />
 
 
+
+<img width="1585" height="789" alt="image" src="https://github.com/user-attachments/assets/12128531-86e6-44eb-98de-700ec148bed1" />
+
