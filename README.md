@@ -334,3 +334,33 @@ Overall performance is solid and consistent with a mean-reversion pairs trading 
 
 <img width="1589" height="789" alt="image" src="https://github.com/user-attachments/assets/5c03410c-b025-4abf-a75d-99d9e15e517a" />
 
+---
+
+The implemented system represents a **market-neutral pairs trading strategy** based on **cointegration analysis**.  
+Its core principle lies in identifying asset pairs which prices move together in a statistically stable relationship and exploiting temporary deviations (Z-score divergences) from their equilibrium. When the spread widens beyond a set threshold, the stategy allows to open a long/short position expecting mean reversion, closing the trade once equilibrium is restored.
+
+**Strategy Overview**
+- **Market neutrality:** Positions are balanced between correlated assets, minimizing exposure to overall market direction (beta ≈ 0).  
+- **Statistical foundation:** Entry signals are derived from rigorous cointegration and stationarity tests (ADF, correlation, Hurst exponent).  
+- **Controlled risk:** The strategy maintains low volatility, shallow drawdowns (MDD ≈ –0.9%), and stable performance (Sharpe ≈ 1.9).  
+- **Consistency:** Over 500 trades, results demonstrate robustness and reliability, with CAGR ≈ 3.5% and limited equity fluctuations.
+
+**Possible Improvements**
+1. **Dynamic cointegration updates:** Recalculate metrics using rolling windows to capture regime shifts.  
+2. **Adaptive position management:** Implement partial exits, trailing stops, and profit reallocation to enhance efficiency.  
+3. **Volatility- or correlation-weighted sizing:** Improve capital allocation by dynamically adjusting trade weights.  
+4. **Transaction cost modeling:** Incorporate more realistic slippage, fees, and funding costs.    
+5. **Portfolio optimization layer:** Combine multiple stable pairs to optimize risk/return balance.
+6. **Multi-timeframe analysis:** Test the strategy across several time horizons (e.g., 1h, 4h, daily) to identify time-dependent stability or mean-reversion strength.
+7. **Factor and macro-filtering:** Incorporate market-wide factors such as volatility indices, BTC dominance, or total crypto market capitalization to filter trades during unstable market regimes.  
+8. **Multi-asset cointegration:** Explore potential cointegration relationships involving three or more assets simultaneously. However, such higher-dimensional models often introduce instability, higher estimation error, and greater transaction costs, so their practical efficiency should be carefully evaluated.
+9. **Parameter optimization:** Conduct systematic parameter tuning using methods such as **grid search** or **Bayesian optimization (Hyperopt)** to find optimal thresholds for Z-entry, Z-exit, volatility lookback, window size, half life, and capital allocation ratios.
+10. **Extended asset coverage:** Run large-scale tests across the full universe of available cryptocurrency pairs. The current experiment was limited to roughly **30% of total assets**, so expanding the dataset could significantly improve statistical confidence and reveal new stable relationships.
+
+
+
+**Summary**
+Overall, the backtest confirms that a **statistically driven, mean-reversion strategy** can achieve stable returns with minimal risk under idealized assumptions.  
+Further development should focus on **realistic execution modeling** and **dynamic adaptation**, transforming the prototype from a static proof-of-concept into a robust live-trading framework.
+
+---
