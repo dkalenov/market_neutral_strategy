@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# scan_pairs.py
-# Запуск: python scan_pairs.py
-
 import os
 import sys
 import time
@@ -23,7 +19,7 @@ PARTS_DIR = "parts"
 OUT_ALL = "signals_all.csv"
 
 CAPITAL = 1_000_000.0
-MAX_NOTIONAL_PER_PAIR = 0.05
+MAX_NOTIONAL_PER_PAIR = 0.1
 VOL_LOOKBACK = 60
 
 # ------------------ Utility / stats helpers ------------------
@@ -186,32 +182,66 @@ def prepare_log_cache(csv_path, npz_path=NPZ_CACHE):
     return npz_path
 
 # ------------------ Worker (top-level for pickling) ------------------
-def worker_process(proc_id, pairs_list, npz_path, out_part_csv,
-                   WINDOW=200, STEP=50, MAX_HALF_LIFE=200, BETA_THRESHOLD=0.11,
-                   Z_ENTRY=2.0, CAPITAL=CAPITAL, MAX_NOTIONAL_PER_PAIR=MAX_NOTIONAL_PER_PAIR,
-                   VOL_LOOKBACK=VOL_LOOKBACK, TEST_MODE=False, TEST_MAX_WINDOWS_PER_PAIR=30):
-    """
-    Scans rolling windows for given pairs and writes partial results to out_part_csv.
-    This function must be at module top-level for multiprocessing pickling.
-    """
-    try:
-        t0 = time.time()
-        print(f"[P{proc_id}] loading cache {npz_path} (pairs={len(pairs_list)})")
-        npz = np.load(npz_path, allow_pickle=True)
-        symbols = [s.decode() if isinstance(s, bytes) else s for s in npz["symbols"]]
-        dates = npz["dates"]
-        logmat = npz["logmat"]
-        shifts = npz["shifts"]
-        sym2idx = {sym: i for i, sym in enumerate(symbols)}
+def worker_process(
+    proc_id,
+    pairs_list,
+    npz_path,
+    out_part_csv,
+    WINDOW=200,
+    STEP=50,
+    MAX_HALF_LIFE=400,
+    BETA_THRESHOLD=0.11,
+    Z_ENTRY=2.0,
+    CAPITAL=CAPITAL,
+    MAX_NOTIONAL_PER_PAIR=MAX_NOTIONAL_PER_PAIR,
+    VOL_LOOKBACK=VOL_LOOKBACK,
+    TEST_MODE=False,
+    TEST_MAX_WINDOWS_PER_PAIR=30,
+):
+    import time
+    import os
+    import traceback
 
-        results_rows = []
-        windows_done = 0
+    t_proc_start = time.time()
 
-        for (a, b) in pairs_list:
-            pairname = f"{a}-{b}"
-            if a not in sym2idx or b not in sym2idx or "BTCUSDT" not in sym2idx:
-                continue
+    done_file = out_part_csv.replace(".csv", ".done.txt")
 
+    # ---------- CHECKPOINT LOAD ----------
+    done_pairs = set()
+    if os.path.exists(done_file):
+        with open(done_file, "r") as f:
+            for line in f:
+                done_pairs.add(line.strip())
+
+    print(
+        f"[P{proc_id}] start | total pairs={len(pairs_list)} | "
+        f"already done={len(done_pairs)}"
+    )
+
+    # ---------- LOAD CACHE ----------
+    npz = np.load(npz_path, allow_pickle=True)
+    symbols = [s.decode() if isinstance(s, bytes) else s for s in npz["symbols"]]
+    dates = npz["dates"]
+    logmat = npz["logmat"]
+    shifts = npz["shifts"]
+    sym2idx = {sym: i for i, sym in enumerate(symbols)}
+
+    results_rows = []
+    processed_pairs = 0
+    total_pair_time = 0.0
+    windows_done = 0
+
+    for (a, b) in pairs_list:
+        pairname = f"{a}-{b}"
+
+        if pairname in done_pairs:
+            continue
+        if a not in sym2idx or b not in sym2idx or "BTCUSDT" not in sym2idx:
+            continue
+
+        t_pair_start = time.time()
+
+        try:
             ia = sym2idx[a]
             ib = sym2idx[b]
             ibtc = sym2idx["BTCUSDT"]
@@ -221,9 +251,11 @@ def worker_process(proc_id, pairs_list, npz_path, out_part_csv,
                 continue
 
             windows_for_pair = 0
+
             for start in range(0, max_start + 1, STEP):
                 if TEST_MODE and windows_for_pair >= TEST_MAX_WINDOWS_PER_PAIR:
                     break
+
                 end = start + WINDOW
                 log1 = logmat[start:end, ia]
                 log2 = logmat[start:end, ib]
@@ -232,8 +264,11 @@ def worker_process(proc_id, pairs_list, npz_path, out_part_csv,
                 windows_done += 1
                 windows_for_pair += 1
 
-                # sanity checks
-                if np.isnan(log1).any() or np.isnan(log2).any() or np.isnan(logbtc).any():
+                if (
+                    np.isnan(log1).any()
+                    or np.isnan(log2).any()
+                    or np.isnan(logbtc).any()
+                ):
                     continue
                 if np.allclose(log1, log1[0]) or np.allclose(log2, log2[0]):
                     continue
@@ -252,6 +287,7 @@ def worker_process(proc_id, pairs_list, npz_path, out_part_csv,
                 z = calculate_z_last(spread)
                 if np.isnan(z):
                     continue
+
                 if z >= Z_ENTRY:
                     signal = -1
                 elif z <= -Z_ENTRY:
@@ -259,35 +295,77 @@ def worker_process(proc_id, pairs_list, npz_path, out_part_csv,
                 else:
                     continue
 
-                dollar1, dollar2 = vol_parity_notional(log1, log2, hedge, capital=CAPITAL, max_notional_per_pair=MAX_NOTIONAL_PER_PAIR, lookback=VOL_LOOKBACK)
+                dollar1, dollar2 = vol_parity_notional(
+                    log1, log2, hedge,
+                    capital=CAPITAL,
+                    max_notional_per_pair=MAX_NOTIONAL_PER_PAIR,
+                    lookback=VOL_LOOKBACK,
+                )
+
                 price1 = max(math.exp(log1[-1]) - shifts[ia], 1e-9)
                 price2 = max(math.exp(log2[-1]) - shifts[ib], 1e-9)
-                qty1, qty2 = calculate_qty(dollar1, dollar2, price1, price2, capital=CAPITAL)
+
+                qty1, qty2 = calculate_qty(
+                    dollar1, dollar2, price1, price2,
+                    capital=CAPITAL,
+                )
 
                 results_rows.append({
                     "pair": pairname,
-                    "start_index": int(start),
-                    "end_index": int(end),
+                    "start_index": start,
+                    "end_index": end,
                     "start_date": str(dates[start]),
-                    "end_date": str(dates[end-1]),
-                    "hedge_ratio": float(hedge),
-                    "half_life": float(hl),
-                    "p_value": float(pval),
-                    "beta_btc": float(beta_btc),
-                    "z": float(z),
-                    "signal": int(signal),
+                    "end_date": str(dates[end - 1]),
+                    "hedge_ratio": hedge,
+                    "half_life": hl,
+                    "p_value": pval,
+                    "beta_btc": beta_btc,
+                    "z": z,
+                    "signal": signal,
                     "qty1": qty1,
                     "qty2": qty2,
                     "dollar1": round(dollar1, 2),
                     "dollar2": round(dollar2, 2),
                 })
 
-        df_part = pd.DataFrame(results_rows)
-        df_part.to_csv(out_part_csv, index=False)
-        print(f"[P{proc_id}] done. windows_done={windows_done} -> wrote {len(df_part)} rows to {out_part_csv} (t={time.time()-t0:.1f}s)")
-    except Exception:
-        traceback.print_exc()
-        pd.DataFrame().to_csv(out_part_csv, index=False)
+        except Exception:
+            traceback.print_exc()
+
+        finally:
+            # ---------- TIMING ----------
+            pair_time = time.time() - t_pair_start
+            processed_pairs += 1
+            total_pair_time += pair_time
+            avg_pair_time = total_pair_time / processed_pairs
+
+            remaining = len(pairs_list) - processed_pairs - len(done_pairs)
+            eta_sec = remaining * avg_pair_time
+            eta_min = eta_sec / 60
+            eta_hr = eta_min / 60
+
+            if processed_pairs % 10 == 0:
+                print(
+                    f"[P{proc_id}] done={processed_pairs} | "
+                    f"avg={avg_pair_time:.2f}s/pair | "
+                    f"ETA ≈ {eta_hr:.2f}h"
+                )
+
+            # ---------- CHECKPOINT SAVE ----------
+            with open(done_file, "a") as f:
+                f.write(pairname + "\n")
+
+    # ---------- SAVE PART ----------
+    df_part = pd.DataFrame(results_rows)
+    df_part.to_csv(out_part_csv, index=False)
+
+    print(
+        f"[P{proc_id}] FINISHED | "
+        f"pairs={processed_pairs} | "
+        f"windows={windows_done} | "
+        f"time={time.time() - t_proc_start:.1f}s"
+    )
+
+
 
 # ------------------ Orchestrator ------------------
 def run_parallel_scan(
@@ -374,20 +452,20 @@ def run_parallel_scan(
         return pd.DataFrame()
 
 # ------------------ Main ------------------
-def ensure_downloads():
-    # If files are absent, attempt to download via gdown (assuming gdown installed)
-    if not os.path.exists(CSV_FILE_100):
-        print("Downloading CSV files with gdown (if available)...")
-        os.system(f"gdown --id 1ikr1Cq4qW5Dkn3NN2twxjs-1jaTSCtZy -O {CSV_FILE_LARGE}")
-        os.system(f"gdown --id 1FA2QRoQ9vuO-Z9EgPHgLXtWinmBlovHm -O {CSV_FILE_100}")
-        os.system(f"gdown --id 1kmX9ActaGZqDT66CA4VJ60bYvXd7ej2M -O {CSV_SIGNALS}")
+# def ensure_downloads():
+#     # If files are absent, attempt to download via gdown (assuming gdown installed)
+#     if not os.path.exists(CSV_FILE_100):
+#         print("Downloading CSV files with gdown (if available)...")
+#         os.system(f"gdown --id 1ikr1Cq4qW5Dkn3NN2twxjs-1jaTSCtZy -O {CSV_FILE_LARGE}")
+#         os.system(f"gdown --id 1FA2QRoQ9vuO-Z9EgPHgLXtWinmBlovHm -O {CSV_FILE_100}")
+#         os.system(f"gdown --id 1kmX9ActaGZqDT66CA4VJ60bYvXd7ej2M -O {CSV_SIGNALS}")
 
 if __name__ == "__main__":
     # Put imports and top-level operations under main guard for Windows multiprocessing
-    ensure_downloads()
+    # ensure_downloads()
 
     # Configuration
-    csv_file = CSV_FILE_100  # основной файл
+    csv_file = "klines_data_1h_clean_2024.05.24_2025.10.24.csv"
     npz_cache = NPZ_CACHE
     n_processes = 16
     TEST_MODE = False
@@ -395,9 +473,9 @@ if __name__ == "__main__":
     TEST_MAX_WINDOWS_PER_PAIR = 2
 
     # sanity checks
-    if not os.path.exists(csv_file):
-        print("CSV file not found:", csv_file)
-        sys.exit(1)
+    # if not os.path.exists(csv_file):
+    #     print("CSV file not found:", csv_file)
+    #     sys.exit(1)
 
     start = time.time()
     print("Starting parallel scan...")
@@ -409,7 +487,7 @@ if __name__ == "__main__":
         TEST_MAX_PAIRS=TEST_MAX_PAIRS,
         WINDOW=200,
         STEP=50,
-        MAX_HALF_LIFE=200,
+        MAX_HALF_LIFE=400,
         BETA_THRESHOLD=0.11,
         Z_ENTRY=2.0,
         CAPITAL=CAPITAL,
@@ -421,4 +499,3 @@ if __name__ == "__main__":
     print("Total signals:", len(df_signals))
     if not df_signals.empty:
         print(df_signals.head())
-
