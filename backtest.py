@@ -24,6 +24,14 @@ MAX_HOLD_DAYS = 30
 PERIODS_PER_YEAR = 24 * 365  # hourly periods
 
 
+
+EXIT_MEAN_REVERT = "mean_revert"
+EXIT_STOP = "stop_loss"
+EXIT_TIME = "time_exit"
+EXIT_FORCE = "force_close"
+
+
+
 def vol_parity_notional_from_series(s1, s2, hedge, cap_pair_usd, vol_lookback=VOL_LOOKBACK):
     """Compute volatility-parity allocations for both legs."""
     if s1 is None or s2 is None or len(s1) < 2 or len(s2) < 2:
@@ -310,14 +318,29 @@ def run_pairs_backtest_with_backtestingpy(input_csv, signals_csv):
             })
 
             trades.append({
-                "pair": pair, "entry_idx": idx_bar, "entry_time": dates[idx_bar],
-                "entry_price_a": pa_exec, "entry_price_b": pb_exec,
-                "qty_a": qty_a_signed, "qty_b": qty_b_signed,
-                "alloc_a": alloc_a, "alloc_b": alloc_b,
+                "pair": pair,
+                "entry_idx": idx_bar,
+                "entry_time": dates[idx_bar],
+                "entry_price_a": pa_exec,
+                "entry_price_b": pb_exec,
+                "qty_a": qty_a_signed,
+                "qty_b": qty_b_signed,
+                "alloc_a": alloc_a,
+                "alloc_b": alloc_b,
                 "entry_comm": float(entry_comm),
-                "exit_idx": None, "exit_time": None,
-                "exit_price_a": None, "exit_price_b": None,
-                "pnl_gross": None, "pnl_net": None, "exit_comm": None
+
+                # NEW
+                "exit_idx": None,
+                "exit_time": None,
+                "exit_price_a": None,
+                "exit_price_b": None,
+                "exit_reason": None,
+                "hold_hours": None,
+
+                "pnl_gross": None,
+                "pnl_net": None,
+                "exit_comm": None,
+                "commission_total": None
             })
 
             scheduled_entries_global.remove(s)
@@ -348,20 +371,30 @@ def run_pairs_backtest_with_backtestingpy(input_csv, signals_csv):
                 continue
             z = (spread.iloc[-1] - spread.mean()) / spread.std()
             entry_z = p["entry_z"]
-            need_exit = (
-                (not np.isnan(z)) and
-                ((entry_z * z < 0) or (abs(z) <= Z_EXIT_FULL) or (abs(z) >= Z_STOP_HARD and z * entry_z > 0))
-            )
-            if not need_exit:
+
+            exit_reason = None
+
+            if not np.isnan(z):
+                if entry_z * z < 0 or abs(z) <= Z_EXIT_FULL:
+                    exit_reason = EXIT_MEAN_REVERT
+                elif abs(z) >= Z_STOP_HARD and z * entry_z > 0:
+                    exit_reason = EXIT_STOP
+
+            if exit_reason is None:
                 hold_bars = idx_bar - p["entry_idx"]
                 if hold_bars / 24.0 >= MAX_HOLD_DAYS:
-                    need_exit = True
-            if not need_exit:
+                    exit_reason = EXIT_TIME
+
+            if exit_reason is None:
                 continue
 
+            # === ИСПОЛНЕНИЕ EXIT ===
+
             exec_idx = min(idx_bar + 1, N - 1)
+
             pa = float(openp[a].iloc[exec_idx]) if openp is not None else float(close[a].iloc[exec_idx])
             pb = float(openp[b].iloc[exec_idx]) if openp is not None else float(close[b].iloc[exec_idx])
+
             pa_exec = pa * (1 - SLIPPAGE_RATE) if p["qty_a"] > 0 else pa * (1 + SLIPPAGE_RATE)
             pb_exec = pb * (1 - SLIPPAGE_RATE) if p["qty_b"] > 0 else pb * (1 + SLIPPAGE_RATE)
 
@@ -370,22 +403,22 @@ def run_pairs_backtest_with_backtestingpy(input_csv, signals_csv):
             total_pnl = pnl_a + pnl_b
 
             exit_comm = (abs(pa_exec * p["qty_a"]) + abs(pb_exec * p["qty_b"])) * COMMISSION_RATE
-            cash += total_pnl - exit_comm
-            invested_capital = max(0.0, invested_capital - (abs(p["entry_alloc_a"]) + abs(p["entry_alloc_b"])))
-            ledger_append(dates[exec_idx], p["pair"], "exit_pnl_comm",
-                          float(total_pnl - exit_comm),
-                          note=f"exit pa={pa_exec:.6f}, pb={pb_exec:.6f}")
 
+            cash += total_pnl - exit_comm
+
+            # === ОБНОВЛЕНИЕ TRADE ===
             for t in reversed(trades):
-                if t.get("entry_idx") == p["entry_idx"] and t.get("pair") == p["pair"] and t.get("pnl_gross") is None:
+                if t["entry_idx"] == p["entry_idx"] and t["pair"] == p["pair"] and t["pnl_net"] is None:
                     t["exit_idx"] = exec_idx
                     t["exit_time"] = dates[exec_idx]
                     t["exit_price_a"] = pa_exec
                     t["exit_price_b"] = pb_exec
-                    t["pnl_gross"] = float(total_pnl)
-                    net_pnl = float(total_pnl - p.get("entry_comm", 0.0) - exit_comm)
-                    t["pnl_net"] = net_pnl
+                    t["exit_reason"] = exit_reason
+                    t["hold_hours"] = (exec_idx - p["entry_idx"])
                     t["exit_comm"] = float(exit_comm)
+                    t["pnl_gross"] = float(total_pnl)
+                    t["commission_total"] = float(p["entry_comm"] + exit_comm)
+                    t["pnl_net"] = float(total_pnl - p["entry_comm"] - exit_comm)
                     break
 
             positions.remove(p)
@@ -473,3 +506,4 @@ for k, v in metrics.items():
         print(f"{k}: {v:.6f}")
     except:
         print(f"{k}: {v}")
+
