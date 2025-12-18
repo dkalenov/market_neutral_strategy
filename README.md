@@ -364,3 +364,20 @@ Overall, the backtest confirms that a **statistically driven, mean-reversion str
 Further development should focus on **realistic execution modeling** and **dynamic adaptation**, transforming the prototype from a static proof-of-concept into a robust live-trading framework.
 
 ---
+
+
+
+
+
+
+BACKTEST
+
+Metrics:
+CAGR: 0.137720
+MDD: -0.157809
+CAGR/MDD: 0.872700
+Sharpe: 0.705082
+Total Trades: 6222.000000
+Win Rate: 0.457409
+Final Equity: 1200929.633983
+Beta vs Market: 0.022444
