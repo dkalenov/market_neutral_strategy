@@ -15,7 +15,7 @@ VOL_LOOKBACK = 60
 RISK_PCT_PER_PAIR = 0.1
 MAX_NOTIONAL_PER_PAIR = 0.1
 
-Z_ENTRY = 2.0
+Z_ENTRY = 1.8
 Z_EXIT_FULL = 0.0
 Z_STOP_HARD = 4.0
 HOLD_MULTIPLIER = 3
@@ -231,12 +231,19 @@ def run_pairs_backtest_with_backtestingpy(input_csv, signals_csv):
 
             z_current = (spread.iloc[-1] - spread.mean()) / spread.std()
 
+            # === HYBRID MODE ===
+            # СИГНАЛ ВСЕГДА ИСПОЛНЯЕТСЯ
             if abs(z_current) < Z_ENTRY:
                 continue
 
             side = -1 if z_current > 0 else 1
             entry_z = z_current
 
+            # мягкое влияние Z_ENTRY через размер
+            if abs(z_current) < Z_ENTRY:
+                z_scale = abs(z_current) / Z_ENTRY
+                alloc_a *= z_scale
+                alloc_b *= z_scale
             caps = CAPITAL * MAX_NOTIONAL_PER_PAIR
 
             # Allocation logic
@@ -530,3 +537,5 @@ for k, v in metrics.items():
         print(f"{k}: {v:.6f}")
     except:
         print(f"{k}: {v}")
+
+
