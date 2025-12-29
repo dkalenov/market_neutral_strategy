@@ -10,7 +10,7 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 
-# ---------------- PARAMETERS (можешь менять)
+
 CSV_FILE_LARGE = "klines_data_1h_clean_2024.05.24_2025.10.24.csv"
 CSV_FILE_100 = "klines_data_1h_clean_100symbols.csv"
 CSV_SIGNALS = "cointegrated_pairs_signals_1h_100symbols.csv"
@@ -22,7 +22,8 @@ CAPITAL = 1_000_000.0
 MAX_NOTIONAL_PER_PAIR = 0.1
 VOL_LOOKBACK = 60
 
-# ------------------ Utility / stats helpers ------------------
+
+
 def safe_get_slope(params):
     """Return slope param (index 1) robustly for numpy.ndarray or pandas.Series."""
     try:
@@ -140,7 +141,7 @@ def calculate_qty(dollar1, dollar2, price1, price2, capital=CAPITAL, max_notiona
     qty2 = dollar2 / price2 if price2 > 0 else 0.0
     return float(qty1), float(qty2)
 
-# ------------------ Data preparation ------------------
+#  Data preparation 
 def prepare_log_cache(csv_path, npz_path=NPZ_CACHE):
     """
     Loads CSV, pivots, computes log(prices) matrix and shifts, saves compressed npz:
@@ -181,7 +182,7 @@ def prepare_log_cache(csv_path, npz_path=NPZ_CACHE):
     print("Saved cache to", npz_path)
     return npz_path
 
-# ------------------ Worker (top-level for pickling) ------------------
+#  Worker (top-level for pickling) 
 def worker_process(
     proc_id,
     pairs_list,
@@ -206,7 +207,7 @@ def worker_process(
 
     done_file = out_part_csv.replace(".csv", ".done.txt")
 
-    # ---------- CHECKPOINT LOAD ----------
+    # CHECKPOINT LOAD 
     done_pairs = set()
     if os.path.exists(done_file):
         with open(done_file, "r") as f:
@@ -218,7 +219,7 @@ def worker_process(
         f"already done={len(done_pairs)}"
     )
 
-    # ---------- LOAD CACHE ----------
+    # LOAD CACHE 
     npz = np.load(npz_path, allow_pickle=True)
     symbols = [s.decode() if isinstance(s, bytes) else s for s in npz["symbols"]]
     dates = npz["dates"]
@@ -350,11 +351,11 @@ def worker_process(
                     f"ETA ≈ {eta_hr:.2f}h"
                 )
 
-            # ---------- CHECKPOINT SAVE ----------
+            # CHECKPOINT SAVE 
             with open(done_file, "a") as f:
                 f.write(pairname + "\n")
 
-    # ---------- SAVE PART ----------
+   
     df_part = pd.DataFrame(results_rows)
     df_part.to_csv(out_part_csv, index=False)
 
@@ -367,7 +368,7 @@ def worker_process(
 
 
 
-# ------------------ Orchestrator ------------------
+# Orchestrator 
 def run_parallel_scan(
     csv_path,
     npz_cache,
@@ -451,7 +452,7 @@ def run_parallel_scan(
         print("No results found in parts.")
         return pd.DataFrame()
 
-# ------------------ Main ------------------
+
 # def ensure_downloads():
 #     # If files are absent, attempt to download via gdown (assuming gdown installed)
 #     if not os.path.exists(CSV_FILE_100):
