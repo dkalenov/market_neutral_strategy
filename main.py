@@ -6,17 +6,13 @@ import pairs_trading
 import db
 import tg
 
-# клиент для Binance
+
 client: binance.Futures
-# словарь для хранения всех торговых пар
+
 all_symbols: dict[str, binance.SymbolFutures] = {}
-# список открытых позиций
 positions = {}
-# список вебсокетов
 websockets_list: list[binance.futures.WebsocketAsync] = []
-# вебсокет юзердата
 userdata_ws: binance.futures.WebsocketAsync
-# менеджер пар
 pairs_manager: pairs_trading.PairsManager
 
 
@@ -46,11 +42,34 @@ async def main():
                              testnet=ini_config.getboolean('BOT', 'testnet'))
     # создаем менеджер пар
     loop = asyncio.get_running_loop()
-    pairs_manager = pairs_trading.PairsManager(client, loop, all_symbols)
+    
+    # Дефолтные значения если в конфиге пусто
+    timeframe = conf.timeframe if conf.timeframe else '1h'
+    
+    if conf.window_size:
+        window_size = conf.window_size
+    else:
+        # Автоматический подбор оптимального окна для разных ТФ
+        if timeframe == '1m':
+            window_size = 720  # 12 часов (полусуточный цикл, минимизация шума)
+        elif timeframe == '5m':
+            window_size = 576  # 2 суток (2 * 288 свечей)
+        elif timeframe == '15m':
+            window_size = 480  # 5 суток (рабочая торговая неделя)
+        elif timeframe == '1h':
+            window_size = 336  # 14 дней (2 недели, цикл "средней" краткосрочности)
+        elif timeframe == '4h':
+            window_size = 180  # 30 дней (месячный тренд)
+        elif timeframe == '1d':
+            window_size = 90   # 90 дней (квартальный тренд, избегаем старых структурных разрывов)
+        else:
+            window_size = 336  # Дефолт как для 1h
+    
+    pairs_manager = pairs_trading.PairsManager(client, loop, all_symbols, timeframe=timeframe, min_data_points=window_size)
     # загружаем все торговые пары
-    asyncio.create_task(load_symbols())
-    # подключаемся к вебсокетам
-    asyncio.create_task(connect_ws())
+    # Запускаем все в фоне
+    loop.create_task(load_symbols())
+    loop.create_task(connect_ws(timeframe))
     
     # Запускаем телеграм бота
     await tg.run(session, client, pairs_manager)
@@ -76,7 +95,7 @@ async def load_symbols():
 
 
 # подключение к вебсокетам
-async def connect_ws():
+async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
 
@@ -89,7 +108,7 @@ async def connect_ws():
         target_symbols.add(pair.symbol1)
         target_symbols.add(pair.symbol2)
 
-    streams = [f"{symbol.lower()}@kline_1m" for symbol in list(target_symbols)]
+    streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in list(target_symbols)]
 
     # запускаем вебсокеты
     chunk_size = 100
