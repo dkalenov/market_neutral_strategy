@@ -56,17 +56,21 @@ class PairInfo:
     entry_price2: float = 0.0
     db_id: int = None # ID записи в БД для синхронизации
     current_trade_id: int = None # ID текущей открытой сделки в таблице Trades
+    is_trading: bool = False # Блокировка для асинхронных операций (вход/выход)
 
 class PairsManager:
     """
     Управляет данными о символах, находит коинтегрированные пары и генерирует сигналы.
     """
-    def __init__(self, client, loop, all_symbols, timeframe='1h', min_data_points=200):
+    def __init__(self, client, loop, all_symbols, timeframe='1h', min_data_points=200, notify_callback=None, config_info=None):
         self.client = client
         self.loop = loop
         self.all_symbols = all_symbols
         self.timeframe = timeframe
         self.min_data_points = min_data_points
+        self.notify_callback = notify_callback # Функция для отправки уведомлений
+        self.config = config_info # Объект конфигурации с параметрами риска
+        
         self.max_len = int(min_data_points * 2.5) # Храним с запасом
         
         self.all_data: dict[str, Data] = {}
@@ -222,7 +226,9 @@ class PairsManager:
                     
                     # Если есть открытая позиция - ЭКСТРЕННОЕ закрытие
                     if pair_info.position_status != 0:
-                        print(f"🚨 Force closing position on broken pair {s1}-{s2}!")
+                        warn_msg = f"🚨 <b>Broken Correlation</b> on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!"
+                        print(warn_msg)
+                        self.loop.create_task(self._notify(warn_msg))
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                     
                     # Удаляем пару из БД и памяти
@@ -295,20 +301,28 @@ class PairsManager:
                         roi = total_pnl / initial_investment
                         # Если просадка больше 20%
                         if roi < -HARD_STOP_PCT:
-                            print(f"🚨 CIRCUIT BREAKER TRIGGERED on {s1}-{s2}!")
-                            print(f"   Unrealized PnL: {total_pnl:.2f} USD ({roi*100:.2f}%). Force Closing...")
+                            cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
+                                      f"Loss: {roi*100:.2f}% ({total_pnl:.2f} USDT). Force Closing...")
+                            print(cb_msg)
+                            self.loop.create_task(self._notify(cb_msg))
+                            
                             self.loop.create_task(self._execute_trade(pair_info, 0))
                             pair_info.position_status = 0
                             continue # Прерываем дальнейшую проверку сигналов
 
+                # Получаем параметры из конфига или дефолтные
+                z_entry = self.config.z_entry if self.config and self.config.z_entry else 2.0
+                z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
+                z_stop = self.config.z_stop if self.config and self.config.z_stop else 4.0
+                
                 # 1. Если позиции нет (ВХОД)
                 if pair_info.position_status == 0:
-                    if z_score < -Z_ENTRY_THRESHOLD:
+                    if z_score < -z_entry:
                         # Z < -2 -> Покупка спреда (Long)
                         print(f"🚀 LONG Signal on {s1}-{s2} spread. Z-score: {z_score:.2f}. Opening position...")
                         self.loop.create_task(self._execute_trade(pair_info, 1))
                         pair_info.position_status = 1
-                    elif z_score > Z_ENTRY_THRESHOLD:
+                    elif z_score > z_entry:
                         # Z > 2 -> Продажа спреда (Short)
                         print(f"🔥 SHORT Signal on {s1}-{s2} spread. Z-score: {z_score:.2f}. Opening position...")
                         self.loop.create_task(self._execute_trade(pair_info, -1))
@@ -317,26 +331,26 @@ class PairsManager:
                 # 2. Если мы в ЛОНГЕ (куплен спред)
                 elif pair_info.position_status == 1:
                     # Take Profit: Z вернулся к 0 (или выше)
-                    if z_score >= Z_EXIT_THRESHOLD:
-                        print(f"💰 TAKE PROFIT (Long) on {s1}-{s2}. Z-score: {z_score:.2f} >= 0. Closing...")
+                    if z_score >= z_exit:
+                        print(f"💰 TAKE PROFIT (Long) on {s1}-{s2}. Z-score: {z_score:.2f} >= {z_exit}. Closing...")
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                         pair_info.position_status = 0
                     # Stop Loss: Z упал еще ниже (-4)
-                    elif z_score <= -Z_STOP_LOSS:
-                        print(f"🛑 STOP LOSS (Long) on {s1}-{s2}. Z-score: {z_score:.2f} <= -4. Closing...")
+                    elif z_score <= -z_stop:
+                        print(f"🛑 STOP LOSS (Long) on {s1}-{s2}. Z-score: {z_score:.2f} <= -{z_stop}. Closing...")
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                         pair_info.position_status = 0
 
                 # 3. Если мы в ШОРТЕ (продан спред)
                 elif pair_info.position_status == -1:
                     # Take Profit: Z вернулся к 0 (или ниже)
-                    if z_score <= -Z_EXIT_THRESHOLD:
-                        print(f"💰 TAKE PROFIT (Short) on {s1}-{s2}. Z-score: {z_score:.2f} <= 0. Closing...")
+                    if z_score <= -z_exit:
+                        print(f"💰 TAKE PROFIT (Short) on {s1}-{s2}. Z-score: {z_score:.2f} <= {-z_exit}. Closing...")
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                         pair_info.position_status = 0
                     # Stop Loss: Z вырос еще выше (4)
-                    elif z_score >= Z_STOP_LOSS:
-                        print(f"🛑 STOP LOSS (Short) on {s1}-{s2}. Z-score: {z_score:.2f} >= 4. Closing...")
+                    elif z_score >= z_stop:
+                        print(f"🛑 STOP LOSS (Short) on {s1}-{s2}. Z-score: {z_score:.2f} >= {z_stop}. Closing...")
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                         pair_info.position_status = 0
 
@@ -484,10 +498,13 @@ class PairsManager:
                 results = await asyncio.gather(task1, task2, return_exceptions=True)
                 
                 if any(isinstance(res, Exception) for res in results):
-                    print(f"ERROR closing position for {s1}-{s2}. Manual intervention required. Errors: {results}")
+                    err_msg = f"❌ ERROR closing position for {s1}-{s2}. Manual intervention required. Errors: {results}"
+                    print(err_msg)
+                    await self._notify(err_msg)
                 else:
                     # Успешное закрытие
-                    print(f"SUCCESS: Position closed for {s1}-{s2}")
+                    msg = f"✅ SUCCESS: Position closed for {s1}-{s2}"
+                    print(msg)
                     
                     # Парсим цены выхода и считаем PnL
                     def get_price(order):
@@ -501,11 +518,6 @@ class PairsManager:
                     close_price2 = get_price(results[1])
                     
                     # Расчет PnL
-                    # Long Spread (pos=1): Long S1, Short S2. Exit: Sell S1, Buy S2.
-                    # PnL1 = (Close - Entry) * Qty
-                    # Short Spread (pos=-1): Short S1, Long S2. Exit: Buy S1, Sell S2.
-                    # PnL1 = (Entry - Close) * Qty (или (Close - Entry) * Qty * -1)
-                    
                     side1_dir = 1 if pair_info.position_status == 1 else -1
                     side2_dir = -1 if pair_info.position_status == 1 else 1
 
@@ -513,7 +525,10 @@ class PairsManager:
                     pnl2 = (close_price2 - pair_info.entry_price2) * pair_info.qty2 * side2_dir
                     total_pnl = pnl1 + pnl2
                     
-                    print(f"  Realized PnL: {total_pnl:.2f} (S1: {pnl1:.2f}, S2: {pnl2:.2f})")
+                    pnl_emoji = "🟢" if total_pnl > 0 else "🔴"
+                    msg += f"\n  Realized PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
+                    print(msg)
+                    await self._notify(msg)
 
                     # Закрываем сделку в БД
                     if pair_info.current_trade_id:
@@ -571,7 +586,17 @@ class PairsManager:
         log_prices1 = np.log(list(data1.close)[-COINT_WINDOW:])
         log_prices2 = np.log(list(data2.close)[-COINT_WINDOW:])
 
-        dollar1, dollar2 = utils.vol_parity_notional(log_prices1, log_prices2, hedge)
+        # Параметры риск-менеджмента
+        capital = self.config.capital if self.config and self.config.capital else 1000.0
+        max_notional = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1
+
+        dollar1, dollar2 = utils.vol_parity_notional(
+            log_prices1, 
+            log_prices2, 
+            hedge,
+            capital=capital,
+            max_notional_per_pair=max_notional
+        )
         
         qty1_dollar = dollar1 * direction
         qty2_dollar = dollar2 * -direction
@@ -650,9 +675,12 @@ class PairsManager:
                 pair_info.entry_price1 = get_price(executed_orders[0])
                 pair_info.entry_price2 = get_price(executed_orders[1])
 
-                print(f"SUCCESS: Trade executed for {s1}-{s2}.")
-                print(f"  Entry Prices: {s1}={pair_info.entry_price1}, {s2}={pair_info.entry_price2}")
-                print(f"  Quantities: {s1}={pair_info.qty1}, {s2}={pair_info.qty2}")
+                success_msg = (f"🚀 <b>Trade OPENED:</b> {s1}-{s2}\n"
+                               f"Direction: {'LONG' if direction == 1 else 'SHORT'} Spread\n"
+                               f"Entry 1: {pair_info.qty1} {s1} @ {pair_info.entry_price1}\n"
+                               f"Entry 2: {pair_info.qty2} {s2} @ {pair_info.entry_price2}")
+                print(success_msg)
+                await self._notify(success_msg)
                 
                 # Обновляем состояние пары в БД
                 if pair_info.db_id:

@@ -35,6 +35,17 @@ async def main():
     # Загружаем конфиг из БД
     conf = await db.load_config()
 
+    # Функция для отправки уведомлений в TG
+    async def send_tg_notification(message):
+        if tg.bot and conf.tg_admins:
+             # Отправляем всем админам
+             admins = [int(admin_id) for admin_id in conf.tg_admins.split(',') if admin_id]
+             for admin_id in admins:
+                 try:
+                     await tg.bot.send_message(admin_id, message)
+                 except Exception as e:
+                     print(f"Error sending TG message to {admin_id}: {e}")
+
     # создаем клиента для Binance
     client = binance.Futures(api_key=conf.api_key,
                              secret_key=conf.api_secret,
@@ -65,10 +76,26 @@ async def main():
         else:
             window_size = 336  # Дефолт как для 1h
     
-    pairs_manager = pairs_trading.PairsManager(client, loop, all_symbols, timeframe=timeframe, min_data_points=window_size)
-    # загружаем все торговые пары
-    # Запускаем все в фоне
-    loop.create_task(load_symbols())
+    # 1. Сначала загружаем символы (синхронно для старта)
+    print("Initial loading of market symbols...")
+    all_symbols = await client.load_symbols()
+    print(f"Loaded {len(all_symbols)} symbols.")
+    
+    # 2. Создаём менеджер пар ПОСЛЕ загрузки символов (чтобы он получил заполненный dict)
+    pairs_manager = pairs_trading.PairsManager(
+        client, 
+        loop, 
+        all_symbols, 
+        timeframe=timeframe, 
+        min_data_points=window_size,
+        notify_callback=send_tg_notification,
+        config_info=conf
+    )
+
+    # 2. Запускаем фоновое обновление символов
+    loop.create_task(load_symbols_loop())
+    
+    # 3. Подключаемся к вебсокетам (теперь all_symbols заполнен)
     loop.create_task(connect_ws(timeframe))
     
     # Запускаем телеграм бота
@@ -76,22 +103,23 @@ async def main():
 
 
 # сервис для загрузки всех торговых пар каждый час
-async def load_symbols():
+async def load_symbols_loop():
     global all_symbols
     # вечный цикл
     while True:
         try:
+            # ждем 1 час
+            await asyncio.sleep(3600)
+            
             # загружаем все торговые пары
-            print("Loading all market symbols...")
+            print("Refreshing market symbols...")
             all_symbols = await client.load_symbols()
-            print(f"Loaded {len(all_symbols)} symbols.")
+            print(f"Refreshed {len(all_symbols)} symbols.")
         except asyncio.CancelledError:
             break
         except Exception as e:
             print(f"Error loading symbols: {e}")
             traceback.print_exc()
-        # ждем 1 час
-        await asyncio.sleep(3600)
 
 
 # подключение к вебсокетам
@@ -101,21 +129,40 @@ async def connect_ws(timeframe='1h'):
 
     print("Connecting to websockets...")
 
-    # Список символов для отслеживания
-    pairs = await db.get_all_pairs()
-    target_symbols = set()
-    for pair in pairs:
-        target_symbols.add(pair.symbol1)
-        target_symbols.add(pair.symbol2)
+    # СОБИРАЕМ ВСЕ USDT ПАРЫ ДЛЯ СКАНЕРА
+    # Бот должен слушать весь рынок, чтобы искать новые коинтеграции
+    target_symbols = []
+    
+    # 1. Все USDT пары из маркета
+    for s_name in all_symbols.keys():
+        if s_name.endswith('USDT'):
+            target_symbols.append(s_name)
+    
+    # 2. Добавляем те, что есть в БД (на случай если их нет в маркете/делистнули, но надо закрыть)
+    db_pairs = await db.get_all_pairs()
+    for p in db_pairs:
+        if p.symbol1 not in target_symbols:
+            target_symbols.append(p.symbol1)
+        if p.symbol2 not in target_symbols:
+            target_symbols.append(p.symbol2)
+            
+    print(f"Subscribing to {len(target_symbols)} symbols (Market + DB active)...")
 
-    streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in list(target_symbols)]
+    streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
 
     # запускаем вебсокеты
-    chunk_size = 100
+    chunk_size = 100 # Ограничение Binance (обычно 1024, но 100 безопаснее для URL length)
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
     for stream_list in streams_list:
-        websockets_list.append(await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error))
-    print("Connected to kline websocket.")
+        try:
+            ws = await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error)
+            websockets_list.append(ws)
+            # Небольшая пауза между подключениями, чтобы не спамить
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"Error subscribing to chunk: {e}")
+
+    print(f"Connected to kline websockets ({len(websockets_list)} connections).")
 
     # Подключение к вебсокету userdata
     try:
