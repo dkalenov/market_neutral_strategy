@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -13,6 +13,18 @@ class Config(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
+# создаем таблицу для хранения истории коинтеграции пар
+class PairHistory(Base):
+    __tablename__ = 'pair_history'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol1 = Column(String)
+    symbol2 = Column(String)
+    event_type = Column(String) # 'FOUND', 'BROKEN'
+    timestamp = Column(BigInteger)
+    hedge_ratio = Column(Float)
+    half_life = Column(Float)
+    reason = Column(String, nullable=True) # Причина удаления
+
 
 # создаем таблицу для хранения пар
 class Pairs(Base):
@@ -22,6 +34,11 @@ class Pairs(Base):
     symbol2 = Column(String)
     hedge_ratio = Column(Float)
     half_life = Column(Float)
+    position_status = Column(Integer, default=0)
+    qty1 = Column(Float, default=0.0)
+    qty2 = Column(Float, default=0.0)
+    entry_price1 = Column(Float, default=0.0)
+    entry_price2 = Column(Float, default=0.0)
     
     
 # создаем таблицу для хранения сделок
@@ -53,6 +70,15 @@ class ConfigInfo:
     db_user: str
     db_password: str
     db_name: str
+    timeframe: str
+    window_size: int
+    # Risk & Strategy Params
+    capital: float
+    max_notional_pct: float
+    leverage: int
+    z_entry: float
+    z_exit: float
+    z_stop: float
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -84,8 +110,32 @@ async def connect(host, port, user, password, db_name):
         await conn.run_sync(Base.metadata.create_all)
     # создаем сессию, expire_on_commit=False - чтобы она не уничтожалась после коммита
     Session = async_sessionmaker(engine, expire_on_commit=False)
+    
+    # Автоматическая миграция — добавляем недостающие колонки
+    await run_migrations(engine)
+    
     # возвращаем сессию
     return Session
+
+
+async def run_migrations(engine):
+    """Автоматически добавляет недостающие колонки в таблицы"""
+    migrations = [
+        # Таблица pairs — новые колонки
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS position_status INTEGER DEFAULT 0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty1 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty2 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price1 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price2 FLOAT DEFAULT 0.0;",
+    ]
+    
+    async with engine.begin() as conn:
+        for sql in migrations:
+            try:
+                await conn.execute(text(sql))
+            except Exception as e:
+                # Игнорируем ошибки (колонка уже существует и т.д.)
+                pass
 
 
 async def load_config():
@@ -134,7 +184,32 @@ async def add_pair(pair):
         # записываем изменения в БД
         await s.commit()
 
-# функция для удаления пары
+# функция для обновления полей сделки по ID
+async def update_trade_fields(trade_id, **kwargs):
+    async with Session() as s:
+        await s.execute(update(Trades).where(Trades.id == trade_id).values(**kwargs))
+        await s.commit()
+
+# функция для обновления пары
+# Принимает dict с обязательным ключом 'id' и остальными полями для обновления
+async def update_pair(data: dict):
+    # Создаём копию, чтобы не мутировать исходный словарь
+    data = data.copy()
+    # создание сессии для работы с БД
+    async with Session() as s:
+        pair_id = data.pop('id')  # Извлекаем ID из копии словаря
+        # обновляем пару
+        await s.execute(update(Pairs).where(Pairs.id == pair_id).values(**data))
+        # записываем изменения в БД
+        await s.commit()
+
+# функция для добавления истории пары
+async def add_pair_history(history_item):
+    async with Session() as s:
+        s.add(history_item)
+        await s.commit()
+
+# функция для обновления пары
 async def delete_pair(pair_id):
     # создание сессии для работы с БД
     async with Session() as s:
@@ -152,6 +227,18 @@ async def get_open_trades():
         # возвращаем результат
         return trades.scalars().all()
 
+# функция для получения последней открытой сделки по ID пары
+async def get_last_open_trade_for_pair(pair_id):
+    async with Session() as s:
+        trade = await s.execute(
+            select(Trades)
+            .where(Trades.pair_id == pair_id)
+            .where(Trades.status == 'OPEN')
+            .order_by(Trades.id.desc())
+            .limit(1)
+        )
+        return trade.scalar_one_or_none()
+
 # функция для добавления сделки
 async def add_trade(trade):
     # создание сессии для работы с БД
@@ -160,6 +247,9 @@ async def add_trade(trade):
         s.add(trade)
         # записываем изменения в БД
         await s.commit()
+        # Обновляем объект, чтобы получить ID
+        await s.refresh(trade)
+        return trade.id
 
 # функция для обновления сделки
 async def update_trade(trade):
