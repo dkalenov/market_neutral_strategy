@@ -19,6 +19,7 @@ pairs_manager: pairs_trading.PairsManager
 async def main():
     global client
     global pairs_manager
+    global all_symbols
     
     # Подключаемся к БД
     ini_config = configparser.ConfigParser()
@@ -133,10 +134,41 @@ async def connect_ws(timeframe='1h'):
     # Бот должен слушать весь рынок, чтобы искать новые коинтеграции
     target_symbols = []
     
+    # Список топовых монет, которые исключаем (BTC, ETH, BNB, SOL и т.д.)
+    # А также стейблкоины и токены-индексы
+    BLACKLIST = [
+        'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 
+        'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'LTCUSDT', 'USDCUSDT',
+        'BTCDOMUSDT', 'DEFIUSDT', 'LINKUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT'
+    ]
+
     # 1. Все USDT пары из маркета
-    for s_name in all_symbols.keys():
-        if s_name.endswith('USDT'):
-            target_symbols.append(s_name)
+    for s_name, s_info in all_symbols.items():
+        # Фильтр 1: Только USDT Perpetual
+        # Проверяем атрибуты объекта (предполагаем наличие status и contract_type)
+        if hasattr(s_info, 'contract_type') and getattr(s_info, 'contract_type') != 'PERPETUAL':
+            continue
+        
+        if hasattr(s_info, 'status') and getattr(s_info, 'status') != 'TRADING':
+            continue
+
+        # Фильтр 2: Только USDT база
+        if not s_name.endswith('USDT'):
+            continue
+        
+        # Фильтр 3: Исключаем черных список
+        if s_name in BLACKLIST:
+            continue
+            
+        # Фильтр 4: Исключаем стейблкоины и специальные токены (UP/DOWN/BEAR/BULL)
+        if any(x in s_name for x in ['UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL', 'DAI', 'TUSD', 'USDP', 'FDUSD']):
+            continue
+
+        target_symbols.append(s_name)
+    
+    # Сортировка для красоты в логах
+    target_symbols.sort()
+    print(f"Subscribing to {len(target_symbols)} high-quality symbols (Filtered for Perpetuals & Trading status).")
     
     # 2. Добавляем те, что есть в БД (на случай если их нет в маркете/делистнули, но надо закрыть)
     db_pairs = await db.get_all_pairs()
