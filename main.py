@@ -21,7 +21,7 @@ async def main():
     global pairs_manager
     global all_symbols
     
-    # Подключаемся к БД
+    # Connect to DB
     ini_config = configparser.ConfigParser()
     ini_config.read('market_neutral/config.ini')
     
@@ -33,56 +33,109 @@ async def main():
         db_name=ini_config['DB']['db_name']
     )
 
-    # Загружаем конфиг из БД
+    # Load config from DB
     conf = await db.load_config()
 
-    # Функция для отправки уведомлений в TG
+    # Initial sync from config.ini to DB if DB is empty or has placeholders
+    sync_needed = False
+    updates = {}
+
+    def needs_sync(val, key_name=None):
+        if val is None:
+            return True
+        if not isinstance(val, str):
+            return False
+        # If it's a key/secret/token, it should be long. 32 chars means it was truncated.
+        if key_name in ['api_key', 'api_secret', 'tg_token'] and len(val) <= 32:
+            return True
+        return val.lower() in ['missing', 'none', '', 'отсутствует']
+
+    # Get values from config.ini
+    api_key_ini = ini_config.get('API', 'KEY', fallback=None) if ini_config.has_section('API') else None
+    api_secret_ini = ini_config.get('API', 'SECRET', fallback=None) if ini_config.has_section('API') else None
+    tg_token_ini = ini_config.get('TG', 'TOKEN', fallback=None) if ini_config.has_section('TG') else None
+    tg_admins_ini = ini_config.get('TG', 'ADMINS', fallback=None) if ini_config.has_section('TG') else None
+
+    if needs_sync(conf.api_key, 'api_key') or (api_key_ini and conf.api_key != api_key_ini):
+        if api_key_ini:
+            updates['api_key'] = api_key_ini
+            sync_needed = True
+    if needs_sync(conf.api_secret, 'api_secret') or (api_secret_ini and conf.api_secret != api_secret_ini):
+        if api_secret_ini:
+            updates['api_secret'] = api_secret_ini
+            sync_needed = True
+    if needs_sync(conf.tg_token, 'tg_token') or (tg_token_ini and conf.tg_token != tg_token_ini):
+        if tg_token_ini:
+            updates['tg_token'] = tg_token_ini
+            sync_needed = True
+    if needs_sync(conf.tg_admins, 'tg_admins') or (tg_admins_ini and conf.tg_admins != tg_admins_ini):
+        if tg_admins_ini:
+            updates['tg_admins'] = tg_admins_ini
+            sync_needed = True
+
+    # Sync DB config to table
+    db_params = ['host', 'port', 'user', 'password', 'db_name']
+    for param in db_params:
+        ini_val = ini_config.get('DB', param, fallback=None)
+        db_key_name = f"db_{param}" if param != 'db_name' else 'db_name'
+        current_db_val = getattr(conf, db_key_name, None)
+        
+        if ini_val and str(current_db_val) != str(ini_val):
+            updates[db_key_name] = ini_val
+            sync_needed = True
+
+    if sync_needed:
+        print("Syncing credentials from config.ini to database...")
+        await db.config_update(**updates)
+        conf = await db.load_config() # Reload synced config
+
+    # Function to send TG notifications
     async def send_tg_notification(message):
         if tg.bot and conf.tg_admins:
-             # Отправляем всем админам
-             admins = [int(admin_id) for admin_id in conf.tg_admins.split(',') if admin_id]
+             # Send to all admins
+             admins = [int(admin_id) for admin_id in conf.tg_admins.split(',') if admin_id] if conf.tg_admins else []
              for admin_id in admins:
                  try:
                      await tg.bot.send_message(admin_id, message)
                  except Exception as e:
                      print(f"Error sending TG message to {admin_id}: {e}")
 
-    # создаем клиента для Binance
+    # Create Binance client
     client = binance.Futures(api_key=conf.api_key,
                              secret_key=conf.api_secret,
                              asynced=True,
                              testnet=ini_config.getboolean('BOT', 'testnet'))
-    # создаем менеджер пар
+    # Init pairs manager
     loop = asyncio.get_running_loop()
     
-    # Дефолтные значения если в конфиге пусто
+    # Default values
     timeframe = conf.timeframe if conf.timeframe else '1h'
     
     if conf.window_size:
         window_size = conf.window_size
     else:
-        # Автоматический подбор оптимального окна для разных ТФ
+        # Auto-selection of window size based on timeframe
         if timeframe == '1m':
-            window_size = 720  # 12 часов (полусуточный цикл, минимизация шума)
+            window_size = 720  # 12 hours
         elif timeframe == '5m':
-            window_size = 576  # 2 суток (2 * 288 свечей)
+            window_size = 576  # 2 days
         elif timeframe == '15m':
-            window_size = 480  # 5 суток (рабочая торговая неделя)
+            window_size = 480  # 5 days
         elif timeframe == '1h':
-            window_size = 336  # 14 дней (2 недели, цикл "средней" краткосрочности)
+            window_size = 336  # 2 weeks
         elif timeframe == '4h':
-            window_size = 180  # 30 дней (месячный тренд)
+            window_size = 180  # 30 days
         elif timeframe == '1d':
-            window_size = 90   # 90 дней (квартальный тренд, избегаем старых структурных разрывов)
+            window_size = 90   # 90 days
         else:
-            window_size = 336  # Дефолт как для 1h
+            window_size = 336  # Default as for 1h
     
-    # 1. Сначала загружаем символы (синхронно для старта)
+    # 1. Load symbols
     print("Initial loading of market symbols...")
     all_symbols = await client.load_symbols()
     print(f"Loaded {len(all_symbols)} symbols.")
     
-    # 2. Создаём менеджер пар ПОСЛЕ загрузки символов (чтобы он получил заполненный dict)
+    # 2. Create pairs manager AFTER loading symbols
     pairs_manager = pairs_trading.PairsManager(
         client, 
         loop, 
@@ -93,26 +146,23 @@ async def main():
         config_info=conf
     )
 
-    # 2. Запускаем фоновое обновление символов
+    # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
     
-    # 3. Подключаемся к вебсокетам (теперь all_symbols заполнен)
+    # 4. Connect to websockets
     loop.create_task(connect_ws(timeframe))
     
-    # Запускаем телеграм бота
+    # Run Telegram bot
     await tg.run(session, client, pairs_manager)
 
 
-# сервис для загрузки всех торговых пар каждый час
+# Service to refresh all trading pairs every hour
 async def load_symbols_loop():
     global all_symbols
-    # вечный цикл
     while True:
         try:
-            # ждем 1 час
             await asyncio.sleep(3600)
             
-            # загружаем все торговые пары
             print("Refreshing market symbols...")
             all_symbols = await client.load_symbols()
             print(f"Refreshed {len(all_symbols)} symbols.")
@@ -123,54 +173,75 @@ async def load_symbols_loop():
             traceback.print_exc()
 
 
-# подключение к вебсокетам
+# Connect to websockets
 async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
 
+    # #region agent log
+    import os
+    import json
+    import time
+    log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
+    def log_instrument(location, message, data=None):
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                entry = {
+                    "id": f"log_{int(time.time()*1000)}_ws",
+                    "timestamp": int(time.time()*1000),
+                    "location": location,
+                    "message": message,
+                    "data": data or {},
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "WS_STABILITY_3"
+                }
+                f.write(json.dumps(entry) + '\n')
+        except: pass
+    # #endregion
+
+    log_instrument("main.py:connect_ws", "Starting websocket connections", {"timeframe": timeframe})
     print("Connecting to websockets...")
 
-    # СОБИРАЕМ ВСЕ USDT ПАРЫ ДЛЯ СКАНЕРА
-    # Бот должен слушать весь рынок, чтобы искать новые коинтеграции
+    # COLLECT ALL USDT PAIRS FOR SCANNER
     target_symbols = []
     
-    # Список топовых монет, которые исключаем (BTC, ETH, BNB, SOL и т.д.)
-    # А также стейблкоины и токены-индексы
-    BLACKLIST = [
-        'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 
-        'ADAUSDT', 'DOGEUSDT', 'TRXUSDT', 'LTCUSDT', 'USDCUSDT',
-        'BTCDOMUSDT', 'DEFIUSDT', 'LINKUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT'
-    ]
+    # Load config for blacklist
+    conf = await db.load_config()
 
-    # 1. Все USDT пары из маркета
+    # Get blacklist from DB (which already contains defaults if initialized)
+    FULL_BLACKLIST = set()
+    if conf and conf.blacklist:
+        FULL_BLACKLIST = set([s.strip().upper() for s in conf.blacklist.split(',') if s.strip()])
+
+    # 1. All USDT pairs from market
     for s_name, s_info in all_symbols.items():
-        # Фильтр 1: Только USDT Perpetual
-        # Проверяем атрибуты объекта (предполагаем наличие status и contract_type)
-        if hasattr(s_info, 'contract_type') and getattr(s_info, 'contract_type') != 'PERPETUAL':
-            continue
-        
-        if hasattr(s_info, 'status') and getattr(s_info, 'status') != 'TRADING':
-            continue
+        # Filter 1: Active and PERPETUAL only
+        try:
+            if getattr(s_info, 'contract_type', None) != 'PERPETUAL': continue
+            if getattr(s_info, 'status', None) != 'TRADING': continue
+            if getattr(s_info, 'quote_asset', None) != 'USDT': continue
+        except:
+            if not s_name.endswith('USDT'): continue
 
-        # Фильтр 2: Только USDT база
-        if not s_name.endswith('USDT'):
-            continue
-        
-        # Фильтр 3: Исключаем черных список
-        if s_name in BLACKLIST:
+        # Filter 2: Exclude blacklist
+        if s_name in FULL_BLACKLIST:
             continue
             
-        # Фильтр 4: Исключаем стейблкоины и специальные токены (UP/DOWN/BEAR/BULL)
-        if any(x in s_name for x in ['UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL', 'DAI', 'TUSD', 'USDP', 'FDUSD']):
+        # Filter 3: Exclude stablecoins and special tokens
+        if any(x in s_name for x in ['UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL', 'DAI', 'TUSD', 'USDP', 'FDUSD', 'EURUSDT', 'GBPUSDT']):
+            continue
+            
+        # Filter 4: Exclude symbols with underscore
+        if '_' in s_name:
             continue
 
         target_symbols.append(s_name)
     
-    # Сортировка для красоты в логах
     target_symbols.sort()
-    print(f"Subscribing to {len(target_symbols)} high-quality symbols (Filtered for Perpetuals & Trading status).")
-    
-    # 2. Добавляем те, что есть в БД (на случай если их нет в маркете/делистнули, но надо закрыть)
+    print(f"Subscribing to {len(target_symbols)} high-quality symbols (Filtered for PERPETUAL USDT-M).")
+
+    # 2. Add symbols from DB (pairs that are already active)
     db_pairs = await db.get_all_pairs()
     for p in db_pairs:
         if p.symbol1 not in target_symbols:
@@ -182,69 +253,72 @@ async def connect_ws(timeframe='1h'):
 
     streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
 
-    # запускаем вебсокеты
-    chunk_size = 100 # Ограничение Binance (обычно 1024, но 100 безопаснее для URL length)
+    # Start websockets
+    chunk_size = 100
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
-    for stream_list in streams_list:
+    log_instrument("main.py:connect_ws", f"Starting websocket connections with {len(streams_list)} chunks")
+
+    for i, stream_list in enumerate(streams_list):
         try:
+            log_instrument("main.py:connect_ws", f"Connecting chunk {i+1}/{len(streams_list)}", {"chunk_size": len(stream_list)})
             ws = await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error)
             websockets_list.append(ws)
-            # Небольшая пауза между подключениями, чтобы не спамить
+            log_instrument("main.py:connect_ws", f"Chunk {i+1} connected successfully")
             await asyncio.sleep(0.1)
         except Exception as e:
+            log_instrument("main.py:connect_ws", f"Failed to connect chunk {i+1}", {"error": str(e), "error_type": type(e).__name__})
             print(f"Error subscribing to chunk: {e}")
 
+    log_instrument("main.py:connect_ws", f"Kline websockets setup complete", {"connections": len(websockets_list)})
     print(f"Connected to kline websockets ({len(websockets_list)} connections).")
 
-    # Подключение к вебсокету userdata
+    # Userdata websocket
     try:
+        log_instrument("main.py:connect_ws", "Connecting userdata websocket")
         userdata_ws = await client.websocket_userdata(on_message=ws_user_msg, on_error=ws_error)
+        log_instrument("main.py:connect_ws", "Userdata websocket connected successfully")
         print("Connected to userdata websocket.")
     except Exception as e:
-        print(f"Could not connect to userdata stream. API keys may be missing. Error: {e}")
+        log_instrument("main.py:connect_ws", "Userdata websocket connection failed", {"error": str(e), "error_type": type(e).__name__})
+        print(f"Could not connect to userdata stream: {e}")
 
 
-# отключение от вебсокетов
+# Disconnect from websockets
 async def disconnect_ws():
     global websockets_list
     global userdata_ws
     print("Disconnecting from websockets...")
-    # перебираем вебсокеты
     for ws in websockets_list:
         try:
-            # закрываем вебсокет
             await ws.close()
         except:
             pass
     try:
-        # закрываем вебсокет userdata
         if 'userdata_ws' in globals() and userdata_ws:
             await userdata_ws.close()
     except:
         pass
 
 
-# обработка ошибок вебсокета
+# Handle websocket errors
 async def ws_error(ws, error):
     print(f"WS ERROR: {error}")
     traceback.print_exc()
 
 
-# обработка сообщений вебсокета
+# Handle kline messages
 async def ws_msg(ws, msg):
     if 'data' not in msg:
         return
     
     kline = msg['data']['k']
     
-    # Если свеча закрылась
+    # If kline closed
     if kline['x']:
-        # print(f"Kline closed for {kline['s']}: C={kline['c']}")
-        # Передаем данные в менеджер пар
         await pairs_manager.add_kline(kline)
 
 
-# обработчик сообщений вебсокета пользователя
+# Handle userdata messages
 async def ws_user_msg(ws, msg):
     print(f"Userdata message: {msg}")
 
