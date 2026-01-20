@@ -1,0 +1,9 @@
+numpy
+pandas
+statsmodels
+aiohttp
+ujson
+requests
+sqlalchemy
+asyncpg
+aiogram
