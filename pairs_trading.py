@@ -85,33 +85,9 @@ class PairsManager:
         self.loop.create_task(self._load_state_from_db())
 
     async def _load_state_from_db(self):
-        # #region agent log
-        import os
-        import json
-        import time
-        log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-        def log_instrument(location, message, data=None):
-            try:
-                with open(log_path, 'a', encoding='utf-8') as f:
-                    entry = {
-                        "id": f"log_{int(time.time()*1000)}_db",
-                        "timestamp": int(time.time()*1000),
-                        "location": location,
-                        "message": message,
-                        "data": data or {},
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "DB_STATE_2"
-                    }
-                    f.write(json.dumps(entry) + '\n')
-            except: pass
-        # #endregion
-
-        log_instrument("pairs_trading.py:_load_state_from_db", "Starting state restoration from DB")
         print("Restoring state from DB...")
         try:
             pairs = await db.get_all_pairs()
-            log_instrument("pairs_trading.py:_load_state_from_db", "Retrieved pairs from DB", {"pairs_count": len(pairs)})
 
             for p in pairs:
                 pair_set = frozenset([p.symbol1, p.symbol2])
@@ -132,17 +108,13 @@ class PairsManager:
                     last_trade = await db.get_last_open_trade_for_pair(p.id)
                     if last_trade:
                         info.current_trade_id = last_trade.id
-                        log_instrument("pairs_trading.py:_load_state_from_db", f"Attached open trade for pair {p.id}", {"trade_id": last_trade.id})
                         print(f"  Attached open trade ID: {last_trade.id}")
                     else:
-                        log_instrument("pairs_trading.py:_load_state_from_db", f"Position active but no trade found for pair {p.id}", {"pair_id": p.id, "status": p.position_status})
                         print(f"  WARN: Position active but no open trade found in DB for pair {p.id}")
 
                 self.active_pairs[pair_set] = info
-                log_instrument("pairs_trading.py:_load_state_from_db", f"Restored pair {p.symbol1}/{p.symbol2}", {"status": p.position_status, "db_id": p.id})
                 print(f"Restored pair {p.symbol1}/{p.symbol2} (Status: {p.position_status}, ID: {p.id})")
         except Exception as e:
-            log_instrument("pairs_trading.py:_load_state_from_db", "State restoration failed", {"error": str(e), "error_type": type(e).__name__})
             print(f"Error loading state from DB: {e}")
 
     async def add_kline(self, kline_data):
@@ -164,29 +136,6 @@ class PairsManager:
         )
 
         if added:
-            # #region agent log
-            import os
-            import json
-            import time
-            log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-            def log_instrument(location, message, data=None):
-                try:
-                    with open(log_path, 'a', encoding='utf-8') as f:
-                        entry = {
-                            "id": f"log_{int(time.time()*1000)}_async",
-                            "timestamp": int(time.time()*1000),
-                            "location": location,
-                            "message": message,
-                            "data": data or {},
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "ASYNC_TASK_5"
-                        }
-                        f.write(json.dumps(entry) + '\n')
-                except: pass
-            # #endregion
-
-            log_instrument("pairs_trading.py:add_kline", f"Creating analysis task for {symbol}", {"data_points": len(self.all_data[symbol].close)})
             self.loop.create_task(self.run_analysis(symbol))
 
     async def _initialize_history(self, symbol):
@@ -329,8 +278,31 @@ class PairsManager:
                 z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
                 z_stop = self.config.z_stop if self.config and self.config.z_stop else 4.0
                 
+                # Test mode flag
+                test_mode = getattr(self.config, 'test_mode', False)
+                if test_mode and isinstance(test_mode, str):
+                    test_mode = test_mode.lower() in ('true', '1', 'yes')
+                
                 # Signal logic
                 if pair_info.position_status == 0:
+                    # Check position limits before opening
+                    if not self.can_open_new_position(s1, s2):
+                        continue
+                    
+                    # In test_mode: force open trades without z-score signals
+                    if test_mode:
+                        test_pairs_str = getattr(self.config, 'test_pairs', '') or ''
+                        test_pairs = [p.strip() for p in test_pairs_str.split(',') if p.strip()]
+                        pair_key = f"{s1}-{s2}"
+                        reverse_key = f"{s2}-{s1}"
+                        
+                        if pair_key in test_pairs or reverse_key in test_pairs or not test_pairs:
+                            print(f"🧪 TEST MODE: Force opening {s1}-{s2} (z={z_score:.2f})")
+                            pair_info.is_trading = True
+                            self.loop.create_task(self._execute_trade(pair_info, 1))
+                            continue
+                    
+                    # Normal mode: check z-score signals
                     if z_score < -z_entry:
                         print(f"🚀 LONG Signal on {s1}-{s2} spread. Z: {z_score:.2f}. Opening...")
                         pair_info.is_trading = True
@@ -470,6 +442,40 @@ class PairsManager:
         except Exception as e:
             print(f"⚠️ Failed to set leverage for {symbol}: {e}")
 
+    def is_symbol_locked(self, symbol: str) -> bool:
+        """Check if symbol is already in an active position (in any pair)."""
+        for pair_info in self.active_pairs.values():
+            if pair_info.position_status != 0:
+                if symbol in (pair_info.symbol1, pair_info.symbol2):
+                    return True
+        return False
+
+    def count_active_positions(self) -> int:
+        """Count the number of currently open pairs."""
+        count = 0
+        for pair_info in self.active_pairs.values():
+            if pair_info.position_status != 0:
+                count += 1
+        return count
+
+    def can_open_new_position(self, s1: str, s2: str) -> bool:
+        """Check if we can open a new position for this pair."""
+        # Check max active pairs limit
+        max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
+        if self.count_active_positions() >= max_pairs:
+            print(f"SKIP: Max active pairs limit ({max_pairs}) reached")
+            return False
+        
+        # Check symbol lock - each symbol can only be in one active pair
+        if self.is_symbol_locked(s1):
+            print(f"SKIP: {s1} is already in an active position")
+            return False
+        if self.is_symbol_locked(s2):
+            print(f"SKIP: {s2} is already in an active position")
+            return False
+        
+        return True
+
     async def _execute_trade(self, pair_info: PairInfo, direction: int):
         """
         Executes a trade order.
@@ -484,41 +490,29 @@ class PairsManager:
             await self._set_leverage(s2, leverage)
         
         try:
-            # #region agent log
-            import os
-            import json
-            import time
-            log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-            def log_instrument(location, message, data=None):
-                try:
-                    with open(log_path, 'a', encoding='utf-8') as f:
-                        entry = {
-                            "id": f"log_{int(time.time()*1000)}_order",
-                            "timestamp": int(time.time()*1000),
-                            "location": location,
-                            "message": message,
-                            "data": data or {},
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "ORDER_EXEC_4"
-                        }
-                        f.write(json.dumps(entry) + '\n')
-                except: pass
-            # #endregion
-
             if direction == 0:
                 if pair_info.position_status == 0:
                     return
 
-                log_instrument("pairs_trading.py:_execute_trade", f"Starting position close for {s1}-{s2}", {"status": pair_info.position_status, "qty1": pair_info.qty1, "qty2": pair_info.qty2})
                 print(f"EXECUTING CLOSE for {s1}-{s2}")
+                
+                # Cancel all open orders (SL/TP) before closing
+                try:
+                    await asyncio.gather(
+                        self.client.cancel_all_open_orders(symbol=s1),
+                        self.client.cancel_all_open_orders(symbol=s2),
+                        return_exceptions=True
+                    )
+                    print(f"🗑️ Cancelled all open orders for {s1} and {s2}")
+                except Exception as e:
+                    print(f"⚠️ Could not cancel open orders: {e}")
+                
                 side1_close = 'SELL' if pair_info.position_status == 1 else 'BUY'
                 side2_close = 'BUY' if pair_info.position_status == 1 else 'SELL'
                 qty1_close = pair_info.qty1
                 qty2_close = pair_info.qty2
 
                 try:
-                    log_instrument("pairs_trading.py:_execute_trade", "Submitting close orders", {"s1_side": side1_close, "s2_side": side2_close})
                     task1 = self.loop.create_task(
                         self.client.new_order(symbol=s1, side=side1_close, type='MARKET', quantity=qty1_close, newOrderRespType='RESULT')
                     )
@@ -526,7 +520,6 @@ class PairsManager:
                         self.client.new_order(symbol=s2, side=side2_close, type='MARKET', quantity=qty2_close, newOrderRespType='RESULT')
                     )
                     results = await asyncio.gather(task1, task2, return_exceptions=True)
-                    log_instrument("pairs_trading.py:_execute_trade", "Close orders completed", {"results_count": len(results)})
                 
                     if any(isinstance(res, Exception) for res in results):
                         err_msg = f"❌ ERROR closing position for {s1}-{s2}. Manual intervention required. Errors: {results}"
@@ -634,14 +627,32 @@ class PairsManager:
             qty2_rounded = utils.round_down(abs(qty2), s2_info.step_size)
 
             min_notional1 = s1_info.notional * 1.1
-            if qty1_rounded * s1_price < min_notional1:
-                print(f"WARN: {s1} qty {qty1_rounded} below min notional {min_notional1}. Bumping up...")
+            min_notional2 = s2_info.notional * 1.1
+            calculated_notional1 = qty1_rounded * s1_price
+            calculated_notional2 = qty2_rounded * s2_price
+            
+            # Get min_order_bump threshold from config (default 1.5)
+            min_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
+            
+            # Check if we should skip trade due to size constraints
+            if utils.should_skip_trade(min_notional1, calculated_notional1, min_order_bump):
+                print(f"SKIP: Trade for {s1}-{s2} cancelled - {s1} below min notional with excessive bump required")
+                pair_info.is_trading = False
+                return
+            
+            if utils.should_skip_trade(min_notional2, calculated_notional2, min_order_bump):
+                print(f"SKIP: Trade for {s1}-{s2} cancelled - {s2} below min notional with excessive bump required")
+                pair_info.is_trading = False
+                return
+            
+            # Apply small bumps if needed (within threshold)
+            if calculated_notional1 < min_notional1:
+                print(f"INFO: {s1} qty slightly bumped to meet min notional")
                 qty1_rounded = utils.round_up(min_notional1 / s1_price, s1_info.step_size)
         
-            min_notional2 = s2_info.notional * 1.1
-            if qty2_rounded * s2_price < min_notional2:
-                 print(f"WARN: {s2} qty {qty2_rounded} below min notional {min_notional2}. Bumping up...")
-                 qty2_rounded = utils.round_up(min_notional2 / s2_price, s2_info.step_size)
+            if calculated_notional2 < min_notional2:
+                print(f"INFO: {s2} qty slightly bumped to meet min notional")
+                qty2_rounded = utils.round_up(min_notional2 / s2_price, s2_info.step_size)
 
             print(f"EXECUTING TRADE for {s1}-{s2}:")
             print(f"  {side1} {qty1_rounded} {s1} at {s1_price}")
@@ -706,8 +717,84 @@ class PairsManager:
                     print(success_msg)
                     await self._notify(success_msg)
                 
+                    # === HARDWARE SL/TP PLACEMENT ===
+                    try:
+                        # Calculate ATR for each symbol
+                        atr1 = utils.calculate_atr(
+                            list(data1.high), 
+                            list(data1.low), 
+                            list(data1.close)
+                        )
+                        atr2 = utils.calculate_atr(
+                            list(data2.high), 
+                            list(data2.low), 
+                            list(data2.close)
+                        )
+                        
+                        # Determine side for each leg
+                        leg1_side = 'LONG' if direction == 1 else 'SHORT'
+                        leg2_side = 'SHORT' if direction == 1 else 'LONG'
+                        
+                        # Calculate SL prices
+                        sl1, tp1, sl1_pct, tp1_pct = utils.calculate_hardware_stops(
+                            pair_info.entry_price1, leg1_side, atr1, self.config
+                        )
+                        sl2, tp2, sl2_pct, tp2_pct = utils.calculate_hardware_stops(
+                            pair_info.entry_price2, leg2_side, atr2, self.config
+                        )
+                        
+                        # Round stop prices to tick size
+                        sl1 = round(sl1, s1_info.price_precision)
+                        sl2 = round(sl2, s2_info.price_precision)
+                        
+                        # Determine close sides
+                        sl_side1 = 'SELL' if direction == 1 else 'BUY'
+                        sl_side2 = 'BUY' if direction == 1 else 'SELL'
+                        
+                        # Place STOP_MARKET orders
+                        print(f"🛡️ Placing hardware SL: {s1} @ {sl1} ({sl1_pct*100:.1f}%), {s2} @ {sl2} ({sl2_pct*100:.1f}%)")
+                        
+                        sl_tasks = [
+                            self.client.new_order(
+                                symbol=s1, 
+                                side=sl_side1, 
+                                type='STOP_MARKET', 
+                                stopPrice=sl1,
+                                closePosition='true'
+                            ),
+                            self.client.new_order(
+                                symbol=s2, 
+                                side=sl_side2, 
+                                type='STOP_MARKET', 
+                                stopPrice=sl2,
+                                closePosition='true'
+                            )
+                        ]
+                        
+                        sl_results = await asyncio.gather(*sl_tasks, return_exceptions=True)
+                        
+                        sl_success = True
+                        for i, res in enumerate(sl_results):
+                            sym = s1 if i == 0 else s2
+                            if isinstance(res, Exception):
+                                print(f"⚠️ WARN: Failed to place SL for {sym}: {res}")
+                                sl_success = False
+                        
+                        if sl_success:
+                            sl_msg = f"🛡️ Hardware SL placed: {s1}@{sl1}, {s2}@{sl2}"
+                            print(sl_msg)
+                        else:
+                            warn_msg = f"⚠️ WARNING: Hardware SL partially failed for {s1}-{s2}. Monitor manually!"
+                            print(warn_msg)
+                            await self._notify(warn_msg)
+                            
+                    except Exception as e:
+                        warn_msg = f"⚠️ ERROR placing hardware SL for {s1}-{s2}: {e}. POSITION IS UNPROTECTED!"
+                        print(warn_msg)
+                        await self._notify(warn_msg)
+                    # === END HARDWARE SL/TP ===
+                
                     if pair_info.db_id:
-                        log_instrument("pairs_trading.py:_execute_trade", "Updating pair in DB", {"db_id": pair_info.db_id, "status": pair_info.position_status})
                         self.loop.create_task(db.update_pair({
                             'id': pair_info.db_id,
                             'position_status': pair_info.position_status,
@@ -718,7 +805,6 @@ class PairsManager:
                         }))
 
                     try:
-                        log_instrument("pairs_trading.py:_execute_trade", "Creating trade record in DB", {"pair_id": pair_info.db_id})
                         trade = db.Trades(
                             pair_id=pair_info.db_id,
                             symbol1=s1,
@@ -733,9 +819,7 @@ class PairsManager:
                             pnl=0.0
                         )
                         pair_info.current_trade_id = await db.add_trade(trade)
-                        log_instrument("pairs_trading.py:_execute_trade", "Trade record created", {"trade_id": pair_info.current_trade_id})
                     except Exception as e:
-                        log_instrument("pairs_trading.py:_execute_trade", "Trade record creation failed", {"error": str(e), "error_type": type(e).__name__})
                         print(f"Error creating trade record: {e}")
             
             except Exception as e:

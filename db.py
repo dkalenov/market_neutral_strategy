@@ -79,6 +79,19 @@ class ConfigInfo:
     z_exit: float
     z_stop: float
     blacklist: str
+    # Hardware SL/TP Parameters (ATR-based)
+    sl_atr_mult: float      # ATR multiplier for stop-loss (default 2.5)
+    sl_min_pct: float       # Minimum SL distance in % (default 0.10)
+    sl_max_pct: float       # Maximum SL distance in % (default 0.30)
+    tp_atr_mult: float      # ATR multiplier for take-profit (default 4.0)
+    tp_min_pct: float       # Minimum TP distance in % (default 0.15)
+    tp_max_pct: float       # Maximum TP distance in % (default 0.50)
+    circuit_breaker_pct: float  # Total pair PnL stop (default 0.20)
+    min_order_bump: float   # Max allowed order size increase ratio (default 1.5)
+    # Position Management (Phase 2)
+    max_active_pairs: int   # Maximum concurrent open pairs (default 5)
+    test_mode: bool         # Force trades without signals on testnet (default False)
+    test_pairs: str         # Comma-separated pairs for test mode (default 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT')
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -100,48 +113,21 @@ class ConfigInfo:
 
 async def connect(host, port, user, password, db_name):
     global Session
-    # #region agent log
-    import os
-    import json
-    import time
-    log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-    def log_instrument(location, message, data=None):
-        try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                entry = {
-                    "id": f"log_{int(time.time()*1000)}_db",
-                    "timestamp": int(time.time()*1000),
-                    "location": location,
-                    "message": message,
-                    "data": data or {},
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "DB_CONN_1"
-                }
-                f.write(json.dumps(entry) + '\n')
-        except: pass
-    # #endregion
-
-    log_instrument("db.py:connect", "Starting database connection", {"host": host, "port": port, "db": db_name})
     try:
         # Create async engine for PostgreSQL using asyncpg
         engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}")
-        log_instrument("db.py:connect", "Engine created successfully")
         async with engine.begin() as conn:
             # Create tables
             await conn.run_sync(Base.metadata.create_all)
-            log_instrument("db.py:connect", "Tables created successfully")
         # Create session maker
         Session = async_sessionmaker(engine, expire_on_commit=False)
-        log_instrument("db.py:connect", "Session maker created")
 
         # Auto-migration for missing columns
         await run_migrations(engine)
-        log_instrument("db.py:connect", "Migrations completed")
 
         return Session
     except Exception as e:
-        log_instrument("db.py:connect", "Database connection failed", {"error": str(e), "error_type": type(e).__name__})
+        print(f"Database connection failed: {e}")
         raise
 
 
@@ -168,29 +154,6 @@ async def run_migrations(engine):
 
 
 async def load_config():
-    # #region agent log
-    import os
-    import json
-    import time
-    log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-    def log_instrument(location, message, data=None):
-        try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                entry = {
-                    "id": f"log_{int(time.time()*1000)}_db",
-                    "timestamp": int(time.time()*1000),
-                    "location": location,
-                    "message": message,
-                    "data": data or {},
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "DB_CONN_1"
-                }
-                f.write(json.dumps(entry) + '\n')
-        except: pass
-    # #endregion
-
-    log_instrument("db.py:load_config", "Starting config load")
     if Session is None:
         raise RuntimeError("DB Session not initialized. Call db.connect() first.")
     try:
@@ -204,7 +167,20 @@ async def load_config():
             'z_entry': '2.0',
             'z_exit': '0.0',
             'z_stop': '4.0',
-            'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT'
+            'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
+            # Hardware SL/TP defaults
+            'sl_atr_mult': '2.5',
+            'sl_min_pct': '0.10',
+            'sl_max_pct': '0.30',
+            'tp_atr_mult': '4.0',
+            'tp_min_pct': '0.15',
+            'tp_max_pct': '0.50',
+            'circuit_breaker_pct': '0.20',
+            'min_order_bump': '1.5',
+            # Position Management (Phase 2)
+            'max_active_pairs': '5',
+            'test_mode': 'false',
+            'test_pairs': 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT'
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty
@@ -221,23 +197,19 @@ async def load_config():
                         # Insert new
                         s.add(Config(key=key, value=default_val))
                         await s.commit()
-                        log_instrument("db.py:load_config", f"Config key created: {key} with default {default_val}")
                     elif (existing.value is None or existing.value == "") and default_val is not None:
                         # Update existing empty/null value with default
                         await s.execute(update(Config).where(Config.key == key).values(value=default_val))
                         await s.commit()
-                        log_instrument("db.py:load_config", f"Config key updated with default: {key} -> {default_val}")
             except Exception as e:
-                log_instrument("db.py:load_config", f"Failed to ensure/update config key {key}", {"error": str(e)})
                 pass
         # Load all configuration from DB
         async with Session() as session:
             result = (await session.execute(select(Config))).scalars().all()
             data = {row.key: row.value for row in result}
-            log_instrument("db.py:load_config", "Config loaded successfully", {"keys_count": len(data)})
             return ConfigInfo(data)
     except Exception as e:
-        log_instrument("db.py:load_config", "Config load failed", {"error": str(e), "error_type": type(e).__name__})
+        print(f"Config load failed: {e}")
         raise
 
 

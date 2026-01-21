@@ -1,6 +1,8 @@
 import asyncio
 import configparser
 import traceback
+import os
+from dotenv import load_dotenv
 import binance
 import pairs_trading
 import db
@@ -21,6 +23,9 @@ async def main():
     global pairs_manager
     global all_symbols
     
+    # Load environment variables from .env file
+    load_dotenv()
+    
     # Connect to DB
     ini_config = configparser.ConfigParser()
     ini_config.read('market_neutral/config.ini')
@@ -36,64 +41,24 @@ async def main():
     # Load config from DB
     conf = await db.load_config()
 
-    # Initial sync from config.ini to DB if DB is empty or has placeholders
-    sync_needed = False
-    updates = {}
-
-    def needs_sync(val, key_name=None):
-        if val is None:
-            return True
-        if not isinstance(val, str):
-            return False
-        # If it's a key/secret/token, it should be long. 32 chars means it was truncated.
-        if key_name in ['api_key', 'api_secret', 'tg_token'] and len(val) <= 32:
-            return True
-        return val.lower() in ['missing', 'none', '', 'отсутствует']
-
-    # Get values from config.ini
-    api_key_ini = ini_config.get('API', 'KEY', fallback=None) if ini_config.has_section('API') else None
-    api_secret_ini = ini_config.get('API', 'SECRET', fallback=None) if ini_config.has_section('API') else None
-    tg_token_ini = ini_config.get('TG', 'TOKEN', fallback=None) if ini_config.has_section('TG') else None
-    tg_admins_ini = ini_config.get('TG', 'ADMINS', fallback=None) if ini_config.has_section('TG') else None
-
-    if needs_sync(conf.api_key, 'api_key') or (api_key_ini and conf.api_key != api_key_ini):
-        if api_key_ini:
-            updates['api_key'] = api_key_ini
-            sync_needed = True
-    if needs_sync(conf.api_secret, 'api_secret') or (api_secret_ini and conf.api_secret != api_secret_ini):
-        if api_secret_ini:
-            updates['api_secret'] = api_secret_ini
-            sync_needed = True
-    if needs_sync(conf.tg_token, 'tg_token') or (tg_token_ini and conf.tg_token != tg_token_ini):
-        if tg_token_ini:
-            updates['tg_token'] = tg_token_ini
-            sync_needed = True
-    if needs_sync(conf.tg_admins, 'tg_admins') or (tg_admins_ini and conf.tg_admins != tg_admins_ini):
-        if tg_admins_ini:
-            updates['tg_admins'] = tg_admins_ini
-            sync_needed = True
-
-    # Sync DB config to table
-    db_params = ['host', 'port', 'user', 'password', 'db_name']
-    for param in db_params:
-        ini_val = ini_config.get('DB', param, fallback=None)
-        db_key_name = f"db_{param}" if param != 'db_name' else 'db_name'
-        current_db_val = getattr(conf, db_key_name, None)
-        
-        if ini_val and str(current_db_val) != str(ini_val):
-            updates[db_key_name] = ini_val
-            sync_needed = True
-
-    if sync_needed:
-        print("Syncing credentials from config.ini to database...")
-        await db.config_update(**updates)
-        conf = await db.load_config() # Reload synced config
+    # Load secrets from environment variables (NOT from config.ini or DB)
+    api_key = os.getenv('BINANCE_API_KEY')
+    api_secret = os.getenv('BINANCE_API_SECRET')
+    tg_token = os.getenv('TG_TOKEN')
+    tg_admins = os.getenv('TG_ADMINS', '')
+    
+    if not api_key or not api_secret:
+        print("ERROR: BINANCE_API_KEY and BINANCE_API_SECRET must be set in .env file!")
+        return
+    
+    if not tg_token:
+        print("WARNING: TG_TOKEN not set in .env file. Telegram bot will not work.")
 
     # Function to send TG notifications
     async def send_tg_notification(message):
-        if tg.bot and conf.tg_admins:
+        if tg.bot and tg_admins:
              # Send to all admins
-             admins = [int(admin_id) for admin_id in conf.tg_admins.split(',') if admin_id] if conf.tg_admins else []
+             admins = [int(admin_id) for admin_id in tg_admins.split(',') if admin_id.strip()]
              for admin_id in admins:
                  try:
                      await tg.bot.send_message(admin_id, message)
@@ -101,8 +66,8 @@ async def main():
                      print(f"Error sending TG message to {admin_id}: {e}")
 
     # Create Binance client
-    client = binance.Futures(api_key=conf.api_key,
-                             secret_key=conf.api_secret,
+    client = binance.Futures(api_key=api_key,
+                             secret_key=api_secret,
                              asynced=True,
                              testnet=ini_config.getboolean('BOT', 'testnet'))
     # Init pairs manager
@@ -178,29 +143,6 @@ async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
 
-    # #region agent log
-    import os
-    import json
-    import time
-    log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-    def log_instrument(location, message, data=None):
-        try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                entry = {
-                    "id": f"log_{int(time.time()*1000)}_ws",
-                    "timestamp": int(time.time()*1000),
-                    "location": location,
-                    "message": message,
-                    "data": data or {},
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "WS_STABILITY_3"
-                }
-                f.write(json.dumps(entry) + '\n')
-        except: pass
-    # #endregion
-
-    log_instrument("main.py:connect_ws", "Starting websocket connections", {"timeframe": timeframe})
     print("Connecting to websockets...")
 
     # COLLECT ALL USDT PAIRS FOR SCANNER
@@ -224,15 +166,26 @@ async def connect_ws(timeframe='1h'):
         except:
             if not s_name.endswith('USDT'): continue
 
-        # Filter 2: Exclude blacklist
+        # Filter 2: ASCII only (exclude Chinese chars and weird symbols)
+        if not s_name.isascii():
+            continue
+
+        # Filter 3: Exclude blacklist
         if s_name in FULL_BLACKLIST:
             continue
             
-        # Filter 3: Exclude stablecoins and special tokens
-        if any(x in s_name for x in ['UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL', 'DAI', 'TUSD', 'USDP', 'FDUSD', 'EURUSDT', 'GBPUSDT']):
+        # Filter 4: Exclude stablecoins, USDC, leverage tokens, and special tokens
+        BAD_PATTERNS = [
+            'UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL',  # Leveraged tokens
+            'DAI', 'TUSD', 'USDP', 'FDUSD', 'USDC',  # Stablecoins
+            'EURUSDT', 'GBPUSDT',  # Fiat pairs
+            '3L', '3S', '2L', '2S',  # Leverage tokens
+            'LEVERAGE'
+        ]
+        if any(pattern in s_name for pattern in BAD_PATTERNS):
             continue
             
-        # Filter 4: Exclude symbols with underscore
+        # Filter 5: Exclude symbols with underscore
         if '_' in s_name:
             continue
 
@@ -256,30 +209,22 @@ async def connect_ws(timeframe='1h'):
     # Start websockets
     chunk_size = 100
     streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
-    log_instrument("main.py:connect_ws", f"Starting websocket connections with {len(streams_list)} chunks")
 
     for i, stream_list in enumerate(streams_list):
         try:
-            log_instrument("main.py:connect_ws", f"Connecting chunk {i+1}/{len(streams_list)}", {"chunk_size": len(stream_list)})
             ws = await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error)
             websockets_list.append(ws)
-            log_instrument("main.py:connect_ws", f"Chunk {i+1} connected successfully")
             await asyncio.sleep(0.1)
         except Exception as e:
-            log_instrument("main.py:connect_ws", f"Failed to connect chunk {i+1}", {"error": str(e), "error_type": type(e).__name__})
-            print(f"Error subscribing to chunk: {e}")
+            print(f"Error subscribing to chunk {i+1}: {e}")
 
-    log_instrument("main.py:connect_ws", f"Kline websockets setup complete", {"connections": len(websockets_list)})
     print(f"Connected to kline websockets ({len(websockets_list)} connections).")
 
     # Userdata websocket
     try:
-        log_instrument("main.py:connect_ws", "Connecting userdata websocket")
         userdata_ws = await client.websocket_userdata(on_message=ws_user_msg, on_error=ws_error)
-        log_instrument("main.py:connect_ws", "Userdata websocket connected successfully")
         print("Connected to userdata websocket.")
     except Exception as e:
-        log_instrument("main.py:connect_ws", "Userdata websocket connection failed", {"error": str(e), "error_type": type(e).__name__})
         print(f"Could not connect to userdata stream: {e}")
 
 

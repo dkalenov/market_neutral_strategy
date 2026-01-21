@@ -51,76 +51,55 @@ async def run(_session, _client: binance.Futures, _pairs_manager):
     global pairs_manager
     global tg_admins
 
-    # #region agent log
-    import os
-    import json
-    import time
-    log_path = r"c:\Users\Dmitrii\Trading strategies\Market_neutral_strategy\.cursor\debug.log"
-    def log_instrument(location, message, data=None):
-        try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                entry = {
-                    "id": f"log_{int(time.time()*1000)}_tg",
-                    "timestamp": int(time.time()*1000),
-                    "location": location,
-                    "message": message,
-                    "data": data or {},
-                    "sessionId": "debug-session",
-                    "runId": "run1",
-                    "hypothesisId": "TG_BOT_6"
-                }
-                f.write(json.dumps(entry) + '\n')
-        except: pass
-    # #endregion
-
     session = _session
     client = _client
     pairs_manager = _pairs_manager
 
-    log_instrument("tg.py:run", "Starting Telegram bot initialization")
-
+    # Load from environment variables
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    load_dotenv(env_path)
+    
+    tg_token = os.getenv('TG_TOKEN')
+    tg_admins_str = os.getenv('TG_ADMINS', '')
+    
+    if not tg_token:
+        print("ERROR: TG_TOKEN not set in .env file!")
+        return
+    
+    # Parse admins
+    tg_admins = [int(admin_id) for admin_id in tg_admins_str.split(',') if admin_id.strip()]
+    
     # Initialize bot
     try:
-        bot = Bot(token=config['TG']['TOKEN'], default=DefaultBotProperties(parse_mode='HTML'))
-        log_instrument("tg.py:run", "Bot initialized successfully")
+        bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'))
     except Exception as e:
-        log_instrument("tg.py:run", "Bot initialization failed", {"error": str(e)})
+        print(f"TG: Bot initialization failed: {e}")
         raise
 
-    # Parse admins
-    admins_str = config.get('TG', 'ADMINS', fallback='')
-    tg_admins = [int(admin_id) for admin_id in admins_str.split(',') if admin_id]
-    log_instrument("tg.py:run", "Parsed admin IDs", {"admins_count": len(tg_admins), "admins": tg_admins})
-
     # Delete webhook
-    print(f"TG: Token used: {config['TG']['TOKEN'][:10]}...")
+    print(f"TG: Token used: {tg_token[:10]}...")
     print(f"TG: Authorized admins: {tg_admins}")
     print("TG: Deleting webhook...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log_instrument("tg.py:run", "Webhook deleted successfully")
     except Exception as e:
-        log_instrument("tg.py:run", "Webhook deletion failed", {"error": str(e)})
         print(f"TG: Webhook deletion failed: {e}")
 
     print("TG: Starting polling...")
     await send_startup_message()
     try:
         # Start polling
-        log_instrument("tg.py:run", "Starting polling")
         await dp.start_polling(bot)
     except Exception as e:
-        log_instrument("tg.py:run", "Polling failed", {"error": str(e), "error_type": type(e).__name__})
         print(f"TG: Polling failed with an error: {e}")
     finally:
         # Close session
         print("TG: Closing bot session...")
         try:
             await bot.session.close()
-            log_instrument("tg.py:run", "Bot session closed successfully")
             print("TG: Bot session closed.")
         except Exception as e:
-            log_instrument("tg.py:run", "Bot session close failed", {"error": str(e)})
             print(f"TG: Session close error: {e}")
 
 
@@ -135,6 +114,7 @@ class States(StatesGroup):
     change_keys = State()
     restart = State()
     blacklist = State()
+    hardware_sltp = State()
 
 # Helper function to answer messages or callbacks
 async def answer(message: Message | CallbackQuery, text, reply_markup=None):
@@ -158,6 +138,21 @@ async def start(message: Message, state: FSMContext):
     ], resize_keyboard=True)
     # Send message
     await answer(message, "Main Menu", reply_markup=keyboard)
+
+
+# Callback handler for inline "start" button (Main Menu from inline keyboards)
+@dp.callback_query(F.data == "start")
+async def start_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(States.main_menu)
+    # Create keyboard
+    keyboard = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="Statistics"), KeyboardButton(text="Pairs")],
+        [KeyboardButton(text="Settings"), KeyboardButton(text="Blacklist")],
+        [KeyboardButton(text="Main Menu")]
+    ], resize_keyboard=True)
+    await callback.message.answer("Main Menu", reply_markup=keyboard)
+    await callback.answer()
 
 
 # Trading pairs
@@ -279,10 +274,17 @@ async def settings(message: Message, state: FSMContext):
     conf = await db.load_config()
     # Set state
     await state.set_state(States.settings)
+    # Get test mode status
+    test_mode = getattr(conf, 'test_mode', False)
+    if isinstance(test_mode, str):
+        test_mode = test_mode.lower() in ('true', '1', 'yes')
+    
     # Create keyboard
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Strategy Settings", callback_data="strategy_settings")],
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
+        [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
+        [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
         [InlineKeyboardButton(text="Restart Bot", callback_data="restart")]
     ])
@@ -341,6 +343,9 @@ async def set_window(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "risk_settings")
 async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    max_pairs = getattr(conf, 'max_active_pairs', 5) or 5
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Capital (USDT)", callback_data="set_capital")],
         [InlineKeyboardButton(text="Leverage (x)", callback_data="set_leverage")],
@@ -348,12 +353,14 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Z-Entry", callback_data="set_z_entry")],
         [InlineKeyboardButton(text="Z-Exit", callback_data="set_z_exit")],
         [InlineKeyboardButton(text="Z-Stop", callback_data="set_z_stop")],
+        [InlineKeyboardButton(text="🛡️ Hardware SL/TP", callback_data="hardware_sltp")],
+        [InlineKeyboardButton(text=f"📊 Max Pairs: {max_pairs}", callback_data="set_max_pairs")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Risk Management Settings:\n\n"
-                           "<b>Capital</b>: Your purchasing power (Equity * Leverage).\n"
-                           "<b>Leverage</b>: Exchange margin leverage.\n"
-                           "<b>Max %</b>: Limit per pair from Capital.", reply_markup=keyboard)
+                           "<b>Capital</b>: Your purchasing power.\n"
+                           "<b>Hardware SL/TP</b>: ATR-based stop orders.\n"
+                           f"<b>Max Pairs</b>: {max_pairs} concurrent trades.", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_capital")
 async def set_capital_cb(callback: CallbackQuery, state: FSMContext):
@@ -390,6 +397,143 @@ async def set_z_stop_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="z_stop")
     await answer(callback, "Enter Z-Score for STOP (e.g., 4.0):")
+
+@dp.callback_query(F.data == "set_max_pairs")
+async def set_max_pairs_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="max_active_pairs")
+    await answer(callback, "Enter maximum number of concurrent pairs (e.g., 5):")
+
+@dp.callback_query(F.data == "toggle_test_mode")
+async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    current = getattr(conf, 'test_mode', False)
+    if isinstance(current, str):
+        current = current.lower() in ('true', '1', 'yes')
+    
+    new_value = 'false' if current else 'true'
+    await db.config_update(test_mode=new_value)
+    
+    # Reload config in pairs_manager
+    if pairs_manager and hasattr(pairs_manager, 'config'):
+        pairs_manager.config = await db.load_config()
+    
+    status = "🧪 Test Mode ENABLED" if new_value == 'true' else "🧪 Test Mode DISABLED"
+    await callback.answer(status)
+    # Refresh menu - go back to settings
+    await settings(callback, state)
+
+
+# === HARDWARE SL/TP MENU ===
+@dp.callback_query(F.data == "hardware_sltp")
+async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    sl_atr = getattr(conf, 'sl_atr_mult', 2.5) or 2.5
+    sl_min = getattr(conf, 'sl_min_pct', 0.10) or 0.10
+    sl_max = getattr(conf, 'sl_max_pct', 0.30) or 0.30
+    tp_atr = getattr(conf, 'tp_atr_mult', 4.0) or 4.0
+    tp_min = getattr(conf, 'tp_min_pct', 0.15) or 0.15
+    tp_max = getattr(conf, 'tp_max_pct', 0.50) or 0.50
+    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
+    bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"SL ATR Mult: {sl_atr}", callback_data="set_sl_atr")],
+        [InlineKeyboardButton(text=f"SL Min: {sl_min*100:.0f}%", callback_data="set_sl_min"),
+         InlineKeyboardButton(text=f"SL Max: {sl_max*100:.0f}%", callback_data="set_sl_max")],
+        [InlineKeyboardButton(text=f"TP ATR Mult: {tp_atr}", callback_data="set_tp_atr")],
+        [InlineKeyboardButton(text=f"TP Min: {tp_min*100:.0f}%", callback_data="set_tp_min"),
+         InlineKeyboardButton(text=f"TP Max: {tp_max*100:.0f}%", callback_data="set_tp_max")],
+        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}%", callback_data="set_circuit_breaker")],
+        [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
+        [InlineKeyboardButton(text="Back", callback_data="risk_settings")]
+    ])
+    await answer(callback, "🛡️ <b>Hardware SL/TP Settings</b>\n\n"
+                           "<b>Stop-Loss (ATR-based):</b>\n"
+                           f"  ATR Multiplier: {sl_atr}x\n"
+                           f"  Range: {sl_min*100:.0f}% - {sl_max*100:.0f}%\n\n"
+                           "<b>Take-Profit (ATR-based):</b>\n"
+                           f"  ATR Multiplier: {tp_atr}x\n"
+                           f"  Range: {tp_min*100:.0f}% - {tp_max*100:.0f}%\n\n"
+                           f"<b>Circuit Breaker:</b> {cb_pct*100:.0f}% total pair loss\n"
+                           f"<b>Min Order Bump:</b> {bump}x max increase", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "set_sl_atr")
+async def set_sl_atr_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="sl_atr_mult")
+    await answer(callback, "Enter SL ATR Multiplier (e.g., 2.5):")
+
+@dp.callback_query(F.data == "set_sl_min")
+async def set_sl_min_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="sl_min_pct")
+    await answer(callback, "Enter Min SL % as decimal (e.g., 0.10 for 10%):")
+
+@dp.callback_query(F.data == "set_sl_max")
+async def set_sl_max_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="sl_max_pct")
+    await answer(callback, "Enter Max SL % as decimal (e.g., 0.30 for 30%):")
+
+@dp.callback_query(F.data == "set_tp_atr")
+async def set_tp_atr_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="tp_atr_mult")
+    await answer(callback, "Enter TP ATR Multiplier (e.g., 4.0):")
+
+@dp.callback_query(F.data == "set_tp_min")
+async def set_tp_min_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="tp_min_pct")
+    await answer(callback, "Enter Min TP % as decimal (e.g., 0.15 for 15%):")
+
+@dp.callback_query(F.data == "set_tp_max")
+async def set_tp_max_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="tp_max_pct")
+    await answer(callback, "Enter Max TP % as decimal (e.g., 0.50 for 50%):")
+
+@dp.callback_query(F.data == "set_circuit_breaker")
+async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="circuit_breaker_pct")
+    await answer(callback, "Enter Circuit Breaker % as decimal (e.g., 0.20 for 20%):")
+
+@dp.callback_query(F.data == "set_min_bump")
+async def set_min_bump_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="min_order_bump")
+    await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
+
+@dp.message(StateFilter(States.hardware_sltp))
+async def process_hardware_sltp_settings(message: Message, state: FSMContext):
+    data = await state.get_data()
+    waiting_for = data.get("waiting_for")
+    value = message.text.strip()
+    
+    try:
+        float_value = float(value)
+        if float_value <= 0:
+            await message.answer("Value must be positive!")
+            return
+        
+        await db.config_update(**{waiting_for: str(float_value)})
+        await message.answer(f"✅ {waiting_for} updated to {float_value}")
+        
+        # Reload pairs_manager config if available
+        if pairs_manager and hasattr(pairs_manager, 'config'):
+            pairs_manager.config = await db.load_config()
+        
+        await state.clear()
+        # Return to hardware_sltp menu
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Back to Hardware SL/TP", callback_data="hardware_sltp")],
+            [InlineKeyboardButton(text="Main Menu", callback_data="start")]
+        ])
+        await message.answer("Setting saved!", reply_markup=keyboard)
+    except ValueError:
+        await message.answer("Invalid input! Please enter a valid number.")
 
 
 # Handle settings input
@@ -454,6 +598,14 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             val = float(value)
             await db.config_update(z_stop=val)
             await answer(message, f"Z-Stop: <b>{val}</b>")
+
+        elif waiting_for == "max_active_pairs":
+            val = int(value)
+            if val < 1 or val > 100:
+                await answer(message, "Value must be between 1 and 100.")
+                return
+            await db.config_update(max_active_pairs=val)
+            await answer(message, f"Max Active Pairs: <b>{val}</b>")
             
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 
@@ -567,11 +719,14 @@ async def blacklist_menu(event: Message | CallbackQuery, state: FSMContext):
     
     if isinstance(event, CallbackQuery):
         await event.answer()
-        await event.message.edit_text(text, reply_markup=keyboard)
+        try:
+            await event.message.edit_text(text, reply_markup=keyboard, parse_mode='HTML')
+        except:
+            await event.message.answer(text, reply_markup=keyboard, parse_mode='HTML')
     else:
-        await event.answer(text, reply_markup=keyboard)
+        await event.answer(text, reply_markup=keyboard, parse_mode='HTML')
 
-@dp.message(States.blacklist)
+@dp.message(StateFilter(States.blacklist))
 async def process_blacklist_update(message: Message, state: FSMContext):
     if message.text.lower() == 'clear':
         await db.config_update(blacklist="")
@@ -612,7 +767,7 @@ async def process_blacklist_update(message: Message, state: FSMContext):
     
     await blacklist_menu(message, state)
 
-@dp.callback_query(States.blacklist, F.data == "bl_clear")
+@dp.callback_query(StateFilter(States.blacklist), F.data == "bl_clear")
 async def bl_clear_cb(callback: CallbackQuery, state: FSMContext):
     await db.config_update(blacklist="")
     await callback.answer("List cleared")

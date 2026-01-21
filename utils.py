@@ -180,3 +180,104 @@ def round_down(num, step_size=1.0):
     precision = get_precision(step_size)
     multiplier = 10 ** precision
     return math.floor(num * multiplier) / multiplier
+
+
+def calculate_atr(high: list, low: list, close: list, period: int = 14) -> float:
+    """
+    Calculate Average True Range for volatility-based stop placement.
+    
+    Args:
+        high: List of high prices
+        low: List of low prices  
+        close: List of close prices
+        period: ATR period (default 14)
+    
+    Returns:
+        ATR value as float
+    """
+    if len(close) < 2:
+        return 0.0
+    
+    tr_list = []
+    for i in range(1, len(close)):
+        tr = max(
+            high[i] - low[i],
+            abs(high[i] - close[i-1]),
+            abs(low[i] - close[i-1])
+        )
+        tr_list.append(tr)
+    
+    if len(tr_list) < period:
+        return sum(tr_list) / len(tr_list) if tr_list else 0.0
+    
+    return sum(tr_list[-period:]) / period
+
+
+def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) -> tuple:
+    """
+    Calculate hardware SL and TP prices based on ATR and config parameters.
+    
+    Args:
+        entry_price: Entry price of the position
+        side: 'LONG' or 'SHORT'
+        atr: Average True Range value
+        config: Config object with sl_*/tp_* parameters
+    
+    Returns:
+        (stop_loss_price, take_profit_price, sl_pct, tp_pct)
+    """
+    # Get config values with defaults
+    sl_atr_mult = getattr(config, 'sl_atr_mult', 2.5) or 2.5
+    sl_min_pct = getattr(config, 'sl_min_pct', 0.10) or 0.10
+    sl_max_pct = getattr(config, 'sl_max_pct', 0.30) or 0.30
+    tp_atr_mult = getattr(config, 'tp_atr_mult', 4.0) or 4.0
+    tp_min_pct = getattr(config, 'tp_min_pct', 0.15) or 0.15
+    tp_max_pct = getattr(config, 'tp_max_pct', 0.50) or 0.50
+    
+    # Calculate ATR-based percentages
+    if entry_price > 0 and atr > 0:
+        atr_sl = (atr / entry_price) * sl_atr_mult
+        atr_tp = (atr / entry_price) * tp_atr_mult
+    else:
+        atr_sl = sl_min_pct
+        atr_tp = tp_min_pct
+    
+    # Apply min/max bounds
+    sl_pct = max(min(atr_sl, sl_max_pct), sl_min_pct)
+    tp_pct = max(min(atr_tp, tp_max_pct), tp_min_pct)
+    
+    # Calculate prices based on side
+    if side == 'LONG':
+        sl_price = entry_price * (1 - sl_pct)
+        tp_price = entry_price * (1 + tp_pct)
+    else:  # SHORT
+        sl_price = entry_price * (1 + sl_pct)
+        tp_price = entry_price * (1 - tp_pct)
+    
+    return sl_price, tp_price, sl_pct, tp_pct
+
+
+def should_skip_trade(min_notional: float, calculated_notional: float, min_order_bump: float = 1.5) -> bool:
+    """
+    Check if trade should be skipped due to minimum order requirements.
+    
+    Args:
+        min_notional: Minimum notional required by exchange
+        calculated_notional: Notional calculated by strategy
+        min_order_bump: Maximum allowed increase ratio (default 1.5x)
+    
+    Returns:
+        True if trade should be skipped, False otherwise
+    """
+    if calculated_notional >= min_notional:
+        return False  # No adjustment needed
+    
+    if calculated_notional <= 0:
+        return True  # Invalid notional
+    
+    bump_ratio = min_notional / calculated_notional
+    if bump_ratio > min_order_bump:
+        print(f"SKIP: Order bump {bump_ratio:.2f}x exceeds threshold {min_order_bump}x")
+        return True
+    
+    return False  # Small adjustment is acceptable
