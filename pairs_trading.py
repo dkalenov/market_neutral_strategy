@@ -6,6 +6,8 @@ import asyncio
 import itertools
 import time
 import traceback
+import json
+import os
 from concurrent.futures import ProcessPoolExecutor
 import db
 
@@ -116,6 +118,135 @@ class PairsManager:
                 print(f"Restored pair {p.symbol1}/{p.symbol2} (Status: {p.position_status}, ID: {p.id})")
         except Exception as e:
             print(f"Error loading state from DB: {e}")
+        
+        # Add test pairs if test_mode is enabled
+        await self._add_test_pairs()
+
+    async def _add_test_pairs(self):
+        """Add test pairs to active_pairs when test_mode is enabled."""
+        test_mode = getattr(self.config, 'test_mode', False)
+        if isinstance(test_mode, str):
+            test_mode = test_mode.lower() in ('true', '1', 'yes')
+        
+        if not test_mode:
+            return
+            
+        test_pairs_str = getattr(self.config, 'test_pairs', '') or ''
+        test_pairs = [p.strip() for p in test_pairs_str.split(',') if p.strip()]
+        
+        if not test_pairs:
+            print("⚠️ Test mode enabled but no test_pairs configured")
+            return
+            
+        print(f"🧪 TEST MODE: Adding {len(test_pairs)} test pairs...")
+        
+        for pair_str in test_pairs:
+            parts = pair_str.split('-')
+            if len(parts) != 2:
+                continue
+            s1, s2 = parts[0].strip(), parts[1].strip()
+            pair_set = frozenset([s1, s2])
+            
+            # Skip if already exists
+            if pair_set in self.active_pairs:
+                print(f"  Test pair {s1}-{s2} already in active_pairs")
+                continue
+            
+            # Add to DB and active_pairs
+            try:
+                new_pair = db.Pairs(
+                    symbol1=s1,
+                    symbol2=s2,
+                    hedge_ratio=1.0,  # Default hedge for test
+                    half_life=24.0,   # Default half-life
+                    position_status=0
+                )
+                await db.add_pair(new_pair)
+                
+                self.active_pairs[pair_set] = PairInfo(
+                    symbol1=s1,
+                    symbol2=s2,
+                    hedge_ratio=1.0,
+                    half_life=24.0,
+                    db_id=new_pair.id
+                )
+                print(f"  ✅ Added test pair: {s1}-{s2}")
+            except Exception as e:
+                print(f"  ⚠️ Error adding test pair {s1}-{s2}: {e}")
+
+    async def initialize_all_symbols_data(self, target_symbols=None, concurrency=20):
+        """
+        Loads historical data for specified symbols with controlled concurrency.
+        Prioritizes active pairs and priority pairs.
+        """
+        symbols_to_load = target_symbols if target_symbols else list(self.all_symbols.keys())
+        print(f"Initializing history for {len(symbols_to_load)} symbols (Concurrency: {concurrency})...")
+        start_time = time.time()
+        
+        # 1. Identify priority symbols
+        priority_symbols = set()
+        
+        # Active pairs
+        for pair in self.active_pairs.values():
+            priority_symbols.add(pair.symbol1)
+            priority_symbols.add(pair.symbol2)
+            
+        # Priority file
+        priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
+        if priority_file_path and not os.path.isabs(priority_file_path):
+             priority_file_path = os.path.join(os.getcwd(), priority_file_path)
+             
+        if priority_file_path and os.path.exists(priority_file_path):
+            try:
+                with open(priority_file_path, 'r') as f:
+                    file_pairs = json.load(f)
+                    if isinstance(file_pairs, list):
+                        for p_str in file_pairs:
+                            parts = p_str.split('-')
+                            if len(parts) == 2:
+                                s1, s2 = parts[0].strip(), parts[1].strip()
+                                # Only add if it's in the target list
+                                if s1 in symbols_to_load: priority_symbols.add(s1)
+                                if s2 in symbols_to_load: priority_symbols.add(s2)
+            except: pass
+            
+        # Sort symbols: priority first, then others
+        other_symbols = [s for s in symbols_to_load if s not in priority_symbols]
+        sorted_symbols = list(priority_symbols) + other_symbols
+        print(f"Priority symbols: {len(priority_symbols)}, Others: {len(other_symbols)}")
+        
+        # 2. Batch processing with semaphore
+        sem = asyncio.Semaphore(concurrency)
+        
+        async def load_safe(symbol):
+            async with sem:
+                # Check if data exists
+                if symbol not in self.all_data:
+                    self.all_data[symbol] = Data(maxlen=self.max_len)
+                    await self._initialize_history(symbol)
+                
+        tasks = [load_safe(s) for s in sorted_symbols]
+        if tasks:
+            await asyncio.gather(*tasks)
+        
+        elapsed = time.time() - start_time
+        print(f"✅ History initialization finished in {elapsed:.2f}s.")
+        
+        # Force run analysis for test_mode
+        test_mode = getattr(self.config, 'test_mode', False)
+        if isinstance(test_mode, str):
+            test_mode = test_mode.lower() in ('true', '1', 'yes')
+        if test_mode and self.active_pairs:
+            print("🧪 TEST MODE: Force running initial analysis...")
+            await asyncio.sleep(1)  # Small delay to ensure data is ready
+            # Trigger analysis for each test pair
+            for pair_set, pair_info in list(self.active_pairs.items()):
+                if pair_info.position_status == 0:
+                    # Trigger analysis for this pair
+                    s1, s2 = pair_info.symbol1, pair_info.symbol2
+                    if s1 in self.all_data and s2 in self.all_data:
+                        print(f"  Analyzing {s1}-{s2}...")
+                        await self._check_signals_for_active_pairs(s1)
 
     async def add_kline(self, kline_data):
         """
@@ -353,17 +484,58 @@ class PairsManager:
             return
 
         print(f"Analyzing {len(ready_symbols)} symbols using {self.min_data_points} candles.")
+        ready_set = set(ready_symbols)
+        checked_pairs = set()
+        candidates_to_process = []
+        
+        # --- 1. Load and process Priority Pairs ---
+        priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
+        # Handle path resolution
+        if priority_file_path and not os.path.isabs(priority_file_path):
+             priority_file_path = os.path.join(os.getcwd(), priority_file_path)
 
-        all_combinations = list(itertools.combinations(ready_symbols, 2))
-        candidates = [pair for pair in all_combinations if frozenset(pair) not in self.active_pairs]
-        total_pairs = len(candidates)
-        print(f"Total pairs to check: {total_pairs}")
+        priority_pairs = []
+        if priority_file_path and os.path.exists(priority_file_path):
+            try:
+                with open(priority_file_path, 'r') as f:
+                    file_pairs = json.load(f)
+                    if isinstance(file_pairs, list):
+                        for p_str in file_pairs:
+                            parts = p_str.split('-')
+                            if len(parts) == 2:
+                                s1, s2 = parts[0].strip(), parts[1].strip()
+                                if s1 in ready_set and s2 in ready_set:
+                                    pair_set = frozenset([s1, s2])
+                                    if pair_set not in self.active_pairs and pair_set not in checked_pairs:
+                                        priority_pairs.append((s1, s2))
+                                        checked_pairs.add(pair_set)
+                
+                if priority_pairs:
+                    print(f"⭐ Found {len(priority_pairs)} valid candidates from priority list.")
+                    candidates_to_process.extend(priority_pairs)
+            except Exception as e:
+                print(f"⚠️ Error loading priority pairs from {priority_file_path}: {e}")
+        else:
+             print(f"Info: Priority file not found at {priority_file_path}")
+
+        # --- 2. Generate standard combinations ---
+        all_combinations = itertools.combinations(ready_symbols, 2)
+        added_count = 0
+        for p in all_combinations:
+            pair_set = frozenset(p)
+            if pair_set not in self.active_pairs and pair_set not in checked_pairs:
+                candidates_to_process.append(p)
+                added_count += 1
+                
+        total_pairs = len(candidates_to_process)
+        print(f"Total pairs to check: {total_pairs} (Priority: {len(priority_pairs)}, Others: {added_count})")
         
         if total_pairs == 0:
             return
 
         CHUNK_SIZE = 5000
-        chunks = [candidates[i:i + CHUNK_SIZE] for i in range(0, total_pairs, CHUNK_SIZE)]
+        # Priority pairs are first in the list, so they will be in the first chunks
+        chunks = [candidates_to_process[i:i + CHUNK_SIZE] for i in range(0, total_pairs, CHUNK_SIZE)]
         print(f"Split into {len(chunks)} chunks for parallel processing.")
         
         tasks = []

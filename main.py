@@ -142,6 +142,7 @@ async def load_symbols_loop():
 async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
+    global pairs_manager
 
     print("Connecting to websockets...")
 
@@ -155,6 +156,21 @@ async def connect_ws(timeframe='1h'):
     FULL_BLACKLIST = set()
     if conf and conf.blacklist:
         FULL_BLACKLIST = set([s.strip().upper() for s in conf.blacklist.split(',') if s.strip()])
+
+    # Test mode: whitelist test_pairs symbols (bypass blacklist)
+    TEST_WHITELIST = set()
+    test_mode = getattr(conf, 'test_mode', False)
+    if isinstance(test_mode, str):
+        test_mode = test_mode.lower() in ('true', '1', 'yes')
+    if test_mode:
+        test_pairs_str = getattr(conf, 'test_pairs', '') or ''
+        for pair_str in test_pairs_str.split(','):
+            parts = pair_str.strip().split('-')
+            if len(parts) == 2:
+                TEST_WHITELIST.add(parts[0].strip().upper())
+                TEST_WHITELIST.add(parts[1].strip().upper())
+        if TEST_WHITELIST:
+            print(f"🧪 TEST MODE: Whitelisting symbols: {TEST_WHITELIST}")
 
     # 1. All USDT pairs from market
     for s_name, s_info in all_symbols.items():
@@ -170,8 +186,8 @@ async def connect_ws(timeframe='1h'):
         if not s_name.isascii():
             continue
 
-        # Filter 3: Exclude blacklist
-        if s_name in FULL_BLACKLIST:
+        # Filter 3: Exclude blacklist (but allow TEST_WHITELIST in test_mode)
+        if s_name in FULL_BLACKLIST and s_name not in TEST_WHITELIST:
             continue
             
         # Filter 4: Exclude stablecoins, USDC, leverage tokens, and special tokens
@@ -203,6 +219,10 @@ async def connect_ws(timeframe='1h'):
             target_symbols.append(p.symbol2)
             
     print(f"Subscribing to {len(target_symbols)} symbols (Market + DB active)...")
+
+    # Optimization: Pre-load historical data using batch processing
+    if pairs_manager:
+        await pairs_manager.initialize_all_symbols_data(target_symbols)
 
     streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
 
