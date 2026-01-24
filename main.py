@@ -70,6 +70,10 @@ async def main():
                              secret_key=api_secret,
                              asynced=True,
                              testnet=ini_config.getboolean('BOT', 'testnet'))
+    
+    # CRITICAL: Sync time with server
+    await client.sync_time()
+    
     # Init pairs manager
     loop = asyncio.get_running_loop()
     
@@ -110,6 +114,9 @@ async def main():
         notify_callback=send_tg_notification,
         config_info=conf
     )
+
+    # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
+    await pairs_manager.initialize()
 
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())

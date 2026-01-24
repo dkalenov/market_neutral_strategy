@@ -115,8 +115,14 @@ class ConfigInfo:
 async def connect(host, port, user, password, db_name):
     global Session
     try:
-        # Create async engine for PostgreSQL using asyncpg
-        engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}")
+        # Create async engine for PostgreSQL using asyncpg with increased pool size
+        engine = create_async_engine(
+            f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}",
+            pool_size=20,        # Increased from default 5
+            max_overflow=30,     # Increased from default 10
+            pool_timeout=60,     # Increased timeout
+            pool_recycle=1800    # Recycle connections every 30 mins
+        )
         async with engine.begin() as conn:
             # Create tables
             await conn.run_sync(Base.metadata.create_all)

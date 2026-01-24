@@ -80,18 +80,39 @@ class PairsManager:
         self._discovery_task = None
         self._last_discovery_time = 0
         
+        # CRITICAL: Lock to prevent race condition when opening trades
+        self._trade_lock = asyncio.Lock()
+        
         # CPU Pool for heavy computations
         self.executor = ProcessPoolExecutor(max_workers=None)
         
-        # Restore state from DB on startup
-        self.loop.create_task(self._load_state_from_db())
+        # NOTE: Initialization is now EXPLICIT - call await pairs_manager.initialize() in main.py
+        self._initialized = False
+
+    async def initialize(self):
+        """
+        MUST be called after creation and awaited before any trading.
+        Loads state from DB and reconciles with exchange.
+        """
+        if self._initialized:
+            return
+        await self._load_state_from_db()
+        self._initialized = True
+        max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
+        print(f"✅ PairsManager initialized. Max active pairs: {max_pairs}")
 
     async def _load_state_from_db(self):
-        print("Restoring state from DB...")
+        print("Restoring active positions from DB...")
         try:
             pairs = await db.get_all_pairs()
-
+            
+            # Only restore pairs with ACTIVE positions (status != 0)
+            active_count = 0
             for p in pairs:
+                # Skip pairs without open positions - they'll be re-discovered
+                if p.position_status == 0:
+                    continue
+                    
                 pair_set = frozenset([p.symbol1, p.symbol2])
                 info = PairInfo(
                     symbol1=p.symbol1,
@@ -106,21 +127,168 @@ class PairsManager:
                     db_id=p.id
                 )
 
-                if p.position_status != 0:
-                    last_trade = await db.get_last_open_trade_for_pair(p.id)
-                    if last_trade:
-                        info.current_trade_id = last_trade.id
-                        print(f"  Attached open trade ID: {last_trade.id}")
-                    else:
-                        print(f"  WARN: Position active but no open trade found in DB for pair {p.id}")
+                last_trade = await db.get_last_open_trade_for_pair(p.id)
+                if last_trade:
+                    info.current_trade_id = last_trade.id
+                    print(f"  ✅ Restored: {p.symbol1}-{p.symbol2} | Trade ID: {last_trade.id}")
+                else:
+                    print(f"  ⚠️ Restored: {p.symbol1}-{p.symbol2} | No trade record")
 
                 self.active_pairs[pair_set] = info
-                print(f"Restored pair {p.symbol1}/{p.symbol2} (Status: {p.position_status}, ID: {p.id})")
+                active_count += 1
+            
+            print(f"Restored {active_count} active pairs from DB.")
         except Exception as e:
             print(f"Error loading state from DB: {e}")
         
+        # CRITICAL: Reconcile DB state with actual exchange positions
+        await self._reconcile_with_exchange()
+        
         # Add test pairs if test_mode is enabled
         await self._add_test_pairs()
+
+    async def _reconcile_with_exchange(self):
+        """
+        CRITICAL: Synchronize DB state with actual exchange positions.
+        Exchange is the SINGLE SOURCE OF TRUTH.
+        """
+        print("🔄 Reconciling DB with exchange positions...")
+        try:
+            # Get all open positions from exchange
+            exchange_positions = await self.client.get_position_risk()
+            
+            # Build set of symbols with actual open positions on exchange
+            open_on_exchange = {}
+            for pos in exchange_positions:
+                symbol = pos.get('symbol', '')
+                qty = abs(float(pos.get('positionAmt', 0)))
+                if qty > 0:
+                    open_on_exchange[symbol] = {
+                        'qty': qty,
+                        'side': 'LONG' if float(pos.get('positionAmt', 0)) > 0 else 'SHORT',
+                        'entry_price': float(pos.get('entryPrice', 0)),
+                        'unrealized_pnl': float(pos.get('unRealizedProfit', 0))
+                    }
+            
+            # Fetch all open orders to check for SL/TP protection
+            all_open_orders = await self.client.get_orders()
+            orders_by_symbol = {}
+            for o in all_open_orders:
+                sym = o['symbol']
+                if sym not in orders_by_symbol: orders_by_symbol[sym] = []
+                orders_by_symbol[sym].append(o)
+
+            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} open orders.")
+            
+            # Warn about positions on exchange that are NOT in our DB
+            tracked_symbols = set()
+            for pair_info in self.active_pairs.values():
+                if pair_info.position_status != 0:
+                    tracked_symbols.add(pair_info.symbol1)
+                    tracked_symbols.add(pair_info.symbol2)
+            
+            unknown_positions = [s for s in open_on_exchange.keys() if s not in tracked_symbols]
+            if unknown_positions:
+                print(f"  🚨 UNKNOWN POSITIONS on exchange (not tracked by bot): {unknown_positions}")
+                await self._notify(f"🚨 WARNING: {len(unknown_positions)} unknown positions on exchange: {unknown_positions[:5]}... Close manually!")
+            
+            # Check each pair in DB
+            pairs_to_fix = []
+            for pair_set, pair_info in list(self.active_pairs.items()):
+                s1, s2 = pair_info.symbol1, pair_info.symbol2
+                s1_open = s1 in open_on_exchange
+                s2_open = s2 in open_on_exchange
+                
+                if pair_info.position_status != 0:
+                    # DB says position is OPEN
+                    if not s1_open and not s2_open:
+                        # But exchange says BOTH legs are closed!
+                        print(f"  ⚠️ MISMATCH: {s1}-{s2} marked OPEN in DB but CLOSED on exchange. Fixing...")
+                        pairs_to_fix.append((pair_info, 'close_db'))
+                    elif s1_open != s2_open:
+                        # One leg open, one closed - orphaned position!
+                        print(f"  🚨 ORPHAN: {s1}-{s2} has mismatched legs! {s1}:{s1_open}, {s2}:{s2_open}")
+                        await self._notify(f"🚨 ORPHAN POSITION: {s1}-{s2} has mismatched legs. Manual check required!")
+                    else:
+                        # Both open - check for SL orders
+                        has_sl1 = any(o['type'] == 'STOP_MARKET' for o in orders_by_symbol.get(s1, []))
+                        has_sl2 = any(o['type'] == 'STOP_MARKET' for o in orders_by_symbol.get(s2, []))
+                        if not has_sl1 or not has_sl2:
+                            print(f"  ⚠️ WARNING: {s1}-{s2} is open but lacks SL orders! (s1:{has_sl1}, s2:{has_sl2})")
+                            await self._notify(f"⚠️ PROTECT: {s1}-{s2} is open but lacks hardware SL protection on exchange!")
+                else:
+                    # DB says position is CLOSED
+                    if s1_open or s2_open:
+                        # But exchange has open position!
+                        print(f"  ⚠️ MISMATCH: {s1}-{s2} marked CLOSED in DB but has positions on exchange!")
+                        # Update DB to reflect reality
+                        if s1_open and s2_open:
+                            pairs_to_fix.append((pair_info, 'open_db', open_on_exchange.get(s1), open_on_exchange.get(s2)))
+            
+            # Apply fixes
+            for fix in pairs_to_fix:
+                pair_info = fix[0]
+                action = fix[1]
+                
+                if action == 'close_db':
+                    # Mark as closed in DB
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+                    
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0
+                        })
+                    
+                    # Close any open trade records
+                    if pair_info.current_trade_id:
+                        await db.update_trade_fields(
+                            pair_info.current_trade_id,
+                            status='CLOSED_MANUAL',
+                            close_time=int(time.time() * 1000)
+                        )
+                        pair_info.current_trade_id = None
+                    
+                    print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as CLOSED in DB")
+                
+                elif action == 'open_db' and len(fix) >= 4:
+                    # Mark as open in DB based on exchange data
+                    pos1_data = fix[2]
+                    pos2_data = fix[3]
+                    if pos1_data and pos2_data:
+                        pair_info.position_status = 1 if pos1_data['side'] == 'LONG' else -1
+                        pair_info.qty1 = pos1_data['qty']
+                        pair_info.qty2 = pos2_data['qty']
+                        pair_info.entry_price1 = pos1_data['entry_price']
+                        pair_info.entry_price2 = pos2_data['entry_price']
+                        
+                        if pair_info.db_id:
+                            await db.update_pair({
+                                'id': pair_info.db_id,
+                                'position_status': pair_info.position_status,
+                                'qty1': pair_info.qty1,
+                                'qty2': pair_info.qty2,
+                                'entry_price1': pair_info.entry_price1,
+                                'entry_price2': pair_info.entry_price2
+                            })
+                        
+                        print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as OPEN in DB (synced from exchange)")
+            
+            active_count = self.count_active_positions()
+            print(f"🔄 Reconciliation complete. Active pairs in DB: {active_count}")
+            
+        except Exception as e:
+            print(f"❌ Error during reconciliation: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _add_test_pairs(self):
         """Add test pairs to active_pairs when test_mode is enabled."""
@@ -331,8 +499,24 @@ class PairsManager:
                 # Dynamic recalculation of cointegration
                 flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2)
 
-                # Pair rotation: if cointegration breaks
-                if flag == 0 or hl > 200:
+                # Check if this is a test pair that should not be removed
+                is_protected_test_pair = False
+                test_mode = getattr(self.config, 'test_mode', False)
+                if isinstance(test_mode, str):
+                    test_mode = test_mode.lower() in ('true', '1', 'yes')
+                if test_mode:
+                    test_pairs_str = getattr(self.config, 'test_pairs', '') or ''
+                    t_pairs = [p.strip() for p in test_pairs_str.split(',')]
+                    if f"{s1}-{s2}" in t_pairs or f"{s2}-{s1}" in t_pairs:
+                        is_protected_test_pair = True
+                        # Use default hedge for test pairs if calculation failed
+                        if flag == 0 or np.isnan(hedge):
+                            hedge = 1.0
+                        if np.isnan(hl) or hl > 200:
+                            hl = 24.0
+
+                # Pair rotation: if cointegration breaks (skip for protected test pairs)
+                if (flag == 0 or hl > 200) and not is_protected_test_pair:
                     print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                     
                     if pair_info.position_status != 0:
@@ -353,7 +537,8 @@ class PairsManager:
                             half_life=hl,
                             reason=reason
                         )
-                        self.loop.create_task(db.add_pair_history(history_item))
+                        # CRITICAL: Await this to prevent pool exhaustion (was create_task)
+                        await db.add_pair_history(history_item)
                         await db.delete_pair(pair_info.db_id)
                     
                     if pair_set in self.active_pairs:
@@ -365,11 +550,12 @@ class PairsManager:
                 pair_info.half_life = hl
                 
                 if pair_info.db_id:
-                    self.loop.create_task(db.update_pair({
+                    # CRITICAL: Await DB update to prevent pool exhaustion (was create_task)
+                    await db.update_pair({
                         'id': pair_info.db_id,
                         'hedge_ratio': hedge,
                         'half_life': hl
-                    }))
+                    })
 
                 spread = log_prices1 - pair_info.hedge_ratio * log_prices2
                 z_score = utils.calculate_z_last(spread)
@@ -420,15 +606,19 @@ class PairsManager:
                     if not self.can_open_new_position(s1, s2):
                         continue
                     
-                    # In test_mode: force open trades without z-score signals
+                    # In test_mode: force open trades without z-score signals (only on slow TFs)
                     if test_mode:
                         test_pairs_str = getattr(self.config, 'test_pairs', '') or ''
                         test_pairs = [p.strip() for p in test_pairs_str.split(',') if p.strip()]
                         pair_key = f"{s1}-{s2}"
                         reverse_key = f"{s2}-{s1}"
                         
-                        if pair_key in test_pairs or reverse_key in test_pairs or not test_pairs:
-                            print(f"🧪 TEST MODE: Force opening {s1}-{s2} (z={z_score:.2f})")
+                        # Force open only on slow timeframes (15m+) where signals are rare
+                        slow_timeframes = ['15m', '30m', '1h', '2h', '4h', '1d']
+                        should_force = self.timeframe in slow_timeframes
+                        
+                        if (pair_key in test_pairs or reverse_key in test_pairs) and should_force:
+                            print(f"🧪 TEST MODE: Force opening {s1}-{s2} (z={z_score:.2f}, tf={self.timeframe})")
                             pair_info.is_trading = True
                             self.loop.create_task(self._execute_trade(pair_info, 1))
                             continue
@@ -574,7 +764,8 @@ class PairsManager:
                         half_life=hl,
                         reason='Discovery'
                     )
-                    self.loop.create_task(db.add_pair_history(history_item))
+                    # CRITICAL: Await this to prevent flooding DB pool with 13k+ tasks
+                    await db.add_pair_history(history_item)
                     
                     pair_set = frozenset([s1, s2])
                     print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}")
@@ -635,15 +826,10 @@ class PairsManager:
         # Check max active pairs limit
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         if self.count_active_positions() >= max_pairs:
-            print(f"SKIP: Max active pairs limit ({max_pairs}) reached")
             return False
         
         # Check symbol lock - each symbol can only be in one active pair
-        if self.is_symbol_locked(s1):
-            print(f"SKIP: {s1} is already in an active position")
-            return False
-        if self.is_symbol_locked(s2):
-            print(f"SKIP: {s2} is already in an active position")
+        if self.is_symbol_locked(s1) or self.is_symbol_locked(s2):
             return False
         
         return True
@@ -657,7 +843,19 @@ class PairsManager:
         s2 = pair_info.symbol2
         leverage = self.config.leverage if self.config and self.config.leverage else 20
 
+        # For OPENING trades: acquire lock and re-check limit
         if direction != 0:
+            async with self._trade_lock:
+                # CRITICAL: Re-check limit inside lock to prevent race condition
+                if not self.can_open_new_position(s1, s2):
+                    print(f"🚫 Trade blocked by lock: {s1}-{s2} (limit reached or symbol locked)")
+                    pair_info.is_trading = False
+                    return
+                
+                # Mark as opening INSIDE lock before releasing
+                pair_info.position_status = direction  # Tentatively set to prevent other trades
+            
+            # Now proceed with actual execution (lock released for API calls)
             await self._set_leverage(s1, leverage)
             await self._set_leverage(s2, leverage)
         
@@ -671,8 +869,8 @@ class PairsManager:
                 # Cancel all open orders (SL/TP) before closing
                 try:
                     await asyncio.gather(
-                        self.client.cancel_all_open_orders(symbol=s1),
-                        self.client.cancel_all_open_orders(symbol=s2),
+                        self.client.cancel_open_orders(symbol=s1),
+                        self.client.cancel_open_orders(symbol=s2),
                         return_exceptions=True
                     )
                     print(f"🗑️ Cancelled all open orders for {s1} and {s2}")
@@ -773,6 +971,7 @@ class PairsManager:
         
             if data1 is None or data2 is None:
                 print(f"ERROR: Data not found for {s1} or {s2} during execution.")
+                pair_info.position_status = 0
                 return
 
             log_prices1 = np.log(list(data1.close)[-COINT_WINDOW:])
@@ -809,11 +1008,13 @@ class PairsManager:
             # Check if we should skip trade due to size constraints
             if utils.should_skip_trade(min_notional1, calculated_notional1, min_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s1} below min notional with excessive bump required")
+                pair_info.position_status = 0
                 pair_info.is_trading = False
                 return
             
             if utils.should_skip_trade(min_notional2, calculated_notional2, min_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s2} below min notional with excessive bump required")
+                pair_info.position_status = 0
                 pair_info.is_trading = False
                 return
             
@@ -924,63 +1125,86 @@ class PairsManager:
                         sl_side2 = 'BUY' if direction == 1 else 'SELL'
                         
                         # Place STOP_MARKET orders
-                        print(f"🛡️ Placing hardware SL: {s1} @ {sl1} ({sl1_pct*100:.1f}%), {s2} @ {sl2} ({sl2_pct*100:.1f}%)")
+                        # Round TP prices to tick size
+                        tp1 = round(tp1, s1_info.price_precision)
+                        tp2 = round(tp2, s2_info.price_precision)
+
+                        # Place STOP_MARKET orders for SL and TAKE_PROFIT_MARKET for TP
+                        print(f"🛡️ Placing SL/TP: {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
                         
-                        sl_tasks = [
-                            self.client.new_order(
-                                symbol=s1, 
-                                side=sl_side1, 
-                                type='STOP_MARKET', 
-                                stopPrice=sl1,
-                                closePosition='true'
-                            ),
-                            self.client.new_order(
-                                symbol=s2, 
-                                side=sl_side2, 
-                                type='STOP_MARKET', 
-                                stopPrice=sl2,
-                                closePosition='true'
-                            )
+                        protection_tasks = [
+                            # SL Orders
+                            self.client.new_order(symbol=s1, side=sl_side1, type='STOP_MARKET', stopPrice=sl1, closePosition='true'),
+                            self.client.new_order(symbol=s2, side=sl_side2, type='STOP_MARKET', stopPrice=sl2, closePosition='true'),
+                            # TP Orders
+                            self.client.new_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT_MARKET', stopPrice=tp1, closePosition='true'),
+                            self.client.new_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT_MARKET', stopPrice=tp2, closePosition='true')
                         ]
                         
-                        sl_results = await asyncio.gather(*sl_tasks, return_exceptions=True)
+                        results = await asyncio.gather(*protection_tasks, return_exceptions=True)
                         
-                        sl_success = True
-                        for i, res in enumerate(sl_results):
-                            sym = s1 if i == 0 else s2
+                        orders_success = True
+                        for res in results:
                             if isinstance(res, Exception):
-                                print(f"⚠️ WARN: Failed to place SL for {sym}: {res}")
-                                sl_success = False
+                                print(f"⚠️ WARN: Failed to place protection order: {res}")
+                                orders_success = False
                         
-                        if sl_success:
-                            sl_msg = f"🛡️ Hardware SL placed: {s1}@{sl1}, {s2}@{sl2}"
-                            print(sl_msg)
+                        if orders_success:
+                            print(f"🛡️ Protection placed successfully (4 orders)")
+                            
+                            # VERIFICATION: Check if orders actually exist
+                            try:
+                                await asyncio.sleep(0.5) # Give exchange a moment
+                                open_orders = await self.client.get_orders()
+                                protection_count = sum(1 for o in open_orders if o['symbol'] in [s1, s2] and o['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'])
+                                
+                                # We expect at least 2 orders (SLs) but ideally 4 (SL+TP)
+                                # If < 2 (missing SLs), force close. TP failure is warned but not fatal.
+                                if protection_count < 2:
+                                    verify_msg = f"🚨 PROTECTION VERIFICATION FAILED: Found {protection_count}/4 orders. SL missing! Force closing {s1}-{s2}!"
+                                    print(verify_msg)
+                                    await self._notify(verify_msg)
+                                    pair_info.is_trading = True
+                                    self.loop.create_task(self._execute_trade(pair_info, 0))
+                                elif protection_count < 4:
+                                    print(f"⚠️ WARN: Only {protection_count}/4 protection orders active for {s1}-{s2}. Check manually.")
+                            except Exception as ve:
+                                print(f"⚠️ Could not verify protection orders: {ve}")
+
                         else:
-                            warn_msg = f"⚠️ WARNING: Hardware SL partially failed for {s1}-{s2}. Monitor manually!"
+                            warn_msg = f"⚠️ CRITICAL: Protection partially FAILED for {s1}-{s2}. Force closing for safety!"
                             print(warn_msg)
                             await self._notify(warn_msg)
+                            # CRITICAL: Force close position if SL fails
+                            pair_info.is_trading = True
+                            self.loop.create_task(self._execute_trade(pair_info, 0))
                             
                     except Exception as e:
-                        warn_msg = f"⚠️ ERROR placing hardware SL for {s1}-{s2}: {e}. POSITION IS UNPROTECTED!"
+                        warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
                         print(warn_msg)
                         await self._notify(warn_msg)
+                        # CRITICAL: Force close position if SL fails
+                        pair_info.is_trading = True
+                        self.loop.create_task(self._execute_trade(pair_info, 0))
                     # === END HARDWARE SL/TP ===
                 
                     if pair_info.db_id:
-                        self.loop.create_task(db.update_pair({
-                            'id': pair_info.db_id,
-                            'position_status': pair_info.position_status,
-                            'qty1': pair_info.qty1,
-                            'qty2': pair_info.qty2,
-                            'entry_price1': pair_info.entry_price1,
-                            'entry_price2': pair_info.entry_price2
-                        }))
+                        # Await DB update for safety
+                        try:
+                            await db.update_pair({
+                                'id': pair_info.db_id,
+                                'position_status': pair_info.position_status,
+                                'qty1': pair_info.qty1,
+                                'qty2': pair_info.qty2,
+                                'entry_price1': pair_info.entry_price1,
+                                'entry_price2': pair_info.entry_price2
+                            })
+                        except Exception as dbe:
+                            print(f"⚠️ DB Update failed: {dbe}")
 
                     try:
                         trade = db.Trades(
                             pair_id=pair_info.db_id,
-                            symbol1=s1,
-                            symbol2=s2,
                             direction=direction,
                             status='OPEN',
                             open_time=int(time.time() * 1000),
