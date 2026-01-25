@@ -99,6 +99,9 @@ async def main():
         else:
             window_size = 336  # Default as for 1h
     
+    # Entry timeframe for faster signals (default: 15m)
+    entry_timeframe = conf.entry_timeframe if conf.entry_timeframe else '15m'
+    
     # 1. Load symbols
     print("Initial loading of market symbols...")
     all_symbols = await client.load_symbols()
@@ -110,6 +113,7 @@ async def main():
         loop, 
         all_symbols, 
         timeframe=timeframe, 
+        entry_timeframe=entry_timeframe,  # NEW: faster TF for entry signals
         min_data_points=window_size,
         notify_callback=send_tg_notification,
         config_info=conf
@@ -121,8 +125,8 @@ async def main():
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
     
-    # 4. Connect to websockets
-    loop.create_task(connect_ws(timeframe))
+    # 4. Connect to websockets (both timeframes)
+    loop.create_task(connect_ws(timeframe, entry_timeframe))
     
     # Run Telegram bot
     await tg.run(session, client, pairs_manager)
@@ -146,7 +150,7 @@ async def load_symbols_loop():
 
 
 # Connect to websockets
-async def connect_ws(timeframe='1h'):
+async def connect_ws(timeframe='1h', entry_timeframe=None):
     global websockets_list
     global userdata_ws
     global pairs_manager
@@ -231,21 +235,44 @@ async def connect_ws(timeframe='1h'):
     if pairs_manager:
         await pairs_manager.initialize_all_symbols_data(target_symbols)
 
-    streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
+    # MAIN TIMEFRAME: for discovery (cointegration tests)
+    main_streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
+    
+    # ENTRY TIMEFRAME: for faster entry signals (only if different from main)
+    if entry_timeframe and entry_timeframe != timeframe:
+        entry_streams = [f"{symbol.lower()}@kline_{entry_timeframe}" for symbol in target_symbols]
+        print(f"MTF Mode: Main TF={timeframe} (discovery), Entry TF={entry_timeframe} (signals)")
+    else:
+        entry_streams = []
+        print(f"Single TF Mode: {timeframe}")
 
-    # Start websockets
+    # Start websockets for MAIN timeframe
     chunk_size = 100
-    streams_list = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+    streams_list = [main_streams[i:i + chunk_size] for i in range(0, len(main_streams), chunk_size)]
 
     for i, stream_list in enumerate(streams_list):
         try:
-            ws = await client.websocket(stream_list, on_message=ws_msg, on_error=ws_error)
+            ws = await client.websocket(stream_list, on_message=ws_msg_main, on_error=ws_error)
             websockets_list.append(ws)
             await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"Error subscribing to chunk {i+1}: {e}")
+            print(f"Error subscribing to main TF chunk {i+1}: {e}")
 
-    print(f"Connected to kline websockets ({len(websockets_list)} connections).")
+    print(f"Connected to main TF kline websockets ({len(websockets_list)} connections).")
+    
+    # Start websockets for ENTRY timeframe (if MTF mode)
+    if entry_streams:
+        entry_streams_list = [entry_streams[i:i + chunk_size] for i in range(0, len(entry_streams), chunk_size)]
+        entry_ws_count = 0
+        for i, stream_list in enumerate(entry_streams_list):
+            try:
+                ws = await client.websocket(stream_list, on_message=ws_msg_entry, on_error=ws_error)
+                websockets_list.append(ws)
+                entry_ws_count += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Error subscribing to entry TF chunk {i+1}: {e}")
+        print(f"Connected to entry TF kline websockets ({entry_ws_count} connections).")
 
     # Userdata websocket
     try:
@@ -278,16 +305,28 @@ async def ws_error(ws, error):
     traceback.print_exc()
 
 
-# Handle kline messages
-async def ws_msg(ws, msg):
+# Handle MAIN timeframe kline messages (for discovery + validation)
+async def ws_msg_main(ws, msg):
     if 'data' not in msg:
         return
     
     kline = msg['data']['k']
     
-    # If kline closed
+    # Only process on candle close (discovery needs complete candles)
     if kline['x']:
-        await pairs_manager.add_kline(kline)
+        await pairs_manager.add_kline_main(kline)
+
+
+# Handle ENTRY timeframe kline messages (for faster signal detection)
+async def ws_msg_entry(ws, msg):
+    if 'data' not in msg:
+        return
+    
+    kline = msg['data']['k']
+    
+    # Only process on candle close (even for entry, we use closed 15m candles for stability)
+    if kline['x']:
+        await pairs_manager.add_kline_entry(kline)
 
 
 # Handle userdata messages
