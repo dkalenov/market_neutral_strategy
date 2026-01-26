@@ -62,19 +62,25 @@ class PairInfo:
 class PairsManager:
     """
     Manages symbol data, finds cointegrated pairs, and generates signals.
+    Supports Multi-Timeframe (MTF) mode: main TF for discovery, entry TF for faster signals.
     """
-    def __init__(self, client, loop, all_symbols, timeframe='1h', min_data_points=200, notify_callback=None, config_info=None):
+    def __init__(self, client, loop, all_symbols, timeframe='1h', entry_timeframe=None, min_data_points=200, notify_callback=None, config_info=None):
         self.client = client
         self.loop = loop
         self.all_symbols = all_symbols
         self.timeframe = timeframe
+        self.entry_timeframe = entry_timeframe or timeframe  # Default to main TF if not specified
         self.min_data_points = min_data_points
         self.notify_callback = notify_callback
         self.config = config_info
         
         self.max_len = int(min_data_points * 2.5)
         
+        # Main TF data (for discovery + validation)
         self.all_data: dict[str, Data] = {}
+        # Entry TF data (for faster signal detection) - only used if MTF mode
+        self.entry_data: dict[str, Data] = {}
+        
         self.active_pairs: dict[frozenset, PairInfo] = {}
         self.leverage_cache = {} # {symbol: leverage_int}
         self._discovery_task = None
@@ -400,6 +406,24 @@ class PairsManager:
         elapsed = time.time() - start_time
         print(f"✅ History initialization finished in {elapsed:.2f}s.")
         
+        # CRITICAL: Run Discovery to find cointegrated pairs BEFORE checking signals
+        print("🔍 Running initial Discovery...")
+        await self._discover_new_pairs()
+        
+        # Initialize entry_data for all symbols that have main TF data (for MTF mode)
+        if self.entry_timeframe != self.timeframe:
+            print(f"📊 Initializing entry TF ({self.entry_timeframe}) data for discovered pairs...")
+            symbols_to_init = set()
+            for pair_info in self.active_pairs.values():
+                symbols_to_init.add(pair_info.symbol1)
+                symbols_to_init.add(pair_info.symbol2)
+            
+            for sym in symbols_to_init:
+                if sym not in self.entry_data and sym in self.all_symbols:
+                    self.entry_data[sym] = Data(maxlen=100)
+                    await self._initialize_entry_history(sym)
+            print(f"📊 Entry TF data initialized for {len(symbols_to_init)} symbols.")
+        
         # Force run analysis for test_mode
         test_mode = getattr(self.config, 'test_mode', False)
         if isinstance(test_mode, str):
@@ -416,9 +440,10 @@ class PairsManager:
                         print(f"  Analyzing {s1}-{s2}...")
                         await self._check_signals_for_active_pairs(s1)
 
-    async def add_kline(self, kline_data):
+    async def add_kline_main(self, kline_data):
         """
-        Processes a new kline from websocket.
+        Processes kline from MAIN timeframe (discovery + validation).
+        Triggers full analysis including cointegration tests.
         """
         symbol = kline_data['s']
         
@@ -435,7 +460,99 @@ class PairsManager:
         )
 
         if added:
+            # Full analysis: discovery + signal check
             self.loop.create_task(self.run_analysis(symbol))
+
+    async def add_kline_entry(self, kline_data):
+        """
+        Processes kline from ENTRY timeframe (faster signal detection).
+        Only checks signals for ALREADY DISCOVERED pairs.
+        """
+        symbol = kline_data['s']
+        
+        # Store entry TF data for the symbol
+        if symbol not in self.entry_data:
+            self.entry_data[symbol] = Data(maxlen=100)  # Smaller buffer for entry TF
+            await self._initialize_entry_history(symbol)
+
+        added = self.entry_data[symbol].add_kline(
+            kline_data['t'],
+            kline_data['o'],
+            kline_data['h'],
+            kline_data['l'],
+            kline_data['c']
+        )
+
+        if added:
+            # Only check signals (no discovery) for active pairs containing this symbol
+            self.loop.create_task(self._check_entry_signals(symbol))
+
+    async def _initialize_entry_history(self, symbol):
+        """Loads historical data for entry timeframe."""
+        try:
+            klines = await self.client.klines(symbol, self.entry_timeframe, limit=100)
+            data = self.entry_data[symbol]
+            for k in klines:
+                data.add_kline(k[0], k[1], k[2], k[3], k[4])
+        except Exception as e:
+            if symbol in self.entry_data:
+                del self.entry_data[symbol]
+
+    async def _check_entry_signals(self, updated_symbol: str):
+        """
+        Checks entry signals using ENTRY timeframe data.
+        Uses main TF cointegration parameters but entry TF prices for faster signals.
+        """
+        for pair_set, pair_info in list(self.active_pairs.items()):
+            if pair_info.is_trading or pair_info.position_status != 0:
+                continue
+            
+            s1, s2 = pair_info.symbol1, pair_info.symbol2
+            if updated_symbol not in (s1, s2):
+                continue
+            
+            # Check if we have entry data for both symbols
+            if s1 not in self.entry_data or s2 not in self.entry_data:
+                continue
+            
+            data1 = self.entry_data[s1]
+            data2 = self.entry_data[s2]
+            
+            if len(data1.close) < 30 or len(data2.close) < 30:
+                continue
+            
+            # Use main TF hedge ratio but entry TF prices
+            log_prices1 = np.log(list(data1.close)[-50:])
+            log_prices2 = np.log(list(data2.close)[-50:])
+            
+            spread = log_prices1 - pair_info.hedge_ratio * log_prices2
+            z_score = utils.calculate_z_last(spread)
+            
+            if z_score is None:
+                continue
+            
+            pair_info.last_z_score = z_score
+            
+            z_entry = self.config.z_entry if self.config and self.config.z_entry else 2.0
+            
+            # Check position limits
+            if not self.can_open_new_position(s1, s2):
+                continue
+            
+            # Entry signals
+            if z_score < -z_entry:
+                print(f"🚀 [ENTRY TF] LONG Signal on {s1}-{s2}. Z: {z_score:.2f}. Opening...")
+                pair_info.is_trading = True
+                self.loop.create_task(self._execute_trade(pair_info, 1))
+            elif z_score > z_entry:
+                print(f"🔥 [ENTRY TF] SHORT Signal on {s1}-{s2}. Z: {z_score:.2f}. Opening...")
+                pair_info.is_trading = True
+                self.loop.create_task(self._execute_trade(pair_info, -1))
+
+    # Legacy method for backward compatibility (single TF mode)
+    async def add_kline(self, kline_data):
+        """Legacy method - calls add_kline_main for backward compatibility."""
+        await self.add_kline_main(kline_data)
 
     async def _initialize_history(self, symbol):
         """
@@ -524,8 +641,14 @@ class PairsManager:
                         print(warn_msg)
                         self.loop.create_task(self._notify(warn_msg))
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
-                    
+                        
+                        # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
+                        try:
+                            await self._execute_trade(pair_info, 0)
+                        except Exception as e:
+                            print(f"❌ Failed to close broken pair {s1}-{s2}: {e}. Keeping in active list to retry.")
+                            continue # Do not delete pair if close failed
+
                     if pair_info.db_id:
                         reason = f"Broken. Flag={flag}, HL={hl:.2f}, Pval={pval:.4f}"
                         history_item = db.PairHistory(
@@ -538,8 +661,11 @@ class PairsManager:
                             reason=reason
                         )
                         # CRITICAL: Await this to prevent pool exhaustion (was create_task)
-                        await db.add_pair_history(history_item)
-                        await db.delete_pair(pair_info.db_id)
+                        try:
+                            await db.add_pair_history(history_item)
+                            await db.delete_pair(pair_info.db_id)
+                        except Exception as e:
+                            print(f"⚠️ Failed to update DB content for broken pair {s1}-{s2}: {e}")
                     
                     if pair_set in self.active_pairs:
                         del self.active_pairs[pair_set]
@@ -778,6 +904,13 @@ class PairsManager:
                         db_id=new_pair.id
                     )
                     new_pairs_count += 1
+                    
+                    # IMMEDIATE ENTRY CHECK: Don't wait for 5m candle!
+                    # Check signals right now using the data we just downloaded
+                    if self.can_open_new_position(s1, s2):
+                        print(f"⚡ Checking immediate entry for found pair {s1}-{s2}...")
+                        self.loop.create_task(self._check_signals_for_active_pairs(s1))
+                        
                 except Exception as e:
                     print(f"Error adding pair {s1}-{s2}: {e}")
 
@@ -804,6 +937,39 @@ class PairsManager:
             self.leverage_cache[symbol] = leverage
         except Exception as e:
             print(f"⚠️ Failed to set leverage for {symbol}: {e}")
+
+    async def _trigger_immediate_analysis(self):
+        """
+        Triggers immediate analysis of all pairs when a slot becomes available.
+        This allows opening new trades without waiting for the next candle close.
+        """
+        await asyncio.sleep(0.5)  # Small delay to ensure state is updated
+        
+        # Check if we have available slots
+        max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
+        current_active = self.count_active_positions()
+        
+        if current_active >= max_pairs:
+            return  # No slots available
+        
+        print(f"🔍 Immediate analysis: {current_active}/{max_pairs} slots used. Scanning for opportunities...")
+        
+        # Analyze all pairs with data
+        analyzed = 0
+        for pair_set, pair_info in list(self.active_pairs.items()):
+            if pair_info.position_status != 0:
+                continue  # Skip pairs with open positions
+            
+            s1, s2 = pair_info.symbol1, pair_info.symbol2
+            if s1 in self.all_data and s2 in self.all_data:
+                await self._check_signals_for_active_pairs(s1)
+                analyzed += 1
+                
+                # Check if we filled all slots
+                if self.count_active_positions() >= max_pairs:
+                    break
+        
+        print(f"🔍 Immediate analysis complete. Checked {analyzed} pairs.")
 
     def is_symbol_locked(self, symbol: str) -> bool:
         """Check if symbol is already in an active position (in any pair)."""
@@ -945,6 +1111,11 @@ class PairsManager:
                                 'entry_price1': 0,
                                 'entry_price2': 0
                             }))
+                        
+                        # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
+                        print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
+                        self.loop.create_task(self._trigger_immediate_analysis())
+                        
                 except Exception as e:
                     print(f"FATAL ERROR closing position for {s1}-{s2}: {e}")
                 return
