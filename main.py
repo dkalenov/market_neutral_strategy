@@ -72,7 +72,8 @@ async def main():
                              testnet=ini_config.getboolean('BOT', 'testnet'))
     
     # CRITICAL: Sync time with server
-    await client.sync_time()
+    # Note: Original library does not support sync_time. Ensure system clock is accurate.
+    # await client.sync_time()
     
     # Init pairs manager
     loop = asyncio.get_running_loop()
@@ -80,8 +81,24 @@ async def main():
     # Default values
     timeframe = conf.timeframe if conf.timeframe else '1h'
     
+    # Robust window_size logic:
+    # 1. Check if user provided a valid override
+    use_manual_window = False
+    window_size_val = 0
+    
     if conf.window_size:
-        window_size = conf.window_size
+        raw_val = str(conf.window_size).strip().lower()
+        if raw_val not in ('', 'none', 'null', '0', 'default', 'auto'):
+            try:
+                window_size_val = int(raw_val)
+                if window_size_val > 0:
+                    use_manual_window = True
+            except ValueError:
+                print(f"⚠️ Invalid window_size '{conf.window_size}' in config. Using auto-calculation.")
+
+    if use_manual_window:
+        window_size = window_size_val
+        print(f"⚙️ Using manual window_size: {window_size}")
     else:
         # Auto-selection of window size based on timeframe
         if timeframe == '1m':
@@ -98,13 +115,35 @@ async def main():
             window_size = 90   # 90 days
         else:
             window_size = 336  # Default as for 1h
+        print(f"⚙️ Auto-calculated window_size: {window_size} (for {timeframe})")
     
     # Entry timeframe for faster signals (default: 15m)
     entry_timeframe = conf.entry_timeframe if conf.entry_timeframe else '15m'
     
-    # 1. Load symbols
+    # 1. Load symbols (with error handling for bad filter data from Binance)
     print("Initial loading of market symbols...")
-    all_symbols = await client.load_symbols()
+    try:
+        all_symbols = await client.load_symbols()
+    except ValueError as e:
+        # Fallback: Manual loading with skipping problematic symbols
+        print(f"⚠️ Standard load failed ({e}). Using safe loader...")
+        raw_info = await client.exchange_info()
+        all_symbols = {}
+        for s_data in raw_info['symbols']:
+            try:
+                # Check for zero stepSize before parsing
+                skip = False
+                for f in s_data.get('filters', []):
+                    for k, v in f.items():
+                        if k in ('stepSize', 'tickSize', 'minQty') and v == '0' or v == '0.0':
+                            skip = True
+                            break
+                if skip:
+                    continue
+                sym_obj = binance.SymbolFutures(s_data)
+                all_symbols[sym_obj.symbol] = sym_obj
+            except Exception:
+                continue  # Skip problematic symbols
     print(f"Loaded {len(all_symbols)} symbols.")
     
     # 2. Create pairs manager AFTER loading symbols

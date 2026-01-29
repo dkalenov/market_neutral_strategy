@@ -93,6 +93,7 @@ class ConfigInfo:
     test_mode: bool         # Force trades without signals on testnet (default False)
     test_pairs: str         # Comma-separated pairs for test mode (default 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT')
     priority_pairs_file: str # Path to JSON file with priority pairs (default 'market_neutral/best_pairs.json')
+    entry_timeframe: str    # Faster timeframe for entry signals (default '15m')
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -188,7 +189,8 @@ async def load_config():
             'max_active_pairs': '5',
             'test_mode': 'false',
             'test_pairs': 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT',
-            'priority_pairs_file': 'market_neutral/best_pairs.json'
+            'priority_pairs_file': 'market_neutral/best_pairs.json',
+            'entry_timeframe': '15m'  # Faster TF for entry signals
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

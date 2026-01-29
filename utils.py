@@ -45,6 +45,8 @@ def calculate_half_life(spread):
     except Exception:
         return np.nan
 
+from numpy.linalg import LinAlgError
+
 def calculate_cointegration(log1, log2):
     """
     log1, log2: numpy arrays of log(prices) (length WINDOW)
@@ -75,7 +77,7 @@ def calculate_cointegration(log1, log2):
 
         flag = 1 if (safe_p_value < 0.05 and t_check) else 0
         return flag, hedge, hl, safe_p_value
-    except Exception:
+    except (Exception, LinAlgError):
         return 0, np.nan, np.nan, safe_p_value
 
 def calculate_z_last(spread):

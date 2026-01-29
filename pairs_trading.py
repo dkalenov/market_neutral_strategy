@@ -184,7 +184,19 @@ class PairsManager:
                 if sym not in orders_by_symbol: orders_by_symbol[sym] = []
                 orders_by_symbol[sym].append(o)
 
-            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} open orders.")
+            # Also fetch algo orders (STOP/TAKE_PROFIT)
+            try:
+                algo_orders = await self.client.get_algo_orders()
+                for o in algo_orders:
+                    sym = o['symbol']
+                    if sym not in orders_by_symbol: orders_by_symbol[sym] = []
+                    # Normalize orderType to type for consistent checking
+                    o['type'] = o.get('orderType', o.get('type', ''))
+                    orders_by_symbol[sym].append(o)
+            except Exception as e:
+                print(f"  ⚠️ Could not fetch algo orders: {e}")
+
+            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} regular + algo orders.")
             
             # Warn about positions on exchange that are NOT in our DB
             tracked_symbols = set()
@@ -216,9 +228,9 @@ class PairsManager:
                         print(f"  🚨 ORPHAN: {s1}-{s2} has mismatched legs! {s1}:{s1_open}, {s2}:{s2_open}")
                         await self._notify(f"🚨 ORPHAN POSITION: {s1}-{s2} has mismatched legs. Manual check required!")
                     else:
-                        # Both open - check for SL orders
-                        has_sl1 = any(o['type'] == 'STOP_MARKET' for o in orders_by_symbol.get(s1, []))
-                        has_sl2 = any(o['type'] == 'STOP_MARKET' for o in orders_by_symbol.get(s2, []))
+                        # Both open - check for SL orders (STOP type in algo orders)
+                        has_sl1 = any(o.get('type') == 'STOP' for o in orders_by_symbol.get(s1, []))
+                        has_sl2 = any(o.get('type') == 'STOP' for o in orders_by_symbol.get(s2, []))
                         if not has_sl1 or not has_sl2:
                             print(f"  ⚠️ WARNING: {s1}-{s2} is open but lacks SL orders! (s1:{has_sl1}, s2:{has_sl2})")
                             await self._notify(f"⚠️ PROTECT: {s1}-{s2} is open but lacks hardware SL protection on exchange!")
@@ -1086,14 +1098,14 @@ class PairsManager:
                         await self._notify(msg)
 
                         if pair_info.current_trade_id:
-                            self.loop.create_task(db.update_trade_fields(
-                                pair_info.current_trade_id, 
+                            await db.update_trade_fields(
+                                pair_info.current_trade_id,
                                 status='CLOSED',
                                 close_time=int(time.time() * 1000),
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=total_pnl,
-                            ))
+                            )
                     
                         pair_info.current_trade_id = None
                         pair_info.position_status = 0
@@ -1102,15 +1114,34 @@ class PairsManager:
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                     
+                        # Cancel all algo orders for this pair
+                        try:
+                            algo_orders = await self.client.get_algo_orders()
+                            cancel_tasks = []
+                            for o in algo_orders:
+                                if o['symbol'] in [s1, s2]:
+                                    cancel_tasks.append(self.client.cancel_algo_order(algoId=o['algoId']))
+                            
+                            if cancel_tasks:
+                                cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                                failed = sum(1 for r in cancel_results if isinstance(r, Exception))
+                                if failed == 0:
+                                    print(f"🗑️ Cancelled {len(cancel_tasks)} algo orders for {s1}-{s2}")
+                                else:
+                                    print(f"⚠️ Cancelled {len(cancel_tasks)-failed}/{len(cancel_tasks)} algo orders (errors: {failed})")
+                        except Exception as e:
+                            print(f"⚠️ Failed to cancel algo orders: {e}")
+
+                    
                         if pair_info.db_id:
-                            self.loop.create_task(db.update_pair({
+                            await db.update_pair({
                                 'id': pair_info.db_id,
                                 'position_status': 0,
                                 'qty1': 0,
                                 'qty2': 0,
                                 'entry_price1': 0,
                                 'entry_price2': 0
-                            }))
+                            })
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -1287,29 +1318,42 @@ class PairsManager:
                             pair_info.entry_price2, leg2_side, atr2, self.config
                         )
                         
-                        # Round stop prices to tick size
-                        sl1 = round(sl1, s1_info.price_precision)
-                        sl2 = round(sl2, s2_info.price_precision)
+                        # Round stop prices to tick_size (price_precision causes -4014 errors)
+                        sl1 = round(sl1, s1_info.tick_size)
+                        sl2 = round(sl2, s2_info.tick_size)
                         
                         # Determine close sides
                         sl_side1 = 'SELL' if direction == 1 else 'BUY'
                         sl_side2 = 'BUY' if direction == 1 else 'SELL'
                         
-                        # Place STOP_MARKET orders
-                        # Round TP prices to tick size
-                        tp1 = round(tp1, s1_info.price_precision)
-                        tp2 = round(tp2, s2_info.price_precision)
-
-                        # Place STOP_MARKET orders for SL and TAKE_PROFIT_MARKET for TP
-                        print(f"🛡️ Placing SL/TP: {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
+                        # Round TP prices to tick_size
+                        tp1 = round(tp1, s1_info.tick_size)
+                        tp2 = round(tp2, s2_info.tick_size)
                         
+                        # Calculate limit prices with 1% slippage
+                        sl1_limit = round(sl1 * (0.99 if sl_side1 == 'SELL' else 1.01), s1_info.tick_size)
+                        sl2_limit = round(sl2 * (0.99 if sl_side2 == 'SELL' else 1.01), s2_info.tick_size)
+                        tp1_limit = round(tp1 * (1.01 if sl_side1 == 'SELL' else 0.99), s1_info.tick_size)
+                        tp2_limit = round(tp2 * (1.01 if sl_side2 == 'SELL' else 0.99), s1_info.tick_size)
+
+                        print(f"🛡️ Placing SL/TP (Algo): {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
+                        
+                        # Use algo orders
                         protection_tasks = [
-                            # SL Orders
-                            self.client.new_order(symbol=s1, side=sl_side1, type='STOP_MARKET', stopPrice=sl1, closePosition='true'),
-                            self.client.new_order(symbol=s2, side=sl_side2, type='STOP_MARKET', stopPrice=sl2, closePosition='true'),
-                            # TP Orders
-                            self.client.new_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT_MARKET', stopPrice=tp1, closePosition='true'),
-                            self.client.new_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT_MARKET', stopPrice=tp2, closePosition='true')
+                            # SL Orders (STOP via algo endpoint)
+                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='STOP',
+                                                       triggerPrice=sl1, price=sl1_limit,
+                                                       quantity=pair_info.qty1, timeInForce='GTC', reduceOnly='true'),
+                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='STOP',
+                                                       triggerPrice=sl2, price=sl2_limit,
+                                                       quantity=pair_info.qty2, timeInForce='GTC', reduceOnly='true'),
+                            # TP Orders (TAKE_PROFIT via algo endpoint)
+                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT',
+                                                       triggerPrice=tp1, price=tp1_limit,
+                                                       quantity=pair_info.qty1, timeInForce='GTC', reduceOnly='true'),
+                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT',
+                                                       triggerPrice=tp2, price=tp2_limit,
+                                                       quantity=pair_info.qty2, timeInForce='GTC', reduceOnly='true'),
                         ]
                         
                         results = await asyncio.gather(*protection_tasks, return_exceptions=True)
@@ -1323,11 +1367,11 @@ class PairsManager:
                         if orders_success:
                             print(f"🛡️ Protection placed successfully (4 orders)")
                             
-                            # VERIFICATION: Check if orders actually exist
+                            # VERIFICATION: Check if algo orders actually exist
                             try:
                                 await asyncio.sleep(0.5) # Give exchange a moment
-                                open_orders = await self.client.get_orders()
-                                protection_count = sum(1 for o in open_orders if o['symbol'] in [s1, s2] and o['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET'])
+                                algo_orders = await self.client.get_algo_orders()
+                                protection_count = sum(1 for o in algo_orders if o['symbol'] in [s1, s2] and o['orderType'] in ['STOP', 'TAKE_PROFIT'])
                                 
                                 # We expect at least 2 orders (SLs) but ideally 4 (SL+TP)
                                 # If < 2 (missing SLs), force close. TP failure is warned but not fatal.
