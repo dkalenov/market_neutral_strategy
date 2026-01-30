@@ -370,7 +370,26 @@ async def ws_msg_entry(ws, msg):
 
 # Handle userdata messages
 async def ws_user_msg(ws, msg):
-    print(f"Userdata message: {msg}")
+    """Handle userdata messages including order updates."""
+    global pairs_manager
+    
+    # Check for ORDER_TRADE_UPDATE (order filled/canceled)
+    if msg.get('e') == 'ORDER_TRADE_UPDATE':
+        order = msg.get('o', {})
+        symbol = order.get('s')
+        order_type = order.get('ot')  # Original order type: STOP, TAKE_PROFIT, MARKET, etc.
+        status = order.get('X')       # FILLED, CANCELED, NEW, etc.
+        
+        # Check if this is a filled SL/TP order (hardware stop triggered)
+        if status == 'FILLED' and order_type in ('STOP', 'TAKE_PROFIT'):
+            print(f"🎯 Hardware SL/TP triggered: {symbol} {order_type} FILLED")
+            
+            # Notify pairs_manager to close the other leg
+            if pairs_manager:
+                try:
+                    await pairs_manager.handle_sl_tp_triggered(symbol)
+                except Exception as e:
+                    print(f"⚠️ Error handling SL/TP trigger: {e}")
 
 
 if __name__ == '__main__':

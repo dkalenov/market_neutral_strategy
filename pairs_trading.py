@@ -85,6 +85,8 @@ class PairsManager:
         self.leverage_cache = {} # {symbol: leverage_int}
         self._discovery_task = None
         self._last_discovery_time = 0
+        self._cleanup_task = None  # Periodic orphaned orders cleanup
+        self._last_cleanup_time = 0
         
         # CRITICAL: Lock to prevent race condition when opening trades
         self._trade_lock = asyncio.Lock()
@@ -106,6 +108,10 @@ class PairsManager:
         self._initialized = True
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         print(f"✅ PairsManager initialized. Max active pairs: {max_pairs}")
+        
+        # Start periodic leg sync loop (checks for desync + orphaned orders every 30 sec)
+        self._leg_sync_task = self.loop.create_task(self._periodic_leg_sync_loop())
+        print("🔄 Started leg synchronization loop (every 30s)")
 
     async def _load_state_from_db(self):
         print("Restoring active positions from DB...")
@@ -307,6 +313,116 @@ class PairsManager:
             print(f"❌ Error during reconciliation: {e}")
             import traceback
             traceback.print_exc()
+
+    async def _cleanup_orphaned_algo_orders(self):
+        """
+        Clean up orphaned algo orders (STOP/TAKE_PROFIT).
+        An order is orphaned if:
+        1. Its symbol has no active position, OR
+        2. There are more than 2 orders per symbol (SL + TP expected)
+        """
+        try:
+            # Build expected symbols from active pairs
+            expected_symbols = set()
+            for pair_info in self.active_pairs.values():
+                if pair_info.position_status != 0:
+                    expected_symbols.add(pair_info.symbol1)
+                    expected_symbols.add(pair_info.symbol2)
+            
+            # Get all algo orders
+            algo_orders = await self.client.get_algo_orders()
+            
+            # Group orders by symbol
+            orders_by_symbol = {}
+            for order in algo_orders:
+                if order['orderType'] in ['STOP', 'TAKE_PROFIT'] and order.get('algoStatus') == 'NEW':
+                    sym = order['symbol']
+                    if sym not in orders_by_symbol:
+                        orders_by_symbol[sym] = []
+                    orders_by_symbol[sym].append(order)
+            
+            # Find orphaned orders
+            orphaned = []
+            for sym, orders in orders_by_symbol.items():
+                if sym not in expected_symbols:
+                    # Symbol not in any active pair - all its orders are orphaned
+                    orphaned.extend(orders)
+                elif len(orders) > 2:
+                    # Too many orders for this symbol - keep only first 2 (oldest)
+                    # Sort by algoId to keep oldest
+                    orders.sort(key=lambda x: int(x['algoId']))
+                    orphaned.extend(orders[2:])  # Remove extra orders
+            
+            if orphaned:
+                print(f"🗑️ Found {len(orphaned)} orphaned algo orders, cancelling...")
+                cancel_tasks = [self.client.cancel_algo_order(algoId=o['algoId']) for o in orphaned]
+                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                
+                failed = sum(1 for r in results if isinstance(r, Exception))
+                success = len(results) - failed
+                print(f"  ✅ Cancelled {success}/{len(orphaned)} orphaned orders")
+                
+        except Exception as e:
+            print(f"⚠️ Error cleaning up orphaned orders: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def handle_sl_tp_triggered(self, symbol: str):
+        """
+        Called when a hardware SL/TP order is filled (via WebSocket).
+        Finds the pair containing this symbol and closes the other leg.
+        """
+        for pair_info in list(self.active_pairs.values()):
+            if pair_info.position_status == 0:
+                continue
+            if symbol in (pair_info.symbol1, pair_info.symbol2):
+                other_symbol = pair_info.symbol2 if symbol == pair_info.symbol1 else pair_info.symbol1
+                msg = f"🚨 SL/TP triggered on {symbol}! Closing other leg {other_symbol}"
+                print(msg)
+                await self._notify(msg)
+                
+                # Force close the pair (cancels algo orders + closes other leg if needed)
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0)
+                break
+
+    async def _periodic_leg_sync_loop(self):
+        """Periodically check leg synchronization every 30 seconds."""
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self._check_leg_synchronization()
+            except Exception as e:
+                print(f"⚠️ Leg sync error: {e}")
+
+    async def _check_leg_synchronization(self):
+        """Check that both legs of each active pair are open."""
+        try:
+            account = await self.client.account()
+            pos_by_symbol = {}
+            for pos in account['positions']:
+                amt = float(pos['positionAmt'])
+                if amt != 0:
+                    pos_by_symbol[pos['symbol']] = amt
+            
+            for pair_info in list(self.active_pairs.values()):
+                if pair_info.position_status == 0 or pair_info.is_trading:
+                    continue
+                    
+                leg1_open = pair_info.symbol1 in pos_by_symbol
+                leg2_open = pair_info.symbol2 in pos_by_symbol
+                
+                if leg1_open != leg2_open:
+                    # One leg closed unexpectedly
+                    closed_leg = pair_info.symbol1 if not leg1_open else pair_info.symbol2
+                    msg = f"🚨 LEG DESYNC: {closed_leg} closed! Closing pair {pair_info.symbol1}-{pair_info.symbol2}"
+                    print(msg)
+                    await self._notify(msg)
+                    
+                    pair_info.is_trading = True
+                    await self._execute_trade(pair_info, 0)
+        except Exception as e:
+            print(f"⚠️ Leg sync error: {e}")
 
     async def _add_test_pairs(self):
         """Add test pairs to active_pairs when test_mode is enabled."""
@@ -1044,16 +1160,21 @@ class PairsManager:
 
                 print(f"EXECUTING CLOSE for {s1}-{s2}")
                 
-                # Cancel all open orders (SL/TP) before closing
+                # Cancel all open orders (including algo SL/TP) before closing
                 try:
-                    await asyncio.gather(
+                    results = await asyncio.gather(
                         self.client.cancel_open_orders(symbol=s1),
                         self.client.cancel_open_orders(symbol=s2),
                         return_exceptions=True
                     )
-                    print(f"🗑️ Cancelled all open orders for {s1} and {s2}")
+                    # Log any errors
+                    for i, res in enumerate(results):
+                        if isinstance(res, Exception):
+                            print(f"⚠️ Cancel orders error for {[s1, s2][i]}: {res}")
+                        else:
+                            print(f"🗑️ Cancelled orders for {[s1, s2][i]}")
                 except Exception as e:
-                    print(f"⚠️ Could not cancel open orders: {e}")
+                    print(f"⚠️ Could not cancel orders: {e}")
                 
                 side1_close = 'SELL' if pair_info.position_status == 1 else 'BUY'
                 side2_close = 'BUY' if pair_info.position_status == 1 else 'SELL'
@@ -1358,39 +1479,33 @@ class PairsManager:
                         
                         results = await asyncio.gather(*protection_tasks, return_exceptions=True)
                         
-                        orders_success = True
+                        # Collect successful order algoIds for potential cancellation
+                        successful_algo_ids = []
+                        failed_count = 0
                         for res in results:
                             if isinstance(res, Exception):
                                 print(f"⚠️ WARN: Failed to place protection order: {res}")
-                                orders_success = False
+                                failed_count += 1
+                            elif isinstance(res, dict) and 'algoId' in res:
+                                successful_algo_ids.append(res['algoId'])
                         
-                        if orders_success:
+                        if failed_count == 0 and len(successful_algo_ids) == 4:
                             print(f"🛡️ Protection placed successfully (4 orders)")
-                            
-                            # VERIFICATION: Check if algo orders actually exist
-                            try:
-                                await asyncio.sleep(0.5) # Give exchange a moment
-                                algo_orders = await self.client.get_algo_orders()
-                                protection_count = sum(1 for o in algo_orders if o['symbol'] in [s1, s2] and o['orderType'] in ['STOP', 'TAKE_PROFIT'])
-                                
-                                # We expect at least 2 orders (SLs) but ideally 4 (SL+TP)
-                                # If < 2 (missing SLs), force close. TP failure is warned but not fatal.
-                                if protection_count < 2:
-                                    verify_msg = f"🚨 PROTECTION VERIFICATION FAILED: Found {protection_count}/4 orders. SL missing! Force closing {s1}-{s2}!"
-                                    print(verify_msg)
-                                    await self._notify(verify_msg)
-                                    pair_info.is_trading = True
-                                    self.loop.create_task(self._execute_trade(pair_info, 0))
-                                elif protection_count < 4:
-                                    print(f"⚠️ WARN: Only {protection_count}/4 protection orders active for {s1}-{s2}. Check manually.")
-                            except Exception as ve:
-                                print(f"⚠️ Could not verify protection orders: {ve}")
-
-                        else:
-                            warn_msg = f"⚠️ CRITICAL: Protection partially FAILED for {s1}-{s2}. Force closing for safety!"
+                        elif failed_count > 0:
+                            warn_msg = f"⚠️ CRITICAL: Protection partially FAILED for {s1}-{s2} ({failed_count}/4 failed). Force closing!"
                             print(warn_msg)
                             await self._notify(warn_msg)
-                            # CRITICAL: Force close position if SL fails
+                            
+                            # Cancel successfully placed orders using algoId from results
+                            if successful_algo_ids:
+                                try:
+                                    cancel_tasks = [self.client.cancel_algo_order(algoId=aid) for aid in successful_algo_ids]
+                                    await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                                    print(f"🗑️ Cancelled {len(successful_algo_ids)} partial algo orders")
+                                except Exception as ce:
+                                    print(f"⚠️ Could not cancel partial orders: {ce}")
+                            
+                            # Force close position
                             pair_info.is_trading = True
                             self.loop.create_task(self._execute_trade(pair_info, 0))
                             
@@ -1398,7 +1513,8 @@ class PairsManager:
                         warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
                         print(warn_msg)
                         await self._notify(warn_msg)
-                        # CRITICAL: Force close position if SL fails
+                        
+                        # Force close position (algo orders will be cancelled by _execute_trade)
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0))
                     # === END HARDWARE SL/TP ===
