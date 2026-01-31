@@ -190,19 +190,9 @@ class PairsManager:
                 if sym not in orders_by_symbol: orders_by_symbol[sym] = []
                 orders_by_symbol[sym].append(o)
 
-            # Also fetch algo orders (STOP/TAKE_PROFIT)
-            try:
-                algo_orders = await self.client.get_algo_orders()
-                for o in algo_orders:
-                    sym = o['symbol']
-                    if sym not in orders_by_symbol: orders_by_symbol[sym] = []
-                    # Normalize orderType to type for consistent checking
-                    o['type'] = o.get('orderType', o.get('type', ''))
-                    orders_by_symbol[sym].append(o)
-            except Exception as e:
-                print(f"  ⚠️ Could not fetch algo orders: {e}")
+            # Note: algo orders (STOP/TAKE_PROFIT) cannot be fetched on mainnet due to API limitation
 
-            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} regular + algo orders.")
+            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} regular orders.")
             
             # Warn about positions on exchange that are NOT in our DB
             tracked_symbols = set()
@@ -314,58 +304,7 @@ class PairsManager:
             import traceback
             traceback.print_exc()
 
-    async def _cleanup_orphaned_algo_orders(self):
-        """
-        Clean up orphaned algo orders (STOP/TAKE_PROFIT).
-        An order is orphaned if:
-        1. Its symbol has no active position, OR
-        2. There are more than 2 orders per symbol (SL + TP expected)
-        """
-        try:
-            # Build expected symbols from active pairs
-            expected_symbols = set()
-            for pair_info in self.active_pairs.values():
-                if pair_info.position_status != 0:
-                    expected_symbols.add(pair_info.symbol1)
-                    expected_symbols.add(pair_info.symbol2)
-            
-            # Get all algo orders
-            algo_orders = await self.client.get_algo_orders()
-            
-            # Group orders by symbol
-            orders_by_symbol = {}
-            for order in algo_orders:
-                if order['orderType'] in ['STOP', 'TAKE_PROFIT'] and order.get('algoStatus') == 'NEW':
-                    sym = order['symbol']
-                    if sym not in orders_by_symbol:
-                        orders_by_symbol[sym] = []
-                    orders_by_symbol[sym].append(order)
-            
-            # Find orphaned orders
-            orphaned = []
-            for sym, orders in orders_by_symbol.items():
-                if sym not in expected_symbols:
-                    # Symbol not in any active pair - all its orders are orphaned
-                    orphaned.extend(orders)
-                elif len(orders) > 2:
-                    # Too many orders for this symbol - keep only first 2 (oldest)
-                    # Sort by algoId to keep oldest
-                    orders.sort(key=lambda x: int(x['algoId']))
-                    orphaned.extend(orders[2:])  # Remove extra orders
-            
-            if orphaned:
-                print(f"🗑️ Found {len(orphaned)} orphaned algo orders, cancelling...")
-                cancel_tasks = [self.client.cancel_algo_order(algoId=o['algoId']) for o in orphaned]
-                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                
-                failed = sum(1 for r in results if isinstance(r, Exception))
-                success = len(results) - failed
-                print(f"  ✅ Cancelled {success}/{len(orphaned)} orphaned orders")
-                
-        except Exception as e:
-            print(f"⚠️ Error cleaning up orphaned orders: {e}")
-            import traceback
-            traceback.print_exc()
+    # NOTE: _cleanup_orphaned_algo_orders removed - get_algo_orders endpoint doesn't work on mainnet
 
     async def handle_sl_tp_triggered(self, symbol: str):
         """
@@ -1183,10 +1122,10 @@ class PairsManager:
 
                 try:
                     task1 = self.loop.create_task(
-                        self.client.new_order(symbol=s1, side=side1_close, type='MARKET', quantity=qty1_close, newOrderRespType='RESULT')
+                        self.client.new_order(symbol=s1, side=side1_close, type='MARKET', quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT')
                     )
                     task2 = self.loop.create_task(
-                        self.client.new_order(symbol=s2, side=side2_close, type='MARKET', quantity=qty2_close, newOrderRespType='RESULT')
+                        self.client.new_order(symbol=s2, side=side2_close, type='MARKET', quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT')
                     )
                     results = await asyncio.gather(task1, task2, return_exceptions=True)
                 
@@ -1382,7 +1321,7 @@ class PairsManager:
                             exec_side = executed['side']
                             revert_side = 'SELL' if exec_side == 'BUY' else 'BUY'
                             revert_tasks.append(
-                                self.client.new_order(symbol=exec_symbol, side=revert_side, type='MARKET', quantity=exec_qty)
+                                self.client.new_order(symbol=exec_symbol, side=revert_side, type='MARKET', quantity=exec_qty, reduceOnly='true')
                             )
                         except Exception as rev_e:
                             print(f"  CRITICAL: Failed to prepare revert {exec_symbol}: {rev_e}")
