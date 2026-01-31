@@ -304,7 +304,62 @@ class PairsManager:
             import traceback
             traceback.print_exc()
 
-    # NOTE: _cleanup_orphaned_algo_orders removed - get_algo_orders endpoint doesn't work on mainnet
+    async def _cleanup_orphaned_algo_orders(self):
+        """
+        Clean up orphaned algo orders (STOP/TAKE_PROFIT).
+        An order is orphaned if:
+        1. Its symbol has no active position, OR
+        2. There are more than 2 orders per symbol (SL + TP expected)
+        """
+        try:
+            # Build expected symbols from active pairs
+            expected_symbols = set()
+            for pair_info in self.active_pairs.values():
+                if pair_info.position_status != 0:
+                    expected_symbols.add(pair_info.symbol1)
+                    expected_symbols.add(pair_info.symbol2)
+            
+            # Get all algo orders (using fixed endpoint /fapi/v1/openAlgoOrders)
+            algo_orders = await self.client.get_algo_orders()
+            if not algo_orders:
+                return
+            
+            # Handle case where response is dict with 'orders' key
+            if isinstance(algo_orders, dict) and 'orders' in algo_orders:
+                algo_orders = algo_orders['orders']
+            
+            # Group orders by symbol
+            orders_by_symbol = {}
+            for order in algo_orders:
+                order_type = order.get('orderType') or order.get('type', '')
+                if order_type in ['STOP', 'TAKE_PROFIT'] and order.get('algoStatus') == 'NEW':
+                    sym = order['symbol']
+                    if sym not in orders_by_symbol:
+                        orders_by_symbol[sym] = []
+                    orders_by_symbol[sym].append(order)
+            
+            # Find orphaned orders
+            orphaned = []
+            for sym, orders in orders_by_symbol.items():
+                if sym not in expected_symbols:
+                    # Symbol not in any active pair - all its orders are orphaned
+                    orphaned.extend(orders)
+                elif len(orders) > 2:
+                    # Too many orders for this symbol - keep only first 2 (oldest)
+                    orders.sort(key=lambda x: int(x.get('algoId', 0)))
+                    orphaned.extend(orders[2:])  # Remove extra orders
+            
+            if orphaned:
+                print(f"🗑️ Found {len(orphaned)} orphaned algo orders, cancelling...")
+                cancel_tasks = [self.client.cancel_algo_order(algoId=o['algoId']) for o in orphaned]
+                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                
+                failed = sum(1 for r in results if isinstance(r, Exception))
+                success = len(results) - failed
+                print(f"  ✅ Cancelled {success}/{len(orphaned)} orphaned orders")
+                
+        except Exception as e:
+            print(f"⚠️ Error cleaning up orphaned orders: {e}")
 
     async def handle_sl_tp_triggered(self, symbol: str):
         """
@@ -326,13 +381,14 @@ class PairsManager:
                 break
 
     async def _periodic_leg_sync_loop(self):
-        """Periodically check leg synchronization every 30 seconds."""
+        """Periodically check leg synchronization and cleanup orphaned orders every 30 seconds."""
         while True:
             await asyncio.sleep(30)
             try:
                 await self._check_leg_synchronization()
+                await self._cleanup_orphaned_algo_orders()
             except Exception as e:
-                print(f"⚠️ Leg sync error: {e}")
+                print(f"⚠️ Leg sync/cleanup error: {e}")
 
     async def _check_leg_synchronization(self):
         """Check that both legs of each active pair are open."""
@@ -770,11 +826,11 @@ class PairsManager:
                     total_pnl = pnl1 + pnl2
                     
                     initial_investment = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
-                    HARD_STOP_PCT = 0.20 
+                    circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
                     
                     if initial_investment > 0:
                         roi = total_pnl / initial_investment
-                        if roi < -HARD_STOP_PCT:
+                        if roi < -circuit_breaker_pct:
                             cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
                                       f"Loss: {roi*100:.2f}% ({total_pnl:.2f} USDT). Force Closing...")
                             print(cb_msg)

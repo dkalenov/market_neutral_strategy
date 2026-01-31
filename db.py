@@ -87,13 +87,13 @@ class ConfigInfo:
     tp_min_pct: float       # Minimum TP distance in % (default 0.15)
     tp_max_pct: float       # Maximum TP distance in % (default 0.50)
     circuit_breaker_pct: float  # Total pair PnL stop (default 0.20)
+    p_value_threshold: float    # Max p-value for correlation validity (default 0.05)
     min_order_bump: float   # Max allowed order size increase ratio (default 1.5)
     # Position Management (Phase 2)
     max_active_pairs: int   # Maximum concurrent open pairs (default 5)
     test_mode: bool         # Force trades without signals on testnet (default False)
     test_pairs: str         # Comma-separated pairs for test mode (default 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT')
     priority_pairs_file: str # Path to JSON file with priority pairs (default 'market_neutral/best_pairs.json')
-    entry_timeframe: str    # Faster timeframe for entry signals (default '15m')
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -116,14 +116,8 @@ class ConfigInfo:
 async def connect(host, port, user, password, db_name):
     global Session
     try:
-        # Create async engine for PostgreSQL using asyncpg with increased pool size
-        engine = create_async_engine(
-            f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}",
-            pool_size=20,        # Increased from default 5
-            max_overflow=30,     # Increased from default 10
-            pool_timeout=60,     # Increased timeout
-            pool_recycle=1800    # Recycle connections every 30 mins
-        )
+        # Create async engine for PostgreSQL using asyncpg
+        engine = create_async_engine(f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}")
         async with engine.begin() as conn:
             # Create tables
             await conn.run_sync(Base.metadata.create_all)
@@ -184,13 +178,13 @@ async def load_config():
             'tp_min_pct': '0.15',
             'tp_max_pct': '0.50',
             'circuit_breaker_pct': '0.20',
+            'p_value_threshold': '0.05',
             'min_order_bump': '1.5',
             # Position Management (Phase 2)
             'max_active_pairs': '5',
             'test_mode': 'false',
             'test_pairs': 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT',
-            'priority_pairs_file': 'market_neutral/best_pairs.json',
-            'entry_timeframe': '15m'  # Faster TF for entry signals
+            'priority_pairs_file': 'market_neutral/best_pairs.json'
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

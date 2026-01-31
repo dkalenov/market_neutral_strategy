@@ -435,6 +435,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
     tp_min = getattr(conf, 'tp_min_pct', 0.15) or 0.15
     tp_max = getattr(conf, 'tp_max_pct', 0.50) or 0.50
     cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
+    p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
     bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -445,6 +446,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"TP Min: {tp_min*100:.0f}%", callback_data="set_tp_min"),
          InlineKeyboardButton(text=f"TP Max: {tp_max*100:.0f}%", callback_data="set_tp_max")],
         [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}%", callback_data="set_circuit_breaker")],
+        [InlineKeyboardButton(text=f"P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
         [InlineKeyboardButton(text="Back", callback_data="risk_settings")]
     ])
@@ -499,6 +501,12 @@ async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.hardware_sltp)
     await state.update_data(waiting_for="circuit_breaker_pct")
     await answer(callback, "Enter Circuit Breaker % as decimal (e.g., 0.20 for 20%):")
+
+@dp.callback_query(F.data == "set_p_value")
+async def set_p_value_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="p_value_threshold")
+    await answer(callback, "Enter P-Value threshold (e.g., 0.05). Pair closes if p-value > this:")
 
 @dp.callback_query(F.data == "set_min_bump")
 async def set_min_bump_cb(callback: CallbackQuery, state: FSMContext):
