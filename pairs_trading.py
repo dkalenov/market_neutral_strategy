@@ -307,17 +307,29 @@ class PairsManager:
     async def _cleanup_orphaned_algo_orders(self):
         """
         Clean up orphaned algo orders (STOP/TAKE_PROFIT).
-        An order is orphaned if:
-        1. Its symbol has no active position, OR
-        2. There are more than 2 orders per symbol (SL + TP expected)
+        Uses EXCHANGE as source of truth:
+        1. Cancel orders for symbols without positions on exchange
+        2. Cancel extra orders if more than 2 per symbol (1 SL + 1 TP)
+        3. Sync local state with exchange
         """
         try:
-            # Build expected symbols from active pairs
-            expected_symbols = set()
-            for pair_info in self.active_pairs.values():
+            # Get REAL positions from exchange (source of truth)
+            account = await self.client.account()
+            exchange_positions = set()
+            for pos in account.get('positions', []):
+                if float(pos.get('positionAmt', 0)) != 0:
+                    exchange_positions.add(pos['symbol'])
+            
+            # Sync local state: clear pairs that don't have positions on exchange
+            for pair_info in list(self.active_pairs.values()):
                 if pair_info.position_status != 0:
-                    expected_symbols.add(pair_info.symbol1)
-                    expected_symbols.add(pair_info.symbol2)
+                    leg1_exists = pair_info.symbol1 in exchange_positions
+                    leg2_exists = pair_info.symbol2 in exchange_positions
+                    
+                    if not leg1_exists and not leg2_exists:
+                        print(f"🧹 Syncing stale pair: {pair_info.symbol1}-{pair_info.symbol2}")
+                        pair_info.position_status = 0
+                        pair_info.is_trading = False
             
             # Get all algo orders (using fixed endpoint /fapi/v1/openAlgoOrders)
             algo_orders = await self.client.get_algo_orders()
@@ -332,7 +344,8 @@ class PairsManager:
             orders_by_symbol = {}
             for order in algo_orders:
                 order_type = order.get('orderType') or order.get('type', '')
-                if order_type in ['STOP', 'TAKE_PROFIT'] and order.get('algoStatus') == 'NEW':
+                status = order.get('algoStatus') or order.get('status', '')
+                if order_type in ['STOP', 'TAKE_PROFIT'] and status == 'NEW':
                     sym = order['symbol']
                     if sym not in orders_by_symbol:
                         orders_by_symbol[sym] = []
@@ -341,22 +354,26 @@ class PairsManager:
             # Find orphaned orders
             orphaned = []
             for sym, orders in orders_by_symbol.items():
-                if sym not in expected_symbols:
-                    # Symbol not in any active pair - all its orders are orphaned
+                if sym not in exchange_positions:
+                    # Symbol has no position on exchange - all its orders are orphaned
                     orphaned.extend(orders)
+                    print(f"  🗑️ {sym}: {len(orders)} orders orphaned (no position)")
                 elif len(orders) > 2:
-                    # Too many orders for this symbol - keep only first 2 (oldest)
+                    # Too many orders for this symbol - keep first 2 (oldest by algoId)
                     orders.sort(key=lambda x: int(x.get('algoId', 0)))
-                    orphaned.extend(orders[2:])  # Remove extra orders
+                    extra = orders[2:]
+                    orphaned.extend(extra)
+                    print(f"  🗑️ {sym}: {len(extra)} extra orders (keeping 2)")
             
             if orphaned:
-                print(f"🗑️ Found {len(orphaned)} orphaned algo orders, cancelling...")
-                cancel_tasks = [self.client.cancel_algo_order(algoId=o['algoId']) for o in orphaned]
-                results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                print(f"🗑️ Cancelling {len(orphaned)} orphaned algo orders...")
+                for o in orphaned:
+                    try:
+                        await self.client.cancel_algo_order(algoId=o['algoId'])
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to cancel algoId {o.get('algoId')}: {e}")
                 
-                failed = sum(1 for r in results if isinstance(r, Exception))
-                success = len(results) - failed
-                print(f"  ✅ Cancelled {success}/{len(orphaned)} orphaned orders")
+                print(f"✅ Orphaned orders cleanup completed")
                 
         except Exception as e:
             print(f"⚠️ Error cleaning up orphaned orders: {e}")
@@ -736,8 +753,9 @@ class PairsManager:
                 log_prices1 = np.log(list(data1.close)[-self.min_data_points:])
                 log_prices2 = np.log(list(data2.close)[-self.min_data_points:])
 
-                # Dynamic recalculation of cointegration
-                flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2)
+                # Dynamic recalculation of cointegration (with configurable p-value threshold)
+                p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
+                flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold)
 
                 # Check if this is a test pair that should not be removed
                 is_protected_test_pair = False

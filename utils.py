@@ -47,9 +47,10 @@ def calculate_half_life(spread):
 
 from numpy.linalg import LinAlgError
 
-def calculate_cointegration(log1, log2):
+def calculate_cointegration(log1, log2, p_value_threshold: float = 0.05):
     """
     log1, log2: numpy arrays of log(prices) (length WINDOW)
+    p_value_threshold: Maximum p-value for valid cointegration (default 0.05)
     Returns:
         flag (0/1), hedge_ratio (beta), half_life, p_value
     """
@@ -75,7 +76,7 @@ def calculate_cointegration(log1, log2):
         if np.isnan(hl) or hl <= 0 or hl > 200:
             return 0, hedge, np.nan, safe_p_value
 
-        flag = 1 if (safe_p_value < 0.05 and t_check) else 0
+        flag = 1 if (safe_p_value < p_value_threshold and t_check) else 0
         return flag, hedge, hl, safe_p_value
     except (Exception, LinAlgError):
         return 0, np.nan, np.nan, safe_p_value

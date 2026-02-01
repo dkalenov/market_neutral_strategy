@@ -115,6 +115,7 @@ class States(StatesGroup):
     restart = State()
     blacklist = State()
     hardware_sltp = State()
+    close_positions = State()
 
 # Helper function to answer messages or callbacks
 async def answer(message: Message | CallbackQuery, text, reply_markup=None):
@@ -134,6 +135,7 @@ async def start(message: Message, state: FSMContext):
     keyboard = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Statistics"), KeyboardButton(text="Pairs")],
         [KeyboardButton(text="Settings"), KeyboardButton(text="Blacklist")],
+        [KeyboardButton(text="🔴 Close Positions")],
         [KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     # Send message
@@ -780,6 +782,155 @@ async def bl_clear_cb(callback: CallbackQuery, state: FSMContext):
     await db.config_update(blacklist="")
     await callback.answer("List cleared")
     await blacklist_menu(callback, state)
+
+
+# --- Close Positions Menu ---
+
+@dp.message(F.text == "🔴 Close Positions")
+@dp.callback_query(F.data == "close_positions")
+async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext):
+    """Show list of active pairs with open positions - verified against exchange."""
+    await state.set_state(States.close_positions)
+    
+    keyboard = []
+    has_positions = False
+    
+    if pairs_manager:
+        # Get real positions from exchange (source of truth)
+        try:
+            account = await pairs_manager.client.account()
+            exchange_positions = set()
+            for pos in account.get('positions', []):
+                if float(pos.get('positionAmt', 0)) != 0:
+                    exchange_positions.add(pos['symbol'])
+        except Exception as e:
+            print(f"Error fetching exchange positions: {e}")
+            exchange_positions = set()
+        
+        for pair_info in pairs_manager.active_pairs.values():
+            if pair_info.position_status != 0:
+                # Verify BOTH legs exist on exchange
+                leg1_exists = pair_info.symbol1 in exchange_positions
+                leg2_exists = pair_info.symbol2 in exchange_positions
+                
+                if leg1_exists or leg2_exists:
+                    direction = "LONG" if pair_info.position_status == 1 else "SHORT"
+                    status = "⚠️" if not (leg1_exists and leg2_exists) else ""
+                    btn_text = f"❌ {status}{pair_info.symbol1}/{pair_info.symbol2} ({direction})"
+                    callback_data = f"close_pair:{pair_info.symbol1}:{pair_info.symbol2}"
+                    keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data)])
+                    has_positions = True
+                else:
+                    # Position closed on exchange but not in local state - clean up
+                    pair_info.position_status = 0
+                    print(f"🧹 Auto-cleaned stale pair: {pair_info.symbol1}-{pair_info.symbol2}")
+    
+    if has_positions:
+        keyboard.append([InlineKeyboardButton(text="🔴 CLOSE ALL POSITIONS", callback_data="close_all_confirm")])
+    
+    keyboard.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="close_positions")])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data="start")])
+    
+    text = "🔴 <b>Close Positions</b>\n\n"
+    if has_positions:
+        text += "Select a position to close, or close all:"
+    else:
+        text += "No open positions on exchange."
+    
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        await event.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    else:
+        await event.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@dp.callback_query(F.data.startswith("close_pair:"))
+async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
+    """Close a specific pair position."""
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid pair data", show_alert=True)
+        return
+    
+    s1, s2 = parts[1], parts[2]
+    
+    if not pairs_manager:
+        await callback.answer("Pairs manager not available", show_alert=True)
+        return
+    
+    # Find the pair
+    pair_info = None
+    for pi in pairs_manager.active_pairs.values():
+        if pi.symbol1 == s1 and pi.symbol2 == s2:
+            pair_info = pi
+            break
+    
+    if not pair_info or pair_info.position_status == 0:
+        await callback.answer("Position not found or already closed", show_alert=True)
+        return
+    
+    await callback.answer(f"Closing {s1}/{s2}...")
+    await callback.message.answer(f"⏳ Closing position {s1}/{s2}...")
+    
+    try:
+        pair_info.is_trading = True
+        await pairs_manager._execute_trade(pair_info, 0)
+        await callback.message.answer(f"✅ Position {s1}/{s2} closed successfully!")
+    except Exception as e:
+        await callback.message.answer(f"❌ Error closing {s1}/{s2}: {e}")
+    
+    # Return to close menu
+    await close_positions_menu(callback, state)
+
+
+@dp.callback_query(F.data == "close_all_confirm")
+async def close_all_confirm_handler(callback: CallbackQuery, state: FSMContext):
+    """Ask for confirmation before closing all positions."""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, Close All", callback_data="close_all_yes")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="close_positions")]
+    ])
+    await callback.answer()
+    await callback.message.answer(
+        "⚠️ <b>Are you sure you want to close ALL positions?</b>\n\n"
+        "This will immediately close all active pair trades.",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data == "close_all_yes")
+async def close_all_yes_handler(callback: CallbackQuery, state: FSMContext):
+    """Close all open positions."""
+    if not pairs_manager:
+        await callback.answer("Pairs manager not available", show_alert=True)
+        return
+    
+    await callback.answer("Closing all positions...")
+    await callback.message.answer("⏳ Closing all positions...")
+    
+    closed = 0
+    failed = 0
+    
+    pairs_to_close = [
+        pi for pi in pairs_manager.active_pairs.values() 
+        if pi.position_status != 0
+    ]
+    
+    for pair_info in pairs_to_close:
+        try:
+            pair_info.is_trading = True
+            await pairs_manager._execute_trade(pair_info, 0)
+            closed += 1
+        except Exception as e:
+            print(f"Error closing {pair_info.symbol1}-{pair_info.symbol2}: {e}")
+            failed += 1
+    
+    result_msg = f"✅ Closed {closed} positions."
+    if failed > 0:
+        result_msg += f"\n⚠️ Failed to close {failed} positions."
+    
+    await callback.message.answer(result_msg)
+    await close_positions_menu(callback, state)
 
 
 async def send_startup_message():
