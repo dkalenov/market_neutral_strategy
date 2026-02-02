@@ -394,7 +394,7 @@ class PairsManager:
                 
                 # Force close the pair (cancels algo orders + closes other leg if needed)
                 pair_info.is_trading = True
-                await self._execute_trade(pair_info, 0)
+                await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                 break
 
     async def _periodic_leg_sync_loop(self):
@@ -432,7 +432,7 @@ class PairsManager:
                     await self._notify(msg)
                     
                     pair_info.is_trading = True
-                    await self._execute_trade(pair_info, 0)
+                    await self._execute_trade(pair_info, 0, close_reason='desync')
         except Exception as e:
             print(f"⚠️ Leg sync error: {e}")
 
@@ -785,7 +785,7 @@ class PairsManager:
                         
                         # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
                         try:
-                            await self._execute_trade(pair_info, 0)
+                            await self._execute_trade(pair_info, 0, close_reason='broken_coint')
                         except Exception as e:
                             print(f"❌ Failed to close broken pair {s1}-{s2}: {e}. Keeping in active list to retry.")
                             continue # Do not delete pair if close failed
@@ -854,7 +854,7 @@ class PairsManager:
                             print(cb_msg)
                             self.loop.create_task(self._notify(cb_msg))
                             pair_info.is_trading = True
-                            self.loop.create_task(self._execute_trade(pair_info, 0))
+                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='circuit'))
                             # pair_info.position_status = 0 # Will be set in execute_trade
                             continue
 
@@ -904,21 +904,21 @@ class PairsManager:
                     if z_score >= z_exit:
                         print(f"💰 TAKE PROFIT (Long) on {s1}-{s2}. Z: {z_score:.2f} >= {z_exit}. Closing...")
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
+                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
                     elif z_score <= -z_stop:
                         print(f"🛑 STOP LOSS (Long) on {s1}-{s2}. Z: {z_score:.2f} <= -{z_stop}. Closing...")
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
+                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
 
                 elif pair_info.position_status == -1: # Short spread
                     if z_score <= -z_exit:
                         print(f"💰 TAKE PROFIT (Short) on {s1}-{s2}. Z: {z_score:.2f} <= {-z_exit}. Closing...")
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
+                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
                     elif z_score >= z_stop:
                         print(f"🛑 STOP LOSS (Short) on {s1}-{s2}. Z: {z_score:.2f} >= {z_stop}. Closing...")
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
+                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
 
     async def _discover_new_pairs(self):
         """
@@ -1002,14 +1002,23 @@ class PairsManager:
                 utils.batch_process_pairs, 
                 chunk, 
                 data_snapshot, 
-                self.min_data_points
+                self.min_data_points,
+                self.config.timeframe,  # Pass timeframe for half-life limits
+                getattr(self.config, 'hl_min_days', 2.0) or 2.0,
+                getattr(self.config, 'hl_max_days', 5.0) or 5.0
             )
             tasks.append(task)
         
         results_list = await asyncio.gather(*tasks)
         
         new_pairs_count = 0
+        batch_idx = 0
         for batch_results in results_list:
+            batch_idx += 1
+            # Yield to event loop every batch to keep TG responsive
+            if batch_idx % 3 == 0:
+                await asyncio.sleep(0)
+            
             for res in batch_results:
                 s1, s2, hedge, hl, pval = res
                 try:
@@ -1079,6 +1088,38 @@ class PairsManager:
         except Exception as e:
             print(f"⚠️ Failed to set leverage for {symbol}: {e}")
 
+    def _add_to_best_pairs(self, symbol1: str, symbol2: str):
+        """
+        Add a successfully traded pair to best_pairs.json for priority loading.
+        Only adds if the pair doesn't already exist.
+        """
+        try:
+            priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
+            if priority_file_path and not os.path.isabs(priority_file_path):
+                priority_file_path = os.path.join(os.getcwd(), priority_file_path)
+            
+            if not priority_file_path:
+                return
+            
+            # Load existing pairs
+            existing_pairs = []
+            if os.path.exists(priority_file_path):
+                with open(priority_file_path, 'r') as f:
+                    existing_pairs = json.load(f)
+            
+            # Create pair string
+            pair_str = f"{symbol1}-{symbol2}"
+            pair_str_rev = f"{symbol2}-{symbol1}"
+            
+            # Check if already exists
+            if pair_str not in existing_pairs and pair_str_rev not in existing_pairs:
+                existing_pairs.append(pair_str)
+                with open(priority_file_path, 'w') as f:
+                    json.dump(existing_pairs, f, indent=2)
+                print(f"✅ Added {pair_str} to best_pairs.json")
+        except Exception as e:
+            print(f"⚠️ Could not add to best_pairs: {e}")
+
     async def _trigger_immediate_analysis(self):
         """
         Triggers immediate analysis of all pairs when a slot becomes available.
@@ -1141,10 +1182,11 @@ class PairsManager:
         
         return True
 
-    async def _execute_trade(self, pair_info: PairInfo, direction: int):
+    async def _execute_trade(self, pair_info: PairInfo, direction: int, close_reason: str = None):
         """
         Executes a trade order.
         direction: 1 for long spread, -1 for short spread, 0 for close.
+        close_reason: Why position is being closed (z_tp, z_sl, circuit, broken_coint, hardware_sl, hardware_tp, manual, desync)
         """
         s1 = pair_info.symbol1
         s2 = pair_info.symbol2
@@ -1208,7 +1250,20 @@ class PairsManager:
                         print(err_msg)
                         await self._notify(err_msg)
                     else:
-                        msg = f"✅ SUCCESS: Position closed for {s1}-{s2}"
+                        # Close reason mapping
+                        CLOSE_REASONS = {
+                            'z_tp': '💰 Z-Score Take Profit',
+                            'z_sl': '🛑 Z-Score Stop Loss',
+                            'circuit': '🔴 Circuit Breaker',
+                            'broken_coint': '🚨 Broken Correlation',
+                            'hardware_sl': '🛡️ Hardware Stop Loss',
+                            'hardware_tp': '🛡️ Hardware Take Profit',
+                            'manual': '👤 Manual Close',
+                            'desync': '⚠️ Leg Desync',
+                        }
+                        reason_text = CLOSE_REASONS.get(close_reason, '❓ Unknown') if close_reason else '❓ Unknown'
+                        
+                        msg = f"✅ Position Closed: {s1}/{s2}"
                     
                         def get_price(order):
                             if 'avgPrice' in order and float(order['avgPrice']) > 0:
@@ -1227,7 +1282,8 @@ class PairsManager:
                         total_pnl = pnl1 + pnl2
                     
                         pnl_emoji = "🟢" if total_pnl > 0 else "🔴"
-                        msg += f"\n  Realized PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
+                        msg += f"\n📊 Reason: {reason_text}"
+                        msg += f"\n💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
                         print(msg)
                         await self._notify(msg)
 
@@ -1276,6 +1332,10 @@ class PairsManager:
                                 'entry_price1': 0,
                                 'entry_price2': 0
                             })
+                        
+                        # AUTO-ADD to best_pairs.json on successful TP
+                        if close_reason in ('z_tp', 'hardware_tp') or total_pnl > 0:
+                            self._add_to_best_pairs(s1, s2)
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -1452,7 +1512,7 @@ class PairsManager:
                             pair_info.entry_price2, leg2_side, atr2, self.config
                         )
                         
-                        # Round stop prices to tick_size (price_precision causes -4014 errors)
+                        # Round stop prices to tick_size (tick_size is int: digit count)
                         sl1 = round(sl1, s1_info.tick_size)
                         sl2 = round(sl2, s2_info.tick_size)
                         
@@ -1468,9 +1528,17 @@ class PairsManager:
                         sl1_limit = round(sl1 * (0.99 if sl_side1 == 'SELL' else 1.01), s1_info.tick_size)
                         sl2_limit = round(sl2 * (0.99 if sl_side2 == 'SELL' else 1.01), s2_info.tick_size)
                         tp1_limit = round(tp1 * (1.01 if sl_side1 == 'SELL' else 0.99), s1_info.tick_size)
-                        tp2_limit = round(tp2 * (1.01 if sl_side2 == 'SELL' else 0.99), s1_info.tick_size)
+                        tp2_limit = round(tp2 * (1.01 if sl_side2 == 'SELL' else 0.99), s2_info.tick_size)
 
                         print(f"🛡️ Placing SL/TP (Algo): {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
+                        
+                        # Validate all prices are positive before placing orders
+                        if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
+                            print(f"⚠️ WARN: Invalid SL/TP prices (sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}). ATR may be missing.")
+                            print(f"  Entry prices: {pair_info.entry_price1}, {pair_info.entry_price2}")
+                            print(f"  ATR values: {atr1}, {atr2}")
+                            # Skip placing protection but don't force close - allow software stops
+                            return
                         
                         # Use algo orders
                         protection_tasks = [
@@ -1520,7 +1588,7 @@ class PairsManager:
                             
                             # Force close position
                             pair_info.is_trading = True
-                            self.loop.create_task(self._execute_trade(pair_info, 0))
+                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
                             
                     except Exception as e:
                         warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
@@ -1529,7 +1597,7 @@ class PairsManager:
                         
                         # Force close position (algo orders will be cancelled by _execute_trade)
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0))
+                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
                     # === END HARDWARE SL/TP ===
                 
                     if pair_info.db_id:

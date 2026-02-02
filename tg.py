@@ -252,21 +252,28 @@ async def delete_pair_yes(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "trades")
 async def open_trades(message: Message | CallbackQuery, state: FSMContext):
     await state.set_state(States.trades)
-    text = "Open Trades:"
-    trades = await db.get_open_trades()
-    for trade in trades:
-        direction = "LONG" if trade.direction == 1 else "SHORT"
-        text += (f"\n\n<b>{direction}</b> #{trade.pair_id}\n"
-                 f"Symbol 1: <b>{trade.qty1} @ {trade.entry_price_1}</b>\n"
-                 f"Symbol 2: <b>{trade.qty2} @ {trade.entry_price_2}</b>\n"
-                 f"PNL: <b>{round(trade.pnl, 2)} USDT</b>")
-    if "\n" in text:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Refresh", callback_data="trades")]
-        ])
-        await answer(message, text, reply_markup=keyboard)
+    text = "📊 <b>Open Trades:</b>"
+    
+    if pairs_manager:
+        # Get live positions from pairs_manager
+        has_trades = False
+        for pair_info in pairs_manager.active_pairs.values():
+            if pair_info.position_status != 0:
+                has_trades = True
+                direction = "🟢 LONG" if pair_info.position_status == 1 else "🔴 SHORT"
+                text += (f"\n\n<b>{direction}</b> {pair_info.symbol1}/{pair_info.symbol2}\n"
+                        f"  Qty1: {pair_info.qty1:.4f} @ {pair_info.entry_price1:.4f}\n"
+                        f"  Qty2: {pair_info.qty2:.4f} @ {pair_info.entry_price2:.4f}")
+        
+        if has_trades:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Refresh", callback_data="trades")]
+            ])
+            await answer(message, text, reply_markup=keyboard)
+        else:
+            await answer(message, "📊 No open trades")
     else:
-        await answer(message, "No open trades")
+        await answer(message, "⚠️ Pairs manager not initialized")
 
 # Settings
 @dp.message(F.text == "Settings")
@@ -287,6 +294,7 @@ async def settings(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
         [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
         [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
+        [InlineKeyboardButton(text="📢 TG Channel", callback_data="set_tg_channel")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
         [InlineKeyboardButton(text="Restart Bot", callback_data="restart")]
     ])
@@ -323,9 +331,14 @@ async def settings(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "strategy_settings")
 async def strategy_settings_menu(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
+    hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Set Timeframe", callback_data="set_timeframe")],
         [InlineKeyboardButton(text="Set Window Size", callback_data="set_window")],
+        [InlineKeyboardButton(text=f"⏱️ Half-Life: {hl_min}-{hl_max} days", callback_data="set_half_life")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Choose parameter to change:", reply_markup=keyboard)
@@ -343,10 +356,26 @@ async def set_window(callback: CallbackQuery, state: FSMContext):
     await state.update_data(waiting_for="window")
     await answer(callback, "Enter new Window Size (e.g., 200, 300, 400):")
 
+@dp.callback_query(F.data == "set_half_life")
+async def set_half_life(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
+    hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="half_life")
+    await answer(callback, 
+        f"⏱️ <b>Half-Life Range</b>\n\n"
+        f"Current: {hl_min}-{hl_max} days\n\n"
+        f"Enter new range as <code>min-max</code> (e.g., 2-5):\n\n"
+        f"• Min: fastest mean-reversion (2+ recommended)\n"
+        f"• Max: slowest before capital locked (5-7 typical)")
+
+
 @dp.callback_query(F.data == "risk_settings")
 async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     max_pairs = getattr(conf, 'max_active_pairs', 5) or 5
+    max_symbols = getattr(conf, 'max_symbols', 150) or 150
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Capital (USDT)", callback_data="set_capital")],
@@ -357,12 +386,14 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Z-Stop", callback_data="set_z_stop")],
         [InlineKeyboardButton(text="🛡️ Hardware SL/TP", callback_data="hardware_sltp")],
         [InlineKeyboardButton(text=f"📊 Max Pairs: {max_pairs}", callback_data="set_max_pairs")],
+        [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Risk Management Settings:\n\n"
                            "<b>Capital</b>: Your purchasing power.\n"
                            "<b>Hardware SL/TP</b>: ATR-based stop orders.\n"
-                           f"<b>Max Pairs</b>: {max_pairs} concurrent trades.", reply_markup=keyboard)
+                           f"<b>Max Pairs</b>: {max_pairs} concurrent trades.\n"
+                           f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_capital")
 async def set_capital_cb(callback: CallbackQuery, state: FSMContext):
@@ -405,6 +436,24 @@ async def set_max_pairs_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_active_pairs")
     await answer(callback, "Enter maximum number of concurrent pairs (e.g., 5):")
+
+@dp.callback_query(F.data == "set_max_symbols")
+async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="max_symbols")
+    await answer(callback, "Enter maximum number of symbols by volume (50-300, e.g., 150):\n\n⚠️ Requires restart to take effect.")
+
+@dp.callback_query(F.data == "set_tg_channel")
+async def set_tg_channel_cb(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    current = getattr(conf, 'tg_channel', '') or 'Not set'
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="tg_channel")
+    await answer(callback, f"📢 Current TG Channel: <code>{current}</code>\n\n"
+                           "Enter channel ID for trade notifications (e.g., -1001234567890):\n\n"
+                           "• Leave empty to use admins chat\n"
+                           "• Add bot to channel as admin first\n"
+                           "• Enter 'clear' to remove")
 
 @dp.callback_query(F.data == "toggle_test_mode")
 async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
@@ -616,6 +665,20 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(max_active_pairs=val)
             await answer(message, f"Max Active Pairs: <b>{val}</b>")
+            
+        elif waiting_for == "half_life":
+            # Parse "min-max" format
+            parts = value.replace(' ', '').split('-')
+            if len(parts) != 2:
+                await answer(message, "Error: use format <code>min-max</code> (e.g., 2-5)")
+                return
+            min_days = float(parts[0])
+            max_days = float(parts[1])
+            if min_days < 0.5 or max_days < min_days or max_days > 30:
+                await answer(message, "Error: min must be ≥0.5, max ≥ min, max ≤30")
+                return
+            await db.config_update(hl_min_days=min_days, hl_max_days=max_days)
+            await answer(message, f"⏱️ Half-Life: <b>{min_days}-{max_days} days</b>")
             
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 
@@ -874,7 +937,7 @@ async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
     
     try:
         pair_info.is_trading = True
-        await pairs_manager._execute_trade(pair_info, 0)
+        await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
         await callback.message.answer(f"✅ Position {s1}/{s2} closed successfully!")
     except Exception as e:
         await callback.message.answer(f"❌ Error closing {s1}/{s2}: {e}")
@@ -919,7 +982,7 @@ async def close_all_yes_handler(callback: CallbackQuery, state: FSMContext):
     for pair_info in pairs_to_close:
         try:
             pair_info.is_trading = True
-            await pairs_manager._execute_trade(pair_info, 0)
+            await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
             closed += 1
         except Exception as e:
             print(f"Error closing {pair_info.symbol1}-{pair_info.symbol2}: {e}")

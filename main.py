@@ -146,6 +146,36 @@ async def main():
                 continue  # Skip problematic symbols
     print(f"Loaded {len(all_symbols)} symbols.")
     
+    # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
+    max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
+    blacklist = set((conf.blacklist or '').split(','))
+    
+    try:
+        print(f"📈 Filtering top {max_symbols} symbols by 24h volume...")
+        tickers = await client.ticker_24hr_price_change()
+        
+        # Filter to USDT pairs with volume, exclude blacklist
+        valid_tickers = []
+        for t in tickers:
+            sym = t.get('symbol', '')
+            if sym.endswith('USDT') and sym not in blacklist and sym in all_symbols:
+                try:
+                    vol = float(t.get('quoteVolume', 0))
+                    valid_tickers.append((sym, vol))
+                except:
+                    continue
+        
+        # Sort by volume descending and keep top N
+        valid_tickers.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+        
+        # Filter all_symbols to only include top volume symbols
+        filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
+        print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)})")
+        all_symbols = filtered_symbols
+    except Exception as e:
+        print(f"⚠️ Volume filter failed ({e}). Using all symbols.")
+    
     # 2. Create pairs manager AFTER loading symbols
     pairs_manager = pairs_trading.PairsManager(
         client, 
@@ -260,15 +290,18 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
     target_symbols.sort()
     print(f"Subscribing to {len(target_symbols)} high-quality symbols (Filtered for PERPETUAL USDT-M).")
 
-    # 2. Add symbols from DB (pairs that are already active)
+    # 2. Add symbols from DB (ONLY pairs with open positions)
     db_pairs = await db.get_all_pairs()
+    active_db_count = 0
     for p in db_pairs:
-        if p.symbol1 not in target_symbols:
-            target_symbols.append(p.symbol1)
-        if p.symbol2 not in target_symbols:
-            target_symbols.append(p.symbol2)
+        if p.position_status != 0:  # Only add if position is open
+            if p.symbol1 not in target_symbols:
+                target_symbols.append(p.symbol1)
+            if p.symbol2 not in target_symbols:
+                target_symbols.append(p.symbol2)
+            active_db_count += 1
             
-    print(f"Subscribing to {len(target_symbols)} symbols (Market + DB active)...")
+    print(f"Subscribing to {len(target_symbols)} symbols (Filtered: {len(target_symbols) - active_db_count * 2}, DB active: {active_db_count} pairs)...")
 
     # Optimization: Pre-load historical data using batch processing
     if pairs_manager:

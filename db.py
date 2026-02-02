@@ -94,6 +94,12 @@ class ConfigInfo:
     test_mode: bool         # Force trades without signals on testnet (default False)
     test_pairs: str         # Comma-separated pairs for test mode (default 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT')
     priority_pairs_file: str # Path to JSON file with priority pairs (default 'market_neutral/best_pairs.json')
+    # Symbol Filtering
+    max_symbols: int        # Top N symbols by 24h volume (default 150)
+    tg_channel: str         # TG channel ID for trade notifications (default '')
+    # Half-Life Limits (in days)
+    hl_min_days: float      # Minimum half-life in days (default 2.0)
+    hl_max_days: float      # Maximum half-life in days (default 5.0)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -183,8 +189,14 @@ async def load_config():
             # Position Management (Phase 2)
             'max_active_pairs': '5',
             'test_mode': 'false',
-            'test_pairs': 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT',
-            'priority_pairs_file': 'market_neutral/best_pairs.json'
+            'test_pairs': '',  # Empty by default - bot handles regular pairs fine
+            'priority_pairs_file': 'market_neutral/best_pairs.json',
+            # Symbol Filtering
+            'max_symbols': '150',
+            'tg_channel': '',
+            # Half-Life Limits (in days) - optimized for 1h/4h TFs
+            'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
+            'hl_max_days': '2.0'     # Max 2 days (1h=48 candles, 4h=12 candles)
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

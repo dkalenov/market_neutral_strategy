@@ -8,6 +8,27 @@ CAPITAL = 1_000_000.0
 MAX_NOTIONAL_PER_PAIR = 0.1
 VOL_LOOKBACK = 60
 
+# Timeframe to candles per day mapping
+CANDLES_PER_DAY = {
+    '1m':  1440,
+    '5m':  288,
+    '15m': 96,
+    '30m': 48,
+    '1h':  24,
+    '4h':  6,
+    '1d':  1,
+}
+
+def get_half_life_limits(timeframe: str, hl_min_days: float = 2.0, hl_max_days: float = 5.0) -> tuple:
+    """
+    Get (min_hl, max_hl) in candles for given timeframe.
+    Converts configurable days to candle count.
+    """
+    candles = CANDLES_PER_DAY.get(timeframe, 24)  # Default to 1h
+    min_hl = int(hl_min_days * candles)
+    max_hl = int(hl_max_days * candles)
+    return (max(1, min_hl), max(min_hl + 1, max_hl))  # Ensure valid range
+
 def safe_get_slope(params):
     """Return slope param (index 1) robustly for numpy.ndarray or pandas.Series."""
     try:
@@ -102,13 +123,17 @@ def calculate_pair_beta(pair_r, market_r):
         return np.nan
     return float(cov / var_m)
 
-def batch_process_pairs(pairs_chunk, data_dict, min_data_points):
+def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h', hl_min_days=2.0, hl_max_days=5.0):
     """
     Worker function for parallel processing.
     pairs_chunk: list of tuples (s1, s2)
     data_dict: dict {symbol: np.array(log_prices)}
     min_data_points: int
+    timeframe: str (for half-life limits)
+    hl_min_days: float (configurable min half-life in days)
+    hl_max_days: float (configurable max half-life in days)
     """
+    min_hl, max_hl = get_half_life_limits(timeframe, hl_min_days, hl_max_days)
     results = []
     for s1, s2 in pairs_chunk:
         try:
@@ -129,7 +154,8 @@ def batch_process_pairs(pairs_chunk, data_dict, min_data_points):
             
             flag, hedge, hl, pval = calculate_cointegration(l1, l2)
             
-            if flag == 1:
+            # Filter by timeframe-specific half-life limits
+            if flag == 1 and min_hl <= hl <= max_hl:
                 results.append((s1, s2, hedge, hl, pval))
         except Exception:
             continue
