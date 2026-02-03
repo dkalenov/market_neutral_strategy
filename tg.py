@@ -294,7 +294,6 @@ async def settings(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
         [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
         [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
-        [InlineKeyboardButton(text="📢 TG Channel", callback_data="set_tg_channel")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
         [InlineKeyboardButton(text="Restart Bot", callback_data="restart")]
     ])
@@ -442,18 +441,6 @@ async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_symbols")
     await answer(callback, "Enter maximum number of symbols by volume (50-300, e.g., 150):\n\n⚠️ Requires restart to take effect.")
-
-@dp.callback_query(F.data == "set_tg_channel")
-async def set_tg_channel_cb(callback: CallbackQuery, state: FSMContext):
-    conf = await db.load_config()
-    current = getattr(conf, 'tg_channel', '') or 'Not set'
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="tg_channel")
-    await answer(callback, f"📢 Current TG Channel: <code>{current}</code>\n\n"
-                           "Enter channel ID for trade notifications (e.g., -1001234567890):\n\n"
-                           "• Leave empty to use admins chat\n"
-                           "• Add bot to channel as admin first\n"
-                           "• Enter 'clear' to remove")
 
 @dp.callback_query(F.data == "toggle_test_mode")
 async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
@@ -734,6 +721,15 @@ async def change_keys_value(message: Message, state: FSMContext):
             await state.update_data(tg_admins=message.text)
         else:
             await state.update_data(tg_admins=None)
+        await answer(message, "Enter TG CHANNEL ID for trade notifications (or 'skip' to skip):")
+        await message.delete()
+        return
+    
+    if 'tg_channel' not in data:
+        if message.text.lower() != 'skip':
+            await state.update_data(tg_channel=message.text)
+        else:
+            await state.update_data(tg_channel=None)
         
         new_conf = await state.get_data()
         update_data = {k: v for k, v in new_conf.items() if v is not None}

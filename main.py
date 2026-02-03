@@ -54,16 +54,28 @@ async def main():
     if not tg_token:
         print("WARNING: TG_TOKEN not set in .env file. Telegram bot will not work.")
 
+    # Get TG_CHANNEL for trade notifications (optional)
+    tg_channel = os.getenv('TG_CHANNEL', '').strip()
+
     # Function to send TG notifications
     async def send_tg_notification(message):
-        if tg.bot and tg_admins:
-             # Send to all admins
-             admins = [int(admin_id) for admin_id in tg_admins.split(',') if admin_id.strip()]
-             for admin_id in admins:
-                 try:
-                     await tg.bot.send_message(admin_id, message)
-                 except Exception as e:
-                     print(f"Error sending TG message to {admin_id}: {e}")
+        if not tg.bot:
+            return
+        
+        # Priority: send to channel if configured, otherwise to admins
+        if tg_channel:
+            try:
+                await tg.bot.send_message(tg_channel, message)
+            except Exception as e:
+                print(f"Error sending TG message to channel {tg_channel}: {e}")
+        elif tg_admins:
+            # Send to all admins
+            admins = [int(admin_id) for admin_id in tg_admins.split(',') if admin_id.strip()]
+            for admin_id in admins:
+                try:
+                    await tg.bot.send_message(admin_id, message)
+                except Exception as e:
+                    print(f"Error sending TG message to {admin_id}: {e}")
 
     # Create Binance client
     client = binance.Futures(api_key=api_key,
