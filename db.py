@@ -38,6 +38,15 @@ class Pairs(Base):
     qty2 = Column(Float, default=0.0)
     entry_price1 = Column(Float, default=0.0)
     entry_price2 = Column(Float, default=0.0)
+    # TG message tracking
+    tg_message_id = Column(Integer, default=0)  # For reply threading
+    # Trade lifecycle
+    open_time = Column(BigInteger, default=0)   # Unix timestamp
+    close_time = Column(BigInteger, default=0)  # Unix timestamp
+    close_pnl = Column(Float, default=0.0)      # Realized PnL
+    close_reason = Column(String, default='')   # z_tp, z_sl, hw_sl, hw_tp, broken, manual, external
+    fee1 = Column(Float, default=0.0)           # Fees leg 1
+    fee2 = Column(Float, default=0.0)           # Fees leg 2
     
     
 # Table for trade execution records
@@ -148,6 +157,14 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price2 FLOAT DEFAULT 0.0;",
+        # TG notification tracking columns
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS tg_message_id INTEGER DEFAULT 0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS open_time BIGINT DEFAULT 0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_time BIGINT DEFAULT 0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_pnl FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
     ]

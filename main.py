@@ -415,8 +415,31 @@ async def ws_msg_entry(ws, msg):
 
 # Handle userdata messages
 async def ws_user_msg(ws, msg):
-    """Handle userdata messages including order updates."""
+    """Handle userdata messages including order updates and position changes."""
     global pairs_manager
+    
+    # Check for ACCOUNT_UPDATE (position changes - including manual closes)
+    if msg.get('e') == 'ACCOUNT_UPDATE':
+        positions = msg.get('a', {}).get('P', [])
+        for pos in positions:
+            symbol = pos.get('s')
+            position_amt = float(pos.get('pa', 0))
+            
+            # Position closed (amount = 0)
+            if position_amt == 0 and pairs_manager:
+                # Check if this symbol is part of an active pair
+                for pair_info in pairs_manager.active_pairs.values():
+                    if pair_info.position_status != 0 and symbol in [pair_info.symbol1, pair_info.symbol2]:
+                        pnl = float(pos.get('up', 0))  # Unrealized PnL at close
+                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                        msg_text = f"📊 <b>Position Change:</b> {symbol}\n"
+                        msg_text += f"Status: Closed (external)\n"
+                        msg_text += f"PnL: {pnl_emoji} {pnl:.2f} USDT"
+                        try:
+                            await send_tg_notification(msg_text)
+                        except Exception as e:
+                            print(f"⚠️ TG notify error: {e}")
+                        break
     
     # Check for ORDER_TRADE_UPDATE (order filled/canceled)
     if msg.get('e') == 'ORDER_TRADE_UPDATE':

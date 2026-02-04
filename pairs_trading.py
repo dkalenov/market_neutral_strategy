@@ -57,7 +57,11 @@ class PairInfo:
     entry_price2: float = 0.0
     db_id: int = None 
     current_trade_id: int = None 
-    is_trading: bool = False 
+    is_trading: bool = False
+    # TG message tracking
+    tg_message_id: int = 0     # TG message ID for reply threading
+    open_time: int = 0         # Unix timestamp when trade opened
+    entry_z_score: float = 0.0 # Z-score at trade entry
 
 class PairsManager:
     """
@@ -427,8 +431,14 @@ class PairsManager:
                 if leg1_open != leg2_open:
                     # One leg closed unexpectedly
                     closed_leg = pair_info.symbol1 if not leg1_open else pair_info.symbol2
-                    msg = f"🚨 LEG DESYNC: {closed_leg} closed! Closing pair {pair_info.symbol1}-{pair_info.symbol2}"
-                    print(msg)
+                    remaining_leg = pair_info.symbol2 if not leg1_open else pair_info.symbol1
+                    remaining_qty = pos_by_symbol.get(remaining_leg, 0)
+                    
+                    msg = f"⚠️ <b>External Close Detected:</b>\n"
+                    msg += f"Pair: {pair_info.symbol1}-{pair_info.symbol2}\n"
+                    msg += f"❌ Closed: {closed_leg}\n"
+                    msg += f"🔄 Closing: {remaining_leg} ({abs(remaining_qty):.4f})"
+                    print(msg.replace('<b>', '').replace('</b>', ''))
                     await self._notify(msg)
                     
                     pair_info.is_trading = True
@@ -682,10 +692,12 @@ class PairsManager:
             # Entry signals
             if z_score < -z_entry:
                 print(f"🚀 [ENTRY TF] LONG Signal on {s1}-{s2}. Z: {z_score:.2f}. Opening...")
+                pair_info.entry_z_score = z_score  # Save Z-score at entry
                 pair_info.is_trading = True
                 self.loop.create_task(self._execute_trade(pair_info, 1))
             elif z_score > z_entry:
                 print(f"🔥 [ENTRY TF] SHORT Signal on {s1}-{s2}. Z: {z_score:.2f}. Opening...")
+                pair_info.entry_z_score = z_score  # Save Z-score at entry
                 pair_info.is_trading = True
                 self.loop.create_task(self._execute_trade(pair_info, -1))
 
@@ -893,10 +905,12 @@ class PairsManager:
                     # Normal mode: check z-score signals
                     if z_score < -z_entry:
                         print(f"🚀 LONG Signal on {s1}-{s2} spread. Z: {z_score:.2f}. Opening...")
+                        pair_info.entry_z_score = z_score
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 1))
                     elif z_score > z_entry:
                         print(f"🔥 SHORT Signal on {s1}-{s2} spread. Z: {z_score:.2f}. Opening...")
+                        pair_info.entry_z_score = z_score
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, -1))
                 
@@ -1237,16 +1251,60 @@ class PairsManager:
                 qty2_close = pair_info.qty2
 
                 try:
-                    task1 = self.loop.create_task(
-                        self.client.new_order(symbol=s1, side=side1_close, type='MARKET', quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT')
-                    )
-                    task2 = self.loop.create_task(
-                        self.client.new_order(symbol=s2, side=side2_close, type='MARKET', quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT')
-                    )
-                    results = await asyncio.gather(task1, task2, return_exceptions=True)
+                    # Check which legs still have open positions
+                    account = await self.client.account()
+                    open_positions = {}
+                    for pos in account.get('positions', []):
+                        amt = float(pos.get('positionAmt', 0))
+                        if amt != 0:
+                            open_positions[pos['symbol']] = amt
+                    
+                    leg1_exists = s1 in open_positions
+                    leg2_exists = s2 in open_positions
+                    
+                    close_tasks = []
+                    close_symbols = []
+                    
+                    if leg1_exists:
+                        close_tasks.append(self.client.new_order(
+                            symbol=s1, side=side1_close, type='MARKET', 
+                            quantity=abs(open_positions[s1]), reduceOnly='true', newOrderRespType='RESULT'
+                        ))
+                        close_symbols.append(s1)
+                    else:
+                        print(f"ℹ️ {s1} already closed, skipping")
+                        
+                    if leg2_exists:
+                        close_tasks.append(self.client.new_order(
+                            symbol=s2, side=side2_close, type='MARKET', 
+                            quantity=abs(open_positions[s2]), reduceOnly='true', newOrderRespType='RESULT'
+                        ))
+                        close_symbols.append(s2)
+                    else:
+                        print(f"ℹ️ {s2} already closed, skipping")
+                    
+                    if close_tasks:
+                        results = await asyncio.gather(*close_tasks, return_exceptions=True)
+                    else:
+                        results = []
+                    
+                    # Check for errors
+                    errors = []
+                    for i, res in enumerate(results):
+                        if isinstance(res, Exception):
+                            sym = close_symbols[i]
+                            # Simplify error message
+                            err_str = str(res)
+                            if 'ReduceOnly' in err_str:
+                                errors.append(f"{sym}: already closed")
+                            else:
+                                errors.append(f"{sym}: {err_str[:50]}")
+                        else:
+                            if close_symbols:
+                                print(f"✅ Closed {close_symbols[i]}")
                 
-                    if any(isinstance(res, Exception) for res in results):
-                        err_msg = f"❌ ERROR closing position for {s1}-{s2}. Manual intervention required. Errors: {results}"
+                    if errors:
+                        err_msg = f"⚠️ Close {s1}-{s2}: {', '.join(errors)}"
                         print(err_msg)
                         await self._notify(err_msg)
                     else:
@@ -1262,8 +1320,6 @@ class PairsManager:
                             'desync': '⚠️ Leg Desync',
                         }
                         reason_text = CLOSE_REASONS.get(close_reason, '❓ Unknown') if close_reason else '❓ Unknown'
-                        
-                        msg = f"✅ Position Closed: {s1}/{s2}"
                     
                         def get_price(order):
                             if 'avgPrice' in order and float(order['avgPrice']) > 0:
@@ -1282,10 +1338,7 @@ class PairsManager:
                         total_pnl = pnl1 + pnl2
                     
                         pnl_emoji = "🟢" if total_pnl > 0 else "🔴"
-                        msg += f"\n📊 Reason: {reason_text}"
-                        msg += f"\n💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
-                        print(msg)
-                        await self._notify(msg)
+
 
                         if pair_info.current_trade_id:
                             await db.update_trade_fields(
@@ -1304,34 +1357,62 @@ class PairsManager:
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                     
-                        # Cancel all algo orders for this pair
+                        # Cancel all algo orders for this pair - track per symbol/type
+                        cleanup_status = []
                         try:
                             algo_orders = await self.client.get_algo_orders()
-                            cancel_tasks = []
-                            for o in algo_orders:
-                                if o['symbol'] in [s1, s2]:
-                                    cancel_tasks.append(self.client.cancel_algo_order(algoId=o['algoId']))
                             
-                            if cancel_tasks:
-                                cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                                failed = sum(1 for r in cancel_results if isinstance(r, Exception))
-                                if failed == 0:
-                                    print(f"🗑️ Cancelled {len(cancel_tasks)} algo orders for {s1}-{s2}")
-                                else:
-                                    print(f"⚠️ Cancelled {len(cancel_tasks)-failed}/{len(cancel_tasks)} algo orders (errors: {failed})")
+                            # Track which orders exist for each symbol
+                            orders_by_sym = {s1: [], s2: []}
+                            for o in algo_orders:
+                                sym = o['symbol']
+                                if sym in orders_by_sym:
+                                    order_type = o.get('type', '')
+                                    if 'STOP' in order_type.upper():
+                                        orders_by_sym[sym].append(('SL', o['algoId']))
+                                    else:
+                                        orders_by_sym[sym].append(('TP', o['algoId']))
+                            
+                            # Cancel each order and track result
+                            for sym in [s1, s2]:
+                                for order_type, algo_id in orders_by_sym[sym]:
+                                    try:
+                                        await self.client.cancel_algo_order(algoId=algo_id)
+                                        cleanup_status.append(f"  ✅ {sym} {order_type} cancelled")
+                                    except Exception as e:
+                                        cleanup_status.append(f"  ⚠️ {sym} {order_type} - {str(e)[:20]}")
+                            
+                            if not orders_by_sym[s1] and not orders_by_sym[s2]:
+                                cleanup_status.append("  ℹ️ No orders found")
+                                
                         except Exception as e:
-                            print(f"⚠️ Failed to cancel algo orders: {e}")
-
-                    
+                            cleanup_status.append(f"  ❌ Failed: {str(e)[:30]}")
+                        
+                        # Build enhanced close message
+                        cleanup_msg = "\n".join(cleanup_status) if cleanup_status else "  ℹ️ No cleanup needed"
+                        full_msg = f"✅ Position Closed: {s1}/{s2}\n"
+                        full_msg += f"📊 Reason: {reason_text}\n\n"
+                        full_msg += f"🛡️ Order Cleanup:\n{cleanup_msg}\n\n"
+                        full_msg += f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
+                        
+                        print(full_msg.replace('<b>', '').replace('</b>', ''))
+                        await self._notify(full_msg)
+                        
+                        # Update DB with close details
                         if pair_info.db_id:
+                            import time
                             await db.update_pair({
                                 'id': pair_info.db_id,
                                 'position_status': 0,
                                 'qty1': 0,
                                 'qty2': 0,
                                 'entry_price1': 0,
-                                'entry_price2': 0
+                                'entry_price2': 0,
+                                'close_time': int(time.time()),
+                                'close_pnl': total_pnl,
+                                'close_reason': close_reason or 'unknown'
                             })
+
                         
                         # AUTO-ADD to best_pairs.json on successful TP
                         if close_reason in ('z_tp', 'hardware_tp') or total_pnl > 0:
@@ -1478,12 +1559,27 @@ class PairsManager:
 
                     pair_info.entry_price1 = get_price(executed_orders[0])
                     pair_info.entry_price2 = get_price(executed_orders[1])
-
+                    
+                    # Set open time
+                    import time
+                    from datetime import datetime
+                    pair_info.open_time = int(time.time())
+                    open_dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Determine which leg is LONG/SHORT
+                    if direction == 1:  # Long spread: BUY s1, SELL s2
+                        long_sym, long_qty, long_price = s1, pair_info.qty1, pair_info.entry_price1
+                        short_sym, short_qty, short_price = s2, pair_info.qty2, pair_info.entry_price2
+                    else:  # Short spread: SELL s1, BUY s2
+                        short_sym, short_qty, short_price = s1, pair_info.qty1, pair_info.entry_price1
+                        long_sym, long_qty, long_price = s2, pair_info.qty2, pair_info.entry_price2
+                    
                     success_msg = (f"🚀 <b>Trade OPENED:</b> {s1}-{s2}\n"
-                                   f"Direction: {'LONG' if direction == 1 else 'SHORT'} Spread\n"
-                                   f"Entry 1: {pair_info.qty1} {s1} @ {pair_info.entry_price1}\n"
-                                   f"Entry 2: {pair_info.qty2} {s2} @ {pair_info.entry_price2}")
-                    print(success_msg)
+                                   f"📅 {open_dt}\n\n"
+                                   f"📈 LONG: {long_qty} {long_sym} @ {long_price}\n"
+                                   f"📉 SHORT: {short_qty} {short_sym} @ {short_price}\n\n"
+                                   f"⚖️ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}")
+                    print(success_msg.replace('<b>', '').replace('</b>', ''))
                     await self._notify(success_msg)
                 
                     # === HARDWARE SL/TP PLACEMENT ===

@@ -851,6 +851,10 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
     """Show list of active pairs with open positions - verified against exchange."""
     await state.set_state(States.close_positions)
     
+    # Show loading message first (API call can be slow)
+    if isinstance(event, CallbackQuery):
+        await event.answer("⏳ Loading positions...")
+    
     keyboard = []
     has_positions = False
     
