@@ -85,6 +85,7 @@ class ConfigInfo:
     max_notional_pct: float
     leverage: int
     z_entry: float
+    z_entry_max: float  # Upper bound for entry Z-score (default 3.0)
     z_exit: float
     z_stop: float
     blacklist: str
@@ -109,6 +110,10 @@ class ConfigInfo:
     # Half-Life Limits (in days)
     hl_min_days: float      # Minimum half-life in days (default 2.0)
     hl_max_days: float      # Maximum half-life in days (default 5.0)
+    # Market Neutrality (Phase 3)
+    beta_threshold: float   # Max |beta_btc| for pair acceptance (default 0.11)
+    beta_alert_threshold: float  # Alert if |beta| > this for open positions (default 0.15)
+    signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -190,6 +195,7 @@ async def load_config():
             'leverage': '20',
             'max_notional_pct': '0.1',
             'z_entry': '2.0',
+            'z_entry_max': '3.0',  # Upper bound for entry window
             'z_exit': '0.0',
             'z_stop': '4.0',
             'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
@@ -213,7 +219,11 @@ async def load_config():
             'tg_channel': '',
             # Half-Life Limits (in days) - optimized for 1h/4h TFs
             'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
-            'hl_max_days': '2.0'     # Max 2 days (1h=48 candles, 4h=12 candles)
+            'hl_max_days': '2.0',    # Max 2 days (1h=48 candles, 4h=12 candles)
+            # Market Neutrality
+            'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
+            'beta_alert_threshold': '0.15',  # Alert if |beta| > this for open positions
+            'signal_confirm_sec': '10'       # Signal confirmation time in seconds
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty
