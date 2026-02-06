@@ -460,20 +460,95 @@ class PairsManager:
                 leg2_open = pair_info.symbol2 in pos_by_symbol
                 
                 if leg1_open != leg2_open:
-                    # One leg closed unexpectedly
-                    closed_leg = pair_info.symbol1 if not leg1_open else pair_info.symbol2
-                    remaining_leg = pair_info.symbol2 if not leg1_open else pair_info.symbol1
+                    # One leg closed unexpectedly - need to close the other and report PnL
+                    s1, s2 = pair_info.symbol1, pair_info.symbol2
+                    closed_leg = s1 if not leg1_open else s2
+                    remaining_leg = s2 if not leg1_open else s1
                     remaining_qty = pos_by_symbol.get(remaining_leg, 0)
                     
-                    msg = f"⚠️ <b>External Close Detected:</b>\n"
-                    msg += f"Pair: {pair_info.symbol1}-{pair_info.symbol2}\n"
-                    msg += f"❌ Closed: {closed_leg}\n"
-                    msg += f"🔄 Closing: {remaining_leg} ({abs(remaining_qty):.4f})"
-                    print(msg.replace('<b>', '').replace('</b>', ''))
-                    await self._notify(msg)
+                    print(f"⚡ Desync detected: {s1}-{s2}. {closed_leg} closed, closing {remaining_leg}...")
                     
                     pair_info.is_trading = True
-                    await self._execute_trade(pair_info, 0, close_reason='desync')
+                    
+                    try:
+                        # Cancel any remaining orders
+                        await self.client.cancel_open_orders(s1)
+                        await self.client.cancel_open_orders(s2)
+                        
+                        # Close remaining leg if it has position
+                        if remaining_qty != 0:
+                            close_side = 'SELL' if remaining_qty > 0 else 'BUY'
+                            await self.client.new_order(
+                                symbol=remaining_leg, 
+                                side=close_side, 
+                                type='MARKET',
+                                quantity=abs(remaining_qty), 
+                                reduceOnly='true'
+                            )
+                            print(f"✅ Closed remaining leg {remaining_leg}")
+                        
+                        # Wait for trade data to be available
+                        import asyncio
+                        await asyncio.sleep(1)
+                        
+                        # Fetch actual PnL from recent trades
+                        import time as time_mod
+                        now_ms = int(time_mod.time() * 1000)
+                        start_ms = now_ms - 300_000  # Last 5 minutes
+                        
+                        trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                        trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                        
+                        print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                        print(f"📊 Trades for {s2}: {len(trades2)} entries")
+                        
+                        # Sum realized PnL (already includes fees)
+                        pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                        pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                        fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                        fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                        total_pnl = pnl1 + pnl2
+                        total_fees = fee1 + fee2
+                        
+                        pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                        
+                        # Update memory state
+                        pair_info.position_status = 0
+                        pair_info.qty1 = 0
+                        pair_info.qty2 = 0
+                        pair_info.is_trading = False
+                        
+                        # Update DB
+                        if pair_info.db_id:
+                            await db.update_pair({
+                                'id': pair_info.db_id,
+                                'position_status': 0,
+                                'qty1': 0,
+                                'qty2': 0,
+                                'close_time': int(time_mod.time()),
+                                'close_pnl': total_pnl,
+                                'close_reason': 'desync',
+                                'pnl1': pnl1,
+                                'pnl2': pnl2,
+                                'fee1': fee1,
+                                'fee2': fee2
+                            })
+                        
+                        # Send detailed notification
+                        done_msg = (f"⚡ <b>Pair Closed (Desync):</b> {s1}-{s2}\n\n"
+                                    f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>\n"
+                                    f"   {s1}: {pnl1:+.2f} USDT\n"
+                                    f"   {s2}: {pnl2:+.2f} USDT\n"
+                                    f"💸 Fees (included): {total_fees:.4f} USDT")
+                        print(done_msg.replace('<b>', '').replace('</b>', ''))
+                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        await self._notify(done_msg, reply_to)
+                        
+                    except Exception as e:
+                        print(f"⚠️ Desync close error for {s1}-{s2}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        pair_info.is_trading = False
         except Exception as e:
             print(f"⚠️ Leg sync error: {e}")
 
