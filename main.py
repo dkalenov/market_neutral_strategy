@@ -17,6 +17,46 @@ websockets_list: list[binance.futures.WebsocketAsync] = []
 userdata_ws: binance.futures.WebsocketAsync
 pairs_manager: pairs_trading.PairsManager
 
+# TG notification globals
+tg_channel_global = ''
+tg_admins_global = ''
+
+async def send_tg_notification(message, reply_to_message_id=None):
+    """Send notification to TG channel or admins. Returns message_id for reply threading."""
+    if not tg.bot:
+        print("⚠️ TG: bot not initialized")
+        return None
+    
+    msg_id = None
+    # Priority: send to channel if configured, otherwise to admins
+    if tg_channel_global:
+        try:
+            sent = await tg.bot.send_message(
+                tg_channel_global, message, parse_mode='HTML',
+                reply_to_message_id=reply_to_message_id
+            )
+            msg_id = sent.message_id
+            print(f"📨 TG sent to channel, msg_id={msg_id}, reply_to={reply_to_message_id}")
+        except Exception as e:
+            print(f"Error sending TG to channel: {e}")
+    elif tg_admins_global:
+        admins = [int(admin_id) for admin_id in tg_admins_global.split(',') if admin_id.strip()]
+        for admin_id in admins:
+            try:
+                sent = await tg.bot.send_message(
+                    admin_id, message, parse_mode='HTML',
+                    reply_to_message_id=reply_to_message_id
+                )
+                if msg_id is None:
+                    msg_id = sent.message_id
+                print(f"📨 TG sent to {admin_id}, msg_id={msg_id}, reply_to={reply_to_message_id}")
+            except Exception as e:
+                print(f"Error sending TG to {admin_id}: {e}")
+    else:
+        print("⚠️ TG: no channel or admins configured")
+    
+    return msg_id
+
 
 async def main():
     global client
@@ -54,28 +94,10 @@ async def main():
     if not tg_token:
         print("WARNING: TG_TOKEN not set in .env file. Telegram bot will not work.")
 
-    # Get TG_CHANNEL for trade notifications (optional)
-    tg_channel = os.getenv('TG_CHANNEL', '').strip()
-
-    # Function to send TG notifications
-    async def send_tg_notification(message):
-        if not tg.bot:
-            return
-        
-        # Priority: send to channel if configured, otherwise to admins
-        if tg_channel:
-            try:
-                await tg.bot.send_message(tg_channel, message)
-            except Exception as e:
-                print(f"Error sending TG message to channel {tg_channel}: {e}")
-        elif tg_admins:
-            # Send to all admins
-            admins = [int(admin_id) for admin_id in tg_admins.split(',') if admin_id.strip()]
-            for admin_id in admins:
-                try:
-                    await tg.bot.send_message(admin_id, message)
-                except Exception as e:
-                    print(f"Error sending TG message to {admin_id}: {e}")
+    # Initialize global TG notification settings
+    global tg_channel_global, tg_admins_global
+    tg_channel_global = os.getenv('TG_CHANNEL', '').strip()
+    tg_admins_global = tg_admins
 
     # Create Binance client
     client = binance.Futures(api_key=api_key,
@@ -129,8 +151,9 @@ async def main():
             window_size = 336  # Default as for 1h
         print(f"⚙️ Auto-calculated window_size: {window_size} (for {timeframe})")
     
-    # Entry timeframe for faster signals (default: 15m)
-    entry_timeframe = conf.entry_timeframe if conf.entry_timeframe else '15m'
+    # Single TF Mode: entry timeframe = main timeframe
+    # This ensures Z-score consistency and avoids conflicting signals
+    entry_timeframe = timeframe  # Changed from separate entry TF to single TF mode
     
     # 1. Load symbols (with error handling for bad filter data from Binance)
     print("Initial loading of market symbols...")
@@ -364,6 +387,40 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
         print("Connected to userdata websocket.")
     except Exception as e:
         print(f"Could not connect to userdata stream: {e}")
+    
+    # Start real-time signal confirmation loop
+    if pairs_manager:
+        pairs_manager.start_realtime_monitoring()
+        
+        # Subscribe to markPrice stream for real-time price updates (for active pairs only)
+        # Get symbols from active pairs
+        active_symbols = set()
+        for pair_info in pairs_manager.active_pairs.values():
+            active_symbols.add(pair_info.symbol1)
+            active_symbols.add(pair_info.symbol2)
+        
+        if active_symbols:
+            mark_streams = [f"{sym.lower()}@markPrice@1s" for sym in active_symbols]
+            mark_chunks = [mark_streams[i:i + chunk_size] for i in range(0, len(mark_streams), chunk_size)]
+            
+            async def ws_mark_price(ws, msg):
+                """Handle markPrice updates for real-time Z-score."""
+                if 'data' not in msg:
+                    return
+                data = msg['data']
+                symbol = data.get('s')
+                price = float(data.get('p', 0))
+                if symbol and price > 0 and pairs_manager:
+                    await pairs_manager.on_ticker_update(symbol, price)
+            
+            for marks in mark_chunks:
+                try:
+                    ws = await client.websocket(marks, on_message=ws_mark_price, on_error=ws_error)
+                    websockets_list.append(ws)
+                except Exception as e:
+                    print(f"Error subscribing to markPrice: {e}")
+            
+            print(f"Connected to markPrice websocket ({len(active_symbols)} symbols).")
 
 
 # Disconnect from websockets
@@ -418,9 +475,30 @@ async def ws_user_msg(ws, msg):
     """Handle userdata messages including order updates and position changes."""
     global pairs_manager
     
+    event_type = msg.get('e')
+    
+    # DEBUG: Log all userdata events
+    if event_type in ('ACCOUNT_UPDATE', 'ORDER_TRADE_UPDATE'):
+        print(f"📡 UserData WS: {event_type} received")
+    
     # Check for ACCOUNT_UPDATE (position changes - including manual closes)
-    if msg.get('e') == 'ACCOUNT_UPDATE':
+    if event_type == 'ACCOUNT_UPDATE':
         positions = msg.get('a', {}).get('P', [])
+        print(f"📡 ACCOUNT_UPDATE: {len(positions)} positions in update")
+        
+        # Notify about ALL position changes immediately
+        closed_symbols = []
+        for pos in positions:
+            sym = pos.get('s')
+            amt = float(pos.get('pa', 0))
+            if amt == 0:
+                closed_symbols.append(sym)
+        
+        # Note: Detailed notifications will be sent per-pair below
+        # Skip simple "Position Changes" message - too noisy
+        
+        processed_pairs = set()  # Track pairs we've already handled in this update
+        
         for pos in positions:
             symbol = pos.get('s')
             position_amt = float(pos.get('pa', 0))
@@ -428,17 +506,173 @@ async def ws_user_msg(ws, msg):
             # Position closed (amount = 0)
             if position_amt == 0 and pairs_manager:
                 # Check if this symbol is part of an active pair
-                for pair_info in pairs_manager.active_pairs.values():
+                for pair_set, pair_info in list(pairs_manager.active_pairs.items()):
+                    # Skip if already processed in this batch
+                    if pair_set in processed_pairs:
+                        continue
+                        
                     if pair_info.position_status != 0 and symbol in [pair_info.symbol1, pair_info.symbol2]:
-                        pnl = float(pos.get('up', 0))  # Unrealized PnL at close
+                        s1, s2 = pair_info.symbol1, pair_info.symbol2
+                        other_symbol = s2 if symbol == s1 else s1
+                        
+                        # Check if both legs were closed in this same update (bulk close)
+                        other_closed_in_batch = any(
+                            p.get('s') == other_symbol and float(p.get('pa', 0)) == 0 
+                            for p in positions
+                        )
+                        
+                        pnl = float(pos.get('up', 0))
                         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                        msg_text = f"📊 <b>Position Change:</b> {symbol}\n"
-                        msg_text += f"Status: Closed (external)\n"
-                        msg_text += f"PnL: {pnl_emoji} {pnl:.2f} USDT"
-                        try:
-                            await send_tg_notification(msg_text)
-                        except Exception as e:
-                            print(f"⚠️ TG notify error: {e}")
+                        
+                        # Mark as processed
+                        processed_pairs.add(pair_set)
+                        
+                        if other_closed_in_batch:
+                            # Both legs closed together - fetch actual PnL and cleanup
+                            print(f"⚡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
+                            try:
+                                await client.cancel_open_orders(s1)
+                                await client.cancel_open_orders(s2)
+                                
+                                # Small delay to ensure trade data is available
+                                import asyncio
+                                await asyncio.sleep(1)
+                                
+                                # Fetch actual PnL from recent trades (more reliable than Income API)
+                                import time as time_mod
+                                now_ms = int(time_mod.time() * 1000)
+                                start_ms = now_ms - 300_000  # Last 5 minutes
+                                
+                                trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                                trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                                
+                                # Debug: show what API returned
+                                print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                                print(f"📊 Trades for {s2}: {len(trades2)} entries")
+                                
+                                # Sum realized PnL and commissions from trades
+                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                                fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                                fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                                total_pnl = pnl1 + pnl2
+                                total_fees = fee1 + fee2
+                                
+                                # Net PnL is realized PnL minus fees (fees are already negative in some cases)
+                                net_pnl = total_pnl - total_fees
+                                
+                                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                                
+                                msg_text = (f"⚡ <b>Pair Closed Externally:</b> {s1}-{s2}\n\n"
+                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
+                                            f"   {s1}: {pnl1:+.2f} USDT\n"
+                                            f"   {s2}: {pnl2:+.2f} USDT\n"
+                                            f"💸 Fees: -{total_fees:.4f} USDT")
+                                
+                                reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                                await send_tg_notification(msg_text, reply_to)
+                                
+                                pair_info.position_status = 0
+                                pair_info.qty1 = 0
+                                pair_info.qty2 = 0
+                                
+                                if pair_info.db_id:
+                                    await db.update_pair({
+                                        'id': pair_info.db_id,
+                                        'position_status': 0,
+                                        'qty1': 0,
+                                        'qty2': 0,
+                                        'close_time': int(time_mod.time()),
+                                        'close_pnl': net_pnl,
+                                        'close_reason': 'external',
+                                        'pnl1': pnl1,
+                                        'pnl2': pnl2,
+                                        'fee1': fee1,
+                                        'fee2': fee2
+                                    })
+                            except Exception as e:
+                                print(f"⚠️ Cleanup error: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        else:
+                            # Only one leg closed - close the other
+                            print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol}...")
+                            try:
+                                await client.cancel_open_orders(s1)
+                                await client.cancel_open_orders(s2)
+                                
+                                # Use get_position_risk to get position info
+                                positions_data = await client.get_position_risk(symbol=other_symbol)
+                                other_pos = positions_data[0] if positions_data else {}
+                                other_amt = float(other_pos.get('positionAmt', 0))
+                                
+                                if other_amt != 0:
+                                    close_side = 'SELL' if other_amt > 0 else 'BUY'
+                                    await client.new_order(symbol=other_symbol, side=close_side, type='MARKET', 
+                                                          quantity=abs(other_amt), reduceOnly='true')
+                                    print(f"✅ Closed remaining leg {other_symbol}")
+                                
+                                # Small delay to ensure trade data is available
+                                import asyncio
+                                await asyncio.sleep(1)
+                                
+                                # Fetch actual PnL from recent trades (more reliable than Income API)
+                                import time as time_mod
+                                now_ms = int(time_mod.time() * 1000)
+                                start_ms = now_ms - 300_000  # Last 5 minutes
+                                
+                                trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                                trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                                
+                                # Debug: show what API returned
+                                print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                                print(f"📊 Trades for {s2}: {len(trades2)} entries")
+                                
+                                # Sum realized PnL and commissions from trades
+                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                                fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                                fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                                total_pnl = pnl1 + pnl2
+                                total_fees = fee1 + fee2
+                                
+                                # Net PnL is realized PnL minus fees
+                                net_pnl = total_pnl - total_fees
+                                
+                                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                                
+                                pair_info.position_status = 0
+                                pair_info.qty1 = 0
+                                pair_info.qty2 = 0
+                                
+                                if pair_info.db_id:
+                                    await db.update_pair({
+                                        'id': pair_info.db_id,
+                                        'position_status': 0,
+                                        'qty1': 0,
+                                        'qty2': 0,
+                                        'close_time': int(time_mod.time()),
+                                        'close_pnl': net_pnl,
+                                        'close_reason': 'external',
+                                        'pnl1': pnl1,
+                                        'pnl2': pnl2,
+                                        'fee1': fee1,
+                                        'fee2': fee2
+                                    })
+                                
+                                # Single consolidated notification
+                                done_msg = (f"⚡ <b>Pair Closed Externally:</b> {s1}-{s2}\n\n"
+                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
+                                            f"   {s1}: {pnl1:+.2f} USDT\n"
+                                            f"   {s2}: {pnl2:+.2f} USDT\n"
+                                            f"💸 Fees: -{total_fees:.4f} USDT")
+                                reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                                await send_tg_notification(done_msg, reply_to)
+                                
+                            except Exception as e:
+                                print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
+                                import traceback
+                                traceback.print_exc()
                         break
     
     # Check for ORDER_TRADE_UPDATE (order filled/canceled)
@@ -447,9 +681,11 @@ async def ws_user_msg(ws, msg):
         symbol = order.get('s')
         order_type = order.get('ot')  # Original order type: STOP, TAKE_PROFIT, MARKET, etc.
         status = order.get('X')       # FILLED, CANCELED, NEW, etc.
+        side = order.get('S')         # BUY, SELL
+        order_id = order.get('i')     # Order ID
         
         # Check if this is a filled SL/TP order (hardware stop triggered)
-        if status == 'FILLED' and order_type in ('STOP', 'TAKE_PROFIT'):
+        if status == 'FILLED' and order_type in ('STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
             print(f"🎯 Hardware SL/TP triggered: {symbol} {order_type} FILLED")
             
             # Notify pairs_manager to close the other leg
@@ -458,6 +694,34 @@ async def ws_user_msg(ws, msg):
                     await pairs_manager.handle_sl_tp_triggered(symbol)
                 except Exception as e:
                     print(f"⚠️ Error handling SL/TP trigger: {e}")
+        
+        # CANCELED order - notify user and trigger cleanup
+        elif status == 'CANCELED' and order_type in ('STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
+            print(f"⚠️ SL/TP CANCELED: {symbol} {order_type} by user/system")
+            
+            # Find which pair this order belongs to
+            if pairs_manager:
+                for pair_info in pairs_manager.active_pairs.values():
+                    if pair_info.position_status != 0 and symbol in [pair_info.symbol1, pair_info.symbol2]:
+                        s1, s2 = pair_info.symbol1, pair_info.symbol2
+                        other_symbol = s2 if symbol == s1 else s1
+                        
+                        # Notify user about manual order cancellation
+                        cancel_msg = (f"⚠️ <b>Order CANCELED:</b> {symbol}\n"
+                                      f"Type: {order_type}\n"
+                                      f"Pair: {s1}-{s2}\n"
+                                      f"⏳ Checking pair integrity...")
+                        try:
+                            await send_tg_notification(cancel_msg)
+                        except Exception as e:
+                            print(f"⚠️ TG notify error: {e}")
+                        
+                        # Trigger immediate leg sync check for this pair
+                        try:
+                            await pairs_manager._check_and_sync_legs()
+                        except Exception as e:
+                            print(f"⚠️ Leg sync error after cancel: {e}")
+                        break
 
 
 if __name__ == '__main__':

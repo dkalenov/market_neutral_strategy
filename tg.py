@@ -13,7 +13,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 
 
 # Initialize bot and dispatcher
-bot: Bot
+bot: Bot = None  # Will be initialized in run()
 dp = Dispatcher()
 
 class AuthMiddleware(BaseMiddleware):
@@ -288,8 +288,14 @@ async def settings(message: Message, state: FSMContext):
     if isinstance(test_mode, str):
         test_mode = test_mode.lower() in ('true', '1', 'yes')
     
+    # Get trade mode status
+    trade_mode = getattr(conf, 'trade_mode', True)
+    if isinstance(trade_mode, str):
+        trade_mode = trade_mode.lower() in ('true', '1', 'yes')
+    
     # Create keyboard
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔄 Trading: {'ON ✅' if trade_mode else 'OFF ❌'}", callback_data="toggle_trade_mode")],
         [InlineKeyboardButton(text="Strategy Settings", callback_data="strategy_settings")],
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
         [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
@@ -308,6 +314,7 @@ async def settings(message: Message, state: FSMContext):
     lev = conf.leverage if conf.leverage else "20 (default)"
     risk = f"{conf.max_notional_pct*100}%" if conf.max_notional_pct else "10% (default)"
     z_in = conf.z_entry if conf.z_entry else "2.0 (default)"
+    z_in_max = conf.z_entry_max if conf.z_entry_max else "3.0 (default)"
     z_ex = conf.z_exit if conf.z_exit is not None else "0.0 (default)"
     z_out = conf.z_stop if conf.z_stop else "4.0 (default)"
 
@@ -321,7 +328,7 @@ async def settings(message: Message, state: FSMContext):
             f"Capital: <b>{cap} USDT</b>\n"
             f"Leverage: <b>x{lev}</b>\n"
             f"Max Risk/Pair: <b>{risk}</b>\n"
-            f"Z-Entry: <b>{z_in}</b>\n"
+            f"Z-Entry Window: <b>{z_in} - {z_in_max}</b>\n"
             f"Z-Exit: <b>{z_ex}</b> (TP)\n"
             f"Z-Stop: <b>{z_out}</b> (SL)\n")
     # Send message
@@ -381,6 +388,7 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Leverage (x)", callback_data="set_leverage")],
         [InlineKeyboardButton(text="Max % Per Pair", callback_data="set_max_notional")],
         [InlineKeyboardButton(text="Z-Entry", callback_data="set_z_entry")],
+        [InlineKeyboardButton(text="Z-Entry Max", callback_data="set_z_entry_max")],
         [InlineKeyboardButton(text="Z-Exit", callback_data="set_z_exit")],
         [InlineKeyboardButton(text="Z-Stop", callback_data="set_z_stop")],
         [InlineKeyboardButton(text="🛡️ Hardware SL/TP", callback_data="hardware_sltp")],
@@ -424,6 +432,12 @@ async def set_z_exit_cb(callback: CallbackQuery, state: FSMContext):
     await state.update_data(waiting_for="z_exit")
     await answer(callback, "Enter Z-Score for EXIT (Take Profit), usually 0:")
 
+@dp.callback_query(F.data == "set_z_entry_max")
+async def set_z_entry_max_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="z_entry_max")
+    await answer(callback, "Enter Z-Score MAX for ENTRY (upper bound of entry window, e.g., 3.0):")
+
 @dp.callback_query(F.data == "set_z_stop")
 async def set_z_stop_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
@@ -441,6 +455,29 @@ async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_symbols")
     await answer(callback, "Enter maximum number of symbols by volume (50-300, e.g., 150):\n\n⚠️ Requires restart to take effect.")
+
+@dp.callback_query(F.data == "toggle_trade_mode")
+async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    current = getattr(conf, 'trade_mode', True)
+    if isinstance(current, str):
+        current = current.lower() in ('true', '1', 'yes')
+    
+    new_value = 'false' if current else 'true'
+    await db.config_update(trade_mode=new_value)
+    
+    # Reload config in pairs_manager
+    if pairs_manager and hasattr(pairs_manager, 'config'):
+        pairs_manager.config = await db.load_config()
+    
+    if new_value == 'true':
+        status = "🔄 Trading ENABLED - New positions will be opened"
+    else:
+        status = "🔄 Trading DISABLED - No new positions will be opened"
+    
+    await callback.answer(status, show_alert=True)
+    # Refresh menu - go back to settings
+    await settings(callback, state)
 
 @dp.callback_query(F.data == "toggle_test_mode")
 async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
@@ -640,6 +677,11 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             await db.config_update(z_exit=val)
             await answer(message, f"Z-Exit: <b>{val}</b> (Take Profit)")
 
+        elif waiting_for == "z_entry_max":
+            val = float(value)
+            await db.config_update(z_entry_max=val)
+            await answer(message, f"Z-Entry Max: <b>{val}</b> (Upper bound for entry window)")
+
         elif waiting_for == "z_stop":
             val = float(value)
             await db.config_update(z_stop=val)
@@ -666,6 +708,14 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(hl_min_days=min_days, hl_max_days=max_days)
             await answer(message, f"⏱️ Half-Life: <b>{min_days}-{max_days} days</b>")
+        
+        elif waiting_for == "max_symbols":
+            val = int(value)
+            if val < 50 or val > 300:
+                await answer(message, "Value must be between 50 and 300.")
+                return
+            await db.config_update(max_symbols=val)
+            await answer(message, f"📈 Max Symbols: <b>{val}</b>\n⚠️ Requires restart to take effect.")
             
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 

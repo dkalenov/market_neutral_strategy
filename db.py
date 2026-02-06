@@ -47,6 +47,8 @@ class Pairs(Base):
     close_reason = Column(String, default='')   # z_tp, z_sl, hw_sl, hw_tp, broken, manual, external
     fee1 = Column(Float, default=0.0)           # Fees leg 1
     fee2 = Column(Float, default=0.0)           # Fees leg 2
+    pnl1 = Column(Float, default=0.0)           # Realized PnL leg 1
+    pnl2 = Column(Float, default=0.0)           # Realized PnL leg 2
     
     
 # Table for trade execution records
@@ -114,6 +116,7 @@ class ConfigInfo:
     beta_threshold: float   # Max |beta_btc| for pair acceptance (default 0.11)
     beta_alert_threshold: float  # Alert if |beta| > this for open positions (default 0.15)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
+    trade_mode: bool        # If True, allow opening new positions (default True)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -170,6 +173,8 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl1 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl2 FLOAT DEFAULT 0.0;",
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
     ]
@@ -223,7 +228,8 @@ async def load_config():
             # Market Neutrality
             'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
             'beta_alert_threshold': '0.15',  # Alert if |beta| > this for open positions
-            'signal_confirm_sec': '10'       # Signal confirmation time in seconds
+            'signal_confirm_sec': '10',      # Signal confirmation time in seconds
+            'trade_mode': 'true'             # Allow opening new positions
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

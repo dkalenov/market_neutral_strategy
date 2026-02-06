@@ -62,6 +62,11 @@ class PairInfo:
     tg_message_id: int = 0     # TG message ID for reply threading
     open_time: int = 0         # Unix timestamp when trade opened
     entry_z_score: float = 0.0 # Z-score at trade entry
+    # Market neutrality
+    beta_btc: float = 0.0      # Beta to BTC (should be near 0 for market-neutral)
+    # Signal confirmation (for real-time mode)
+    pending_signal: float = None  # Pending Z-score signal awaiting confirmation
+    pending_since: float = None   # Time when signal started
 
 class PairsManager:
     """
@@ -98,6 +103,10 @@ class PairsManager:
         # CPU Pool for heavy computations
         self.executor = ProcessPoolExecutor(max_workers=None)
         
+        # Real-time Z-score monitoring
+        self.last_prices: dict[str, float] = {}  # {symbol: last_price} from WebSocket ticker
+        self._signal_confirmation_task = None    # Task for checking confirmed signals
+        
         # NOTE: Initialization is now EXPLICIT - call await pairs_manager.initialize() in main.py
         self._initialized = False
 
@@ -113,9 +122,9 @@ class PairsManager:
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         print(f"✅ PairsManager initialized. Max active pairs: {max_pairs}")
         
-        # Start periodic leg sync loop (checks for desync + orphaned orders every 30 sec)
+        # Start periodic leg sync loop (BACKUP only - primary sync is via WebSocket)
         self._leg_sync_task = self.loop.create_task(self._periodic_leg_sync_loop())
-        print("🔄 Started leg synchronization loop (every 30s)")
+        print("🔄 Started backup leg sync loop (every 30s, primary via WebSocket)")
 
     async def _load_state_from_db(self):
         print("Restoring active positions from DB...")
@@ -140,7 +149,8 @@ class PairsManager:
                     qty2=p.qty2,
                     entry_price1=p.entry_price1,
                     entry_price2=p.entry_price2,
-                    db_id=p.id
+                    db_id=p.id,
+                    tg_message_id=getattr(p, 'tg_message_id', 0) or 0
                 )
 
                 last_trade = await db.get_last_open_trade_for_pair(p.id)
@@ -225,8 +235,12 @@ class PairsManager:
                         pairs_to_fix.append((pair_info, 'close_db'))
                     elif s1_open != s2_open:
                         # One leg open, one closed - orphaned position!
+                        # Mark as closed in DB to prevent sync loop from trying to close
                         print(f"  🚨 ORPHAN: {s1}-{s2} has mismatched legs! {s1}:{s1_open}, {s2}:{s2_open}")
-                        await self._notify(f"🚨 ORPHAN POSITION: {s1}-{s2} has mismatched legs. Manual check required!")
+                        print(f"      → Marking as CLOSED in DB. Close remaining leg manually!")
+                        pairs_to_fix.append((pair_info, 'close_db'))
+                        remaining_sym = s1 if s1_open else s2
+                        await self._notify(f"🚨 ORPHAN POSITION: {s1}-{s2}\n{remaining_sym} is still open on exchange!\nClose manually or it will remain open.")
                     else:
                         # Both open - check for SL orders (STOP type in algo orders)
                         has_sl1 = any(o.get('type') == 'STOP' for o in orders_by_symbol.get(s1, []))
@@ -402,9 +416,10 @@ class PairsManager:
                 break
 
     async def _periodic_leg_sync_loop(self):
-        """Periodically check leg synchronization and cleanup orphaned orders every 30 seconds."""
+        """BACKUP: Periodically check leg sync and cleanup orphaned orders every 30 seconds.
+        Primary sync is handled by userdata WebSocket."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(30)  # Backup check
             try:
                 await self._check_leg_synchronization()
                 await self._cleanup_orphaned_algo_orders()
@@ -537,6 +552,12 @@ class PairsManager:
         # Sort symbols: priority first, then others
         other_symbols = [s for s in symbols_to_load if s not in priority_symbols]
         sorted_symbols = list(priority_symbols) + other_symbols
+        
+        # CRITICAL: Always include BTCUSDT for market beta calculation
+        if 'BTCUSDT' not in sorted_symbols and 'BTCUSDT' in self.all_symbols:
+            sorted_symbols.append('BTCUSDT')
+            print("📈 Added BTCUSDT for market beta calculation")
+        
         print(f"Priority symbols: {len(priority_symbols)}, Others: {len(other_symbols)}")
         
         # 2. Batch processing with semaphore
@@ -555,6 +576,15 @@ class PairsManager:
         
         elapsed = time.time() - start_time
         print(f"✅ History initialization finished in {elapsed:.2f}s.")
+        
+        # CRITICAL: Ensure BTCUSDT is loaded for beta calculation
+        if 'BTCUSDT' not in self.all_data:
+            print("📈 Loading BTCUSDT for beta calculation...")
+            self.all_data['BTCUSDT'] = Data(maxlen=self.max_len)
+            await self._initialize_history('BTCUSDT')
+        
+        btc_len = len(self.all_data.get('BTCUSDT', Data()).close) if 'BTCUSDT' in self.all_data else 0
+        print(f"📊 BTCUSDT data: {btc_len} candles loaded")
         
         # CRITICAL: Run Discovery to find cointegrated pairs BEFORE checking signals
         print("🔍 Running initial Discovery...")
@@ -769,6 +799,27 @@ class PairsManager:
                 p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
                 flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold)
 
+                # === MARKET NEUTRALITY CHECK ===
+                # Calculate beta to BTC to ensure pair is market-neutral
+                beta_btc = np.nan
+                beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
+                
+                if flag == 1 and 'BTCUSDT' in self.all_data:
+                    btc_data = self.all_data['BTCUSDT']
+                    if len(btc_data.close) >= self.min_data_points:
+                        log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
+                        # Spread returns = d(log1) - hedge * d(log2)
+                        spread_returns = np.diff(log_prices1) - hedge * np.diff(log_prices2)
+                        btc_returns = np.diff(log_btc)
+                        beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
+                        
+                        if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
+                            print(f"⚠️ {s1}-{s2} rejected: beta_btc={beta_btc:.3f} >= {beta_threshold} (not market-neutral)")
+                            flag = 0  # Mark as not cointegrated
+                
+                # Store beta for display
+                pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
+
                 # Check if this is a test pair that should not be removed
                 is_protected_test_pair = False
                 test_mode = getattr(self.config, 'test_mode', False)
@@ -869,6 +920,40 @@ class PairsManager:
                             self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='circuit'))
                             # pair_info.position_status = 0 # Will be set in execute_trade
                             continue
+                
+                # === BETA DRIFT MONITORING ===
+                # Check if open position has become correlated with market
+                if pair_info.position_status != 0 and pair_info.beta_btc != 0:
+                    beta_alert_threshold = getattr(self.config, 'beta_alert_threshold', 0.15) or 0.15
+                    
+                    if abs(pair_info.beta_btc) >= beta_alert_threshold:
+                        # Calculate current PnL
+                        current_price1 = list(data1.close)[-1]
+                        current_price2 = list(data2.close)[-1]
+                        side1 = 1 if pair_info.position_status == 1 else -1
+                        side2 = -1 if pair_info.position_status == 1 else 1
+                        pnl1 = (current_price1 - pair_info.entry_price1) * pair_info.qty1 * side1
+                        pnl2 = (current_price2 - pair_info.entry_price2) * pair_info.qty2 * side2
+                        total_pnl = pnl1 + pnl2
+                        
+                        if total_pnl > 0:
+                            # Positive PnL - auto close
+                            beta_msg = (f"⚠️ <b>BETA DRIFT</b> on {s1}-{s2}!\n"
+                                        f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
+                                        f"PnL: +{total_pnl:.2f} USDT. Auto-closing...")
+                            print(beta_msg)
+                            self.loop.create_task(self._notify(beta_msg))
+                            pair_info.is_trading = True
+                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='beta_drift'))
+                            continue
+                        else:
+                            # Negative PnL - notify user (but don't close)
+                            beta_warn = (f"⚠️ <b>BETA DRIFT WARNING</b> on {s1}-{s2}!\n"
+                                         f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
+                                         f"PnL: {total_pnl:.2f} USDT. Consider manual close.")
+                            print(beta_warn)
+                            self.loop.create_task(self._notify(beta_warn))
+                            # Don't continue - let position stay open
 
                 z_entry = self.config.z_entry if self.config and self.config.z_entry else 2.0
                 z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
@@ -902,17 +987,10 @@ class PairsManager:
                             self.loop.create_task(self._execute_trade(pair_info, 1))
                             continue
                     
-                    # Normal mode: check z-score signals
-                    if z_score < -z_entry:
-                        print(f"🚀 LONG Signal on {s1}-{s2} spread. Z: {z_score:.2f}. Opening...")
-                        pair_info.entry_z_score = z_score
-                        pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 1))
-                    elif z_score > z_entry:
-                        print(f"🔥 SHORT Signal on {s1}-{s2} spread. Z: {z_score:.2f}. Opening...")
-                        pair_info.entry_z_score = z_score
-                        pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, -1))
+                    # NOTE: Entry signals are now handled by real-time Z-score monitoring
+                    # (on_ticker_update + _signal_confirmation_loop)
+                    # This discovery loop only validates cointegration and updates parameters
+                    pass
                 
                 elif pair_info.position_status == 1: # Long spread
                     if z_score >= z_exit:
@@ -1081,13 +1159,25 @@ class PairsManager:
         elapsed = time.time() - start_time
         print(f"Discovery process finished in {elapsed:.2f}s. Found {new_pairs_count} new pairs.")
 
-    async def _notify(self, message):
-        """Sends a notification via the configured callback."""
+    async def _notify(self, message, reply_to_msg_id=None):
+        """Sends a notification via the configured callback. Returns msg_id for reply threading."""
         if self.notify_callback:
             try:
-                await self.notify_callback(message)
+                return await self.notify_callback(message, reply_to_msg_id)
             except Exception as e:
                 print(f"Error in _notify: {e}")
+        return None
+
+    def _format_half_life(self, hl_hours: float) -> str:
+        """Format half-life in human-readable format (e.g., '1d 6h' or '16h 48m')."""
+        if hl_hours >= 24:
+            days = int(hl_hours // 24)
+            hours = int(hl_hours % 24)
+            return f"{days}d {hours}h" if hours > 0 else f"{days}d"
+        else:
+            hours = int(hl_hours)
+            mins = int((hl_hours - hours) * 60)
+            return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
 
     async def _set_leverage(self, symbol, leverage):
         """Sets leverage for the symbol if not already set."""
@@ -1185,6 +1275,11 @@ class PairsManager:
 
     def can_open_new_position(self, s1: str, s2: str) -> bool:
         """Check if we can open a new position for this pair."""
+        # Check if trading is enabled
+        trade_mode = getattr(self.config, 'trade_mode', True)
+        if trade_mode is not None and str(trade_mode).lower() in ('false', '0', 'no'):
+            return False
+        
         # Check max active pairs limit
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         if self.count_active_positions() >= max_pairs:
@@ -1396,7 +1491,9 @@ class PairsManager:
                         full_msg += f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
                         
                         print(full_msg.replace('<b>', '').replace('</b>', ''))
-                        await self._notify(full_msg)
+                        # Reply to original open message if available
+                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        await self._notify(full_msg, reply_to)
                         
                         # Update DB with close details
                         if pair_info.db_id:
@@ -1576,11 +1673,22 @@ class PairsManager:
                     
                     success_msg = (f"🚀 <b>Trade OPENED:</b> {s1}-{s2}\n"
                                    f"📅 {open_dt}\n\n"
-                                   f"📈 LONG: {long_qty} {long_sym} @ {long_price}\n"
-                                   f"📉 SHORT: {short_qty} {short_sym} @ {short_price}\n\n"
-                                   f"⚖️ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}")
+                                   f"📈 LONG: {long_qty} {long_sym} @ {long_price:.4f}\n"
+                                   f"     💰 ${long_qty * long_price:.2f}\n"
+                                   f"📉 SHORT: {short_qty} {short_sym} @ {short_price:.4f}\n"
+                                   f"     💰 ${short_qty * short_price:.2f}\n\n"
+                                   f"⚖️ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}\n"
+                                   f"📊 Beta: {pair_info.beta_btc:.3f}\n"
+                                   # Format half-life as readable hours/days
+                                   f"⏳ Half-life: {self._format_half_life(pair_info.half_life)}")
                     print(success_msg.replace('<b>', '').replace('</b>', ''))
-                    await self._notify(success_msg)
+                    # Save msg_id for reply threading on close
+                    msg_id = await self._notify(success_msg)
+                    if msg_id:
+                        pair_info.tg_message_id = msg_id
+                        # Update in DB
+                        if pair_info.db_id:
+                            await db.update_pair({'id': pair_info.db_id, 'tg_message_id': msg_id})
                 
                     # === HARDWARE SL/TP PLACEMENT ===
                     try:
@@ -1732,3 +1840,137 @@ class PairsManager:
                 pair_info.position_status = 0
         finally:
             pair_info.is_trading = False
+
+    # === REAL-TIME Z-SCORE MONITORING ===
+    
+    def _pairs_with_symbol(self, symbol: str) -> list:
+        """Returns all PairInfo objects containing the given symbol."""
+        result = []
+        for pair_set, pair_info in self.active_pairs.items():
+            if symbol in pair_set:
+                result.append(pair_info)
+        return result
+    
+    def _calc_realtime_zscore(self, pair_info: PairInfo, price1: float, price2: float) -> float:
+        """
+        Calculate Z-score using historical data + current real-time prices.
+        Uses the closed candles for mean/std, but current price for the last point.
+        """
+        try:
+            data1 = self.all_data.get(pair_info.symbol1)
+            data2 = self.all_data.get(pair_info.symbol2)
+            if not data1 or not data2:
+                return np.nan
+            if len(data1.close) < self.min_data_points or len(data2.close) < self.min_data_points:
+                return np.nan
+            
+            # Get historical log prices
+            log1 = np.log(list(data1.close)[-self.min_data_points:])
+            log2 = np.log(list(data2.close)[-self.min_data_points:])
+            
+            # Calculate spread on historical data
+            historical_spread = log1 - pair_info.hedge_ratio * log2
+            mean = np.mean(historical_spread)
+            std = np.std(historical_spread)
+            if std == 0 or np.isnan(std):
+                return np.nan
+            
+            # Current spread using real-time prices
+            current_log1 = np.log(price1)
+            current_log2 = np.log(price2)
+            current_spread = current_log1 - pair_info.hedge_ratio * current_log2
+            
+            # Z-score
+            z_score = (current_spread - mean) / std
+            return float(z_score)
+        except Exception:
+            return np.nan
+    
+    async def on_ticker_update(self, symbol: str, price: float):
+        """
+        Called when a price update is received from WebSocket ticker.
+        Updates last_prices and checks for entry signals with confirmation.
+        """
+        self.last_prices[symbol] = price
+        
+        # Check all pairs containing this symbol
+        for pair_info in self._pairs_with_symbol(symbol):
+            if pair_info.position_status != 0 or pair_info.is_trading:
+                continue  # Already in position or trading
+            
+            # Get both prices
+            price1 = self.last_prices.get(pair_info.symbol1)
+            price2 = self.last_prices.get(pair_info.symbol2)
+            if not price1 or not price2:
+                continue
+            
+            # Calculate real-time Z-score
+            z_score = self._calc_realtime_zscore(pair_info, price1, price2)
+            if np.isnan(z_score):
+                continue
+            
+            z_entry = getattr(self.config, 'z_entry', 2.0) or 2.0
+            z_entry_max = getattr(self.config, 'z_entry_max', 3.0) or 3.0
+            
+            # Check if signal (between z_entry and z_entry_max)
+            # Reject if already too extreme - spread may be broken
+            if abs(z_score) >= z_entry and abs(z_score) < z_entry_max:
+                if pair_info.pending_signal is None:
+                    # Start confirmation timer
+                    pair_info.pending_signal = z_score
+                    pair_info.pending_since = time.time()
+                    print(f"🔔 Signal detected for {pair_info.symbol1}-{pair_info.symbol2}: Z={z_score:.2f}. Confirming...")
+            else:
+                # Signal went away - reset
+                if pair_info.pending_signal is not None:
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+    
+    async def _signal_confirmation_loop(self):
+        """
+        Periodically checks for confirmed signals (held for N seconds).
+        """
+        confirm_sec = getattr(self.config, 'signal_confirm_sec', 10) or 10
+        
+        while True:
+            await asyncio.sleep(1)  # Check every second
+            
+            for pair_info in list(self.active_pairs.values()):
+                if pair_info.position_status != 0 or pair_info.is_trading:
+                    continue
+                
+                if pair_info.pending_signal is not None and pair_info.pending_since is not None:
+                    elapsed = time.time() - pair_info.pending_since
+                    
+                    if elapsed >= confirm_sec:
+                        # Re-check current Z-score
+                        price1 = self.last_prices.get(pair_info.symbol1)
+                        price2 = self.last_prices.get(pair_info.symbol2)
+                        
+                        if price1 and price2:
+                            current_z = self._calc_realtime_zscore(pair_info, price1, price2)
+                            z_entry = getattr(self.config, 'z_entry', 2.0) or 2.0
+                            z_entry_max = getattr(self.config, 'z_entry_max', 3.0) or 3.0
+                            
+                            # Check signal still valid and in same direction
+                            # Also reject if Z-score exceeds entry window (spread may be broken)
+                            if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
+                                # Check can open
+                                if self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
+                                    direction = 1 if current_z < 0 else -1
+                                    pair_info.entry_z_score = current_z
+                                    print(f"✅ Signal CONFIRMED for {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f}. Opening position...")
+                                    pair_info.is_trading = True
+                                    self.loop.create_task(self._execute_trade(pair_info, direction))
+                            elif abs(current_z) >= z_entry_max:
+                                print(f"⚠️ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
+                        
+                        # Reset pending after check
+                        pair_info.pending_signal = None
+                        pair_info.pending_since = None
+    
+    def start_realtime_monitoring(self):
+        """Start the signal confirmation loop."""
+        if self._signal_confirmation_task is None:
+            self._signal_confirmation_task = self.loop.create_task(self._signal_confirmation_loop())
+            print("🔄 Started real-time signal confirmation loop")
