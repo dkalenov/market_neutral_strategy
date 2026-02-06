@@ -439,6 +439,22 @@ class PairsManager:
             for pair_info in list(self.active_pairs.values()):
                 if pair_info.position_status == 0 or pair_info.is_trading:
                     continue
+                
+                # VALIDATION: Skip stale pairs where symbols don't exist
+                if pair_info.symbol1 not in self.all_symbols or pair_info.symbol2 not in self.all_symbols:
+                    print(f"⚠️ Skipping stale pair {pair_info.symbol1}-{pair_info.symbol2}: symbols not in trading list. Cleaning up...")
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'close_reason': 'stale_symbols'
+                        })
+                    continue
                     
                 leg1_open = pair_info.symbol1 in pos_by_symbol
                 leg2_open = pair_info.symbol2 in pos_by_symbol
@@ -1423,8 +1439,9 @@ class PairsManager:
                                 return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
                             return 0.0
 
-                        close_price1 = get_price(results[0])
-                        close_price2 = get_price(results[1])
+                        # Safely get prices (results may be smaller if some legs already closed)
+                        close_price1 = get_price(results[0]) if len(results) > 0 and not isinstance(results[0], Exception) else pair_info.entry_price1
+                        close_price2 = get_price(results[1]) if len(results) > 1 and not isinstance(results[1], Exception) else pair_info.entry_price2
                     
                         side1_dir = 1 if pair_info.position_status == 1 else -1
                         side2_dir = -1 if pair_info.position_status == 1 else 1
@@ -1670,6 +1687,24 @@ class PairsManager:
                     else:  # Short spread: SELL s1, BUY s2
                         short_sym, short_qty, short_price = s1, pair_info.qty1, pair_info.entry_price1
                         long_sym, long_qty, long_price = s2, pair_info.qty2, pair_info.entry_price2
+                    
+                    # Calculate beta if not already set (for newly discovered pairs)
+                    if pair_info.beta_btc == 0.0 and 'BTCUSDT' in self.all_data:
+                        try:
+                            data1 = self.all_data.get(s1)
+                            data2 = self.all_data.get(s2)
+                            btc_data = self.all_data['BTCUSDT']
+                            if data1 and data2 and len(btc_data.close) >= self.min_data_points:
+                                log1 = np.log(list(data1.close)[-self.min_data_points:])
+                                log2 = np.log(list(data2.close)[-self.min_data_points:])
+                                log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
+                                spread_returns = np.diff(log1) - pair_info.hedge_ratio * np.diff(log2)
+                                btc_returns = np.diff(log_btc)
+                                beta = utils.calculate_pair_beta(spread_returns, btc_returns)
+                                if not np.isnan(beta):
+                                    pair_info.beta_btc = beta
+                        except Exception as e:
+                            print(f"⚠️ Beta calculation error: {e}")
                     
                     success_msg = (f"🚀 <b>Trade OPENED:</b> {s1}-{s2}\n"
                                    f"📅 {open_dt}\n\n"

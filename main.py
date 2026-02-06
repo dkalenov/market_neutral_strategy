@@ -515,6 +515,22 @@ async def ws_user_msg(ws, msg):
                         s1, s2 = pair_info.symbol1, pair_info.symbol2
                         other_symbol = s2 if symbol == s1 else s1
                         
+                        # VALIDATION: Skip stale pairs where symbols don't exist anymore
+                        if s1 not in pairs_manager.all_symbols or s2 not in pairs_manager.all_symbols:
+                            print(f"⚠️ Skipping stale pair {s1}-{s2}: symbols not in trading list. Cleaning up...")
+                            pair_info.position_status = 0
+                            pair_info.qty1 = 0
+                            pair_info.qty2 = 0
+                            if pair_info.db_id:
+                                await db.update_pair({
+                                    'id': pair_info.db_id,
+                                    'position_status': 0,
+                                    'qty1': 0,
+                                    'qty2': 0,
+                                    'close_reason': 'stale_symbols'
+                                })
+                            continue
+                        
                         # Check if both legs were closed in this same update (bulk close)
                         other_closed_in_batch = any(
                             p.get('s') == other_symbol and float(p.get('pa', 0)) == 0 
@@ -524,8 +540,11 @@ async def ws_user_msg(ws, msg):
                         pnl = float(pos.get('up', 0))
                         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
                         
-                        # Mark as processed
+                        # Mark as processed in THIS batch only (prevents duplicate handling in same message)
                         processed_pairs.add(pair_set)
+                        
+                        # Set is_trading to prevent duplicate handling from pairs_trading leg sync
+                        pair_info.is_trading = True
                         
                         if other_closed_in_batch:
                             # Both legs closed together - fetch actual PnL and cleanup
@@ -558,8 +577,9 @@ async def ws_user_msg(ws, msg):
                                 total_pnl = pnl1 + pnl2
                                 total_fees = fee1 + fee2
                                 
-                                # Net PnL is realized PnL minus fees (fees are already negative in some cases)
-                                net_pnl = total_pnl - total_fees
+                                # realizedPnl from Binance ALREADY includes fee deduction
+                                # So net_pnl = total_pnl (fees shown for info only)
+                                net_pnl = total_pnl
                                 
                                 pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
                                 
@@ -567,15 +587,18 @@ async def ws_user_msg(ws, msg):
                                             f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
                                             f"   {s1}: {pnl1:+.2f} USDT\n"
                                             f"   {s2}: {pnl2:+.2f} USDT\n"
-                                            f"💸 Fees: -{total_fees:.4f} USDT")
+                                            f"💸 Fees (included): {total_fees:.4f} USDT")
                                 
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                                 await send_tg_notification(msg_text, reply_to)
                                 
+                                # Update memory state
                                 pair_info.position_status = 0
                                 pair_info.qty1 = 0
                                 pair_info.qty2 = 0
+                                pair_info.is_trading = False
                                 
+                                # Update DB with PnL details
                                 if pair_info.db_id:
                                     await db.update_pair({
                                         'id': pair_info.db_id,
@@ -636,15 +659,18 @@ async def ws_user_msg(ws, msg):
                                 total_pnl = pnl1 + pnl2
                                 total_fees = fee1 + fee2
                                 
-                                # Net PnL is realized PnL minus fees
-                                net_pnl = total_pnl - total_fees
+                                # realizedPnl from Binance ALREADY includes fee deduction
+                                net_pnl = total_pnl
                                 
                                 pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
                                 
+                                # Update memory state
                                 pair_info.position_status = 0
                                 pair_info.qty1 = 0
                                 pair_info.qty2 = 0
+                                pair_info.is_trading = False
                                 
+                                # Update DB with PnL details
                                 if pair_info.db_id:
                                     await db.update_pair({
                                         'id': pair_info.db_id,
@@ -665,7 +691,7 @@ async def ws_user_msg(ws, msg):
                                             f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
                                             f"   {s1}: {pnl1:+.2f} USDT\n"
                                             f"   {s2}: {pnl2:+.2f} USDT\n"
-                                            f"💸 Fees: -{total_fees:.4f} USDT")
+                                            f"💸 Fees (included): {total_fees:.4f} USDT")
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                                 await send_tg_notification(done_msg, reply_to)
                                 
