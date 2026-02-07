@@ -21,7 +21,7 @@ pairs_manager: pairs_trading.PairsManager
 tg_channel_global = ''
 tg_admins_global = ''
 
-async def send_tg_notification(message, reply_to_message_id=None):
+async def send_tg_notification(message, reply_to_message_id=None, reply_markup=None):
     """Send notification to TG channel or admins. Returns message_id for reply threading."""
     if not tg.bot:
         print("⚠️ TG: bot not initialized")
@@ -33,7 +33,8 @@ async def send_tg_notification(message, reply_to_message_id=None):
         try:
             sent = await tg.bot.send_message(
                 tg_channel_global, message, parse_mode='HTML',
-                reply_to_message_id=reply_to_message_id
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup
             )
             msg_id = sent.message_id
             print(f"📨 TG sent to channel, msg_id={msg_id}, reply_to={reply_to_message_id}")
@@ -45,7 +46,8 @@ async def send_tg_notification(message, reply_to_message_id=None):
             try:
                 sent = await tg.bot.send_message(
                     admin_id, message, parse_mode='HTML',
-                    reply_to_message_id=reply_to_message_id
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup
                 )
                 if msg_id is None:
                     msg_id = sent.message_id
@@ -222,6 +224,9 @@ async def main():
         notify_callback=send_tg_notification,
         config_info=conf
     )
+
+    # CRITICAL: Initialize TG bot FIRST so notifications work during reconciliation
+    await tg.init_bot()
 
     # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
     await pairs_manager.initialize()

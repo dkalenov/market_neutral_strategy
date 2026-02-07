@@ -127,47 +127,211 @@ class PairsManager:
         print("🔄 Started backup leg sync loop (every 30s, primary via WebSocket)")
 
     async def _load_state_from_db(self):
-        print("Restoring active positions from DB...")
-        try:
-            pairs = await db.get_all_pairs()
-            
-            # Only restore pairs with ACTIVE positions (status != 0)
-            active_count = 0
-            for p in pairs:
-                # Skip pairs without open positions - they'll be re-discovered
-                if p.position_status == 0:
-                    continue
-                    
-                pair_set = frozenset([p.symbol1, p.symbol2])
-                info = PairInfo(
-                    symbol1=p.symbol1,
-                    symbol2=p.symbol2,
-                    hedge_ratio=p.hedge_ratio,
-                    half_life=p.half_life,
-                    position_status=p.position_status,
-                    qty1=p.qty1,
-                    qty2=p.qty2,
-                    entry_price1=p.entry_price1,
-                    entry_price2=p.entry_price2,
-                    db_id=p.id,
-                    tg_message_id=getattr(p, 'tg_message_id', 0) or 0
-                )
-
-                last_trade = await db.get_last_open_trade_for_pair(p.id)
-                if last_trade:
-                    info.current_trade_id = last_trade.id
-                    print(f"  ✅ Restored: {p.symbol1}-{p.symbol2} | Trade ID: {last_trade.id}")
-                else:
-                    print(f"  ⚠️ Restored: {p.symbol1}-{p.symbol2} | No trade record")
-
-                self.active_pairs[pair_set] = info
-                active_count += 1
-            
-            print(f"Restored {active_count} active pairs from DB.")
-        except Exception as e:
-            print(f"Error loading state from DB: {e}")
+        """
+        CRITICAL: Exchange is source of truth.
+        1. Fetch actual positions from exchange FIRST
+        2. Load from DB only pairs that exist on exchange
+        3. Mark non-existent pairs as closed
+        """
+        print("🔄 Syncing state with exchange (source of truth)...")
         
-        # CRITICAL: Reconcile DB state with actual exchange positions
+        try:
+            # STEP 1: Get REAL positions from exchange FIRST
+            exchange_positions = await self.client.get_position_risk()
+            open_on_exchange = {}
+            for pos in exchange_positions:
+                symbol = pos.get('symbol', '')
+                qty = abs(float(pos.get('positionAmt', 0)))
+                if qty > 0:
+                    open_on_exchange[symbol] = {
+                        'qty': qty,
+                        'side': 'LONG' if float(pos.get('positionAmt', 0)) > 0 else 'SHORT',
+                        'entry_price': float(pos.get('entryPrice', 0)),
+                        'unrealized_pnl': float(pos.get('unRealizedProfit', 0))
+                    }
+            
+            print(f"  Exchange has {len(open_on_exchange)} open positions")
+            
+            # STEP 2: Load pairs from DB and validate against exchange
+            pairs = await db.get_all_pairs()
+            restored_count = 0
+            closed_count = 0
+            
+            for p in pairs:
+                pair_set = frozenset([p.symbol1, p.symbol2])
+                
+                if p.position_status != 0:
+                    # DB says position is open - verify against exchange
+                    s1_open = p.symbol1 in open_on_exchange
+                    s2_open = p.symbol2 in open_on_exchange
+                    
+                    if s1_open and s2_open:
+                        # VALID: Both legs exist on exchange - restore
+                        info = PairInfo(
+                            symbol1=p.symbol1,
+                            symbol2=p.symbol2,
+                            hedge_ratio=p.hedge_ratio,
+                            half_life=p.half_life,
+                            position_status=p.position_status,
+                            qty1=p.qty1,
+                            qty2=p.qty2,
+                            entry_price1=p.entry_price1,
+                            entry_price2=p.entry_price2,
+                            db_id=p.id,
+                            tg_message_id=getattr(p, 'tg_message_id', 0) or 0
+                        )
+                        
+                        last_trade = await db.get_last_open_trade_for_pair(p.id)
+                        if last_trade:
+                            info.current_trade_id = last_trade.id
+                        
+                        self.active_pairs[pair_set] = info
+                        restored_count += 1
+                        print(f"  ✅ Restored: {p.symbol1}-{p.symbol2}")
+                    
+                    elif s1_open != s2_open:
+                        # ORPHAN: One leg closed externally, need to close remaining leg
+                        remaining_sym = p.symbol1 if s1_open else p.symbol2
+                        closed_sym = p.symbol2 if s1_open else p.symbol1
+                        remaining_pos = open_on_exchange[remaining_sym]
+                        remaining_qty = remaining_pos['qty']
+                        remaining_side = remaining_pos['side']
+                        unrealized_pnl = remaining_pos['unrealized_pnl']
+                        
+                        tg_msg_id = getattr(p, 'tg_message_id', 0) or 0
+                        
+                        print(f"  🚨 ORPHAN: {p.symbol1}-{p.symbol2} | {closed_sym} closed externally")
+                        print(f"      Remaining: {remaining_sym} ({remaining_side}) PnL: {unrealized_pnl:.2f}")
+                        
+                        # Get PnL from the already closed leg
+                        import time as time_mod
+                        now_ms = int(time_mod.time() * 1000)
+                        start_ms = now_ms - 86400_000  # Last 24 hours
+                        closed_leg_trades = await self.client.get_account_trades(symbol=closed_sym, startTime=start_ms, limit=100)
+                        closed_leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in closed_leg_trades)
+                        
+                        # PnL-based decision
+                        should_close = True
+                        if unrealized_pnl < 0:
+                            # Losing position - notify and wait with cancel button
+                            pnl_emoji = "🔴"
+                            
+                            # Import for inline keyboard
+                            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                            import tg
+                            
+                            cancel_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="✅ Keep Position", callback_data=f"orphan_cancel:{remaining_sym}")]
+                            ])
+                            
+                            await self._notify(
+                                f"🚨 <b>ORPHAN PAIR DETECTED</b>\n\n"
+                                f"Pair: {p.symbol1}-{p.symbol2}\n"
+                                f"❌ Closed externally: {closed_sym}\n"
+                                f"   └─ PnL: {closed_leg_pnl:+.2f} USDT\n\n"
+                                f"⚠️ Remaining: {remaining_sym} ({remaining_side})\n"
+                                f"   └─ Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
+                                f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
+                                f"Click button below to KEEP position:",
+                                reply_to_msg_id=tg_msg_id,
+                                reply_markup=cancel_keyboard
+                            )
+                            import asyncio
+                            await asyncio.sleep(30)
+                            
+                            # Check if user cancelled via button
+                            if tg.check_orphan_cancelled(remaining_sym):
+                                print(f"      → Cancelled by user via button")
+                                should_close = False
+                                # Don't update DB - keep pair active
+                                continue
+                            
+                            # Re-check if position still exists
+                            check_positions = await self.client.get_position_risk()
+                            still_open = False
+                            for pos in check_positions:
+                                if pos.get('symbol') == remaining_sym and abs(float(pos.get('positionAmt', 0))) > 0:
+                                    still_open = True
+                                    remaining_qty = abs(float(pos.get('positionAmt', 0)))
+                                    remaining_side = 'LONG' if float(pos.get('positionAmt', 0)) > 0 else 'SHORT'
+                                    break
+                            
+                            if not still_open:
+                                print(f"      → Closed by user during wait")
+                                should_close = False
+                        else:
+                            pnl_emoji = "🟢"
+                            print(f"      → PnL >= 0, auto-closing...")
+                        
+                        if should_close:
+                            try:
+                                await self.client.cancel_open_orders(remaining_sym)
+                                close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
+                                await self.client.new_order(
+                                    symbol=remaining_sym,
+                                    side=close_side,
+                                    type='MARKET',
+                                    quantity=remaining_qty,
+                                    reduceOnly='true'
+                                )
+                                print(f"      ✅ Closed orphan {remaining_sym}")
+                                
+                                import asyncio
+                                await asyncio.sleep(1)
+                                
+                                # Fetch PnL for remaining leg
+                                now_ms = int(time_mod.time() * 1000)
+                                start_ms = now_ms - 300_000
+                                remaining_trades = await self.client.get_account_trades(symbol=remaining_sym, startTime=start_ms, limit=50)
+                                remaining_leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in remaining_trades)
+                                
+                                total_pnl = closed_leg_pnl + remaining_leg_pnl
+                                total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                                
+                                await self._notify(
+                                    f"⚡ <b>Orphan Pair Closed</b>\n\n"
+                                    f"Pair: {p.symbol1}-{p.symbol2}\n\n"
+                                    f"❌ {closed_sym}: {closed_leg_pnl:+.2f} USDT (closed externally)\n"
+                                    f"⚡ {remaining_sym}: {remaining_leg_pnl:+.2f} USDT (closed by bot)\n\n"
+                                    f"💰 <b>Total PnL: {total_emoji} {total_pnl:+.2f} USDT</b>",
+                                    reply_to_msg_id=tg_msg_id
+                                )
+                            except Exception as e:
+                                print(f"      ⚠️ Failed to close orphan: {e}")
+                                await self._notify(f"🚨 ORPHAN CLOSE FAILED: {remaining_sym}\nError: {e}")
+                        
+                        # Mark pair as closed in DB
+                        await db.update_pair({
+                            'id': p.id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0
+                        })
+                        closed_count += 1
+                    
+                    else:
+                        # Both legs closed on exchange - just mark as closed
+                        print(f"  ⚠️ Stale: {p.symbol1}-{p.symbol2} (both closed on exchange)")
+                        await db.update_pair({
+                            'id': p.id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0
+                        })
+                        closed_count += 1
+            
+            print(f"  Restored {restored_count} pairs, marked {closed_count} stale pairs as CLOSED")
+            
+        except Exception as e:
+            print(f"❌ Error loading state: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Continue with full reconciliation (orphan handling, unknown positions, etc.)
         await self._reconcile_with_exchange()
         
         # Add test pairs if test_mode is enabled
@@ -204,9 +368,19 @@ class PairsManager:
                 if sym not in orders_by_symbol: orders_by_symbol[sym] = []
                 orders_by_symbol[sym].append(o)
 
-            # Note: algo orders (STOP/TAKE_PROFIT) cannot be fetched on mainnet due to API limitation
+            # Fetch algo orders ONCE for all pairs (not inside loop!)
+            all_algo_orders = []
+            try:
+                algo_result = await self.client.get_algo_orders()
+                if isinstance(algo_result, dict) and 'orders' in algo_result:
+                    all_algo_orders = algo_result.get('orders', [])
+                elif isinstance(algo_result, list):
+                    all_algo_orders = algo_result
+                print(f"  Fetched {len(all_algo_orders)} algo orders")
+            except Exception as e:
+                print(f"  ⚠️ Could not fetch algo orders: {e}")
 
-            print(f"  Exchange has {len(open_on_exchange)} open positions and {len(all_open_orders)} regular orders.")
+            print(f"  Exchange has {len(open_on_exchange)} open positions, {len(all_open_orders)} regular orders, {len(all_algo_orders)} algo orders.")
             
             # Warn about positions on exchange that are NOT in our DB
             tracked_symbols = set()
@@ -218,7 +392,77 @@ class PairsManager:
             unknown_positions = [s for s in open_on_exchange.keys() if s not in tracked_symbols]
             if unknown_positions:
                 print(f"  🚨 UNKNOWN POSITIONS on exchange (not tracked by bot): {unknown_positions}")
-                await self._notify(f"🚨 WARNING: {len(unknown_positions)} unknown positions on exchange: {unknown_positions[:5]}... Close manually!")
+                
+                import asyncio
+                
+                for symbol in unknown_positions:
+                    pos_data = open_on_exchange[symbol]
+                    qty = pos_data['qty']
+                    side = pos_data['side']
+                    unrealized_pnl = pos_data['unrealized_pnl']
+                    
+                    print(f"      Unknown: {symbol} ({side} {qty}) PnL: {unrealized_pnl:.2f}")
+                    
+                    should_close = True
+                    if unrealized_pnl < 0:
+                        # Losing position - wait 30 seconds
+                        pnl_emoji = "🔴"
+                        await self._notify(
+                            f"🚨 <b>UNKNOWN POSITION DETECTED</b>\n\n"
+                            f"Symbol: {symbol} ({side})\n"
+                            f"Qty: {qty}\n"
+                            f"💵 Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
+                            f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
+                            f"Close manually in Binance if you want to keep it."
+                        )
+                        await asyncio.sleep(30)
+                        
+                        # Re-check if position still exists
+                        check_positions = await self.client.get_position_risk()
+                        still_open = False
+                        for p in check_positions:
+                            if p.get('symbol') == symbol and abs(float(p.get('positionAmt', 0))) > 0:
+                                still_open = True
+                                qty = abs(float(p.get('positionAmt', 0)))
+                                side = 'LONG' if float(p.get('positionAmt', 0)) > 0 else 'SHORT'
+                                break
+                        
+                        if not still_open:
+                            print(f"      → Unknown position {symbol} was closed by user")
+                            await self._notify(f"✅ Unknown position {symbol} was closed manually.")
+                            should_close = False
+                    else:
+                        pnl_emoji = "🟢"
+                        print(f"      → PnL >= 0, auto-closing {symbol}...")
+                    
+                    if should_close:
+                        try:
+                            await self.client.cancel_open_orders(symbol)
+                            
+                            close_side = 'SELL' if side == 'LONG' else 'BUY'
+                            await self.client.new_order(
+                                symbol=symbol,
+                                side=close_side,
+                                type='MARKET',
+                                quantity=qty,
+                                reduceOnly='true'
+                            )
+                            print(f"      ✅ Closed unknown position {symbol}")
+                            
+                            # Fetch PnL
+                            await asyncio.sleep(1)
+                            import time as time_mod
+                            now_ms = int(time_mod.time() * 1000)
+                            start_ms = now_ms - 300_000
+                            trades = await self.client.get_account_trades(symbol=symbol, startTime=start_ms, limit=50)
+                            pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
+                            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                            
+                            await self._notify(f"⚡ <b>Unknown Position Closed:</b> {symbol}\n"
+                                               f"💵 PnL: {pnl_emoji} <b>{pnl:.2f} USDT</b>")
+                        except Exception as e:
+                            print(f"      ⚠️ Failed to close {symbol}: {e}")
+                            await self._notify(f"🚨 FAILED to close: {symbol}\nError: {e}")
             
             # Check each pair in DB
             pairs_to_fix = []
@@ -235,19 +479,120 @@ class PairsManager:
                         pairs_to_fix.append((pair_info, 'close_db'))
                     elif s1_open != s2_open:
                         # One leg open, one closed - orphaned position!
-                        # Mark as closed in DB to prevent sync loop from trying to close
-                        print(f"  🚨 ORPHAN: {s1}-{s2} has mismatched legs! {s1}:{s1_open}, {s2}:{s2_open}")
-                        print(f"      → Marking as CLOSED in DB. Close remaining leg manually!")
-                        pairs_to_fix.append((pair_info, 'close_db'))
                         remaining_sym = s1 if s1_open else s2
-                        await self._notify(f"🚨 ORPHAN POSITION: {s1}-{s2}\n{remaining_sym} is still open on exchange!\nClose manually or it will remain open.")
+                        remaining_pos = open_on_exchange[remaining_sym]
+                        remaining_qty = remaining_pos['qty']
+                        remaining_side = remaining_pos['side']
+                        unrealized_pnl = remaining_pos['unrealized_pnl']
+                        
+                        print(f"  🚨 ORPHAN: {s1}-{s2} has mismatched legs! {s1}:{s1_open}, {s2}:{s2_open}")
+                        print(f"      Remaining: {remaining_sym} ({remaining_side} {remaining_qty}) PnL: {unrealized_pnl:.2f}")
+                        
+                        # Decision based on PnL
+                        should_close = True
+                        if unrealized_pnl < 0:
+                            # Losing position - wait 30 seconds, notify user
+                            print(f"      → PnL negative, waiting 30 seconds for user decision...")
+                            pnl_emoji = "🔴"
+                            await self._notify(
+                                f"🚨 <b>ORPHAN POSITION DETECTED</b>\n\n"
+                                f"Pair: {s1}-{s2}\n"
+                                f"Remaining: {remaining_sym} ({remaining_side})\n"
+                                f"💵 Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
+                                f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
+                                f"Close the position manually in Binance if you want to keep it."
+                            )
+                            import asyncio
+                            await asyncio.sleep(30)
+                            
+                            # Re-check if position still exists
+                            check_positions = await self.client.get_position_risk()
+                            still_open = False
+                            for p in check_positions:
+                                if p.get('symbol') == remaining_sym and abs(float(p.get('positionAmt', 0))) > 0:
+                                    still_open = True
+                                    unrealized_pnl = float(p.get('unRealizedProfit', 0))
+                                    break
+                            
+                            if not still_open:
+                                print(f"      → Position was closed by user during wait")
+                                pairs_to_fix.append((pair_info, 'close_db'))
+                                await self._notify(f"✅ Orphan {remaining_sym} was closed manually.")
+                                should_close = False
+                        else:
+                            # Profitable or breakeven - auto close immediately
+                            pnl_emoji = "🟢"
+                            print(f"      → PnL >= 0, auto-closing immediately...")
+                        
+                        if should_close:
+                            try:
+                                # Cancel any remaining orders for this symbol
+                                await self.client.cancel_open_orders(remaining_sym)
+                                
+                                # Close remaining leg with market order
+                                close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
+                                await self.client.new_order(
+                                    symbol=remaining_sym,
+                                    side=close_side,
+                                    type='MARKET',
+                                    quantity=remaining_qty,
+                                    reduceOnly='true'
+                                )
+                                print(f"      ✅ Closed orphan leg {remaining_sym}")
+                                
+                                # Wait for trade data
+                                import asyncio
+                                await asyncio.sleep(1)
+                                
+                                # Fetch PnL from recent trades
+                                import time as time_mod
+                                now_ms = int(time_mod.time() * 1000)
+                                start_ms = now_ms - 300_000  # Last 5 minutes
+                                trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                                trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                                
+                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                                total_pnl = pnl1 + pnl2
+                                pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                                
+                                # Update DB with PnL
+                                pairs_to_fix.append((pair_info, 'close_db_with_pnl', total_pnl, pnl1, pnl2))
+                                
+                                # Notify with details
+                                await self._notify(f"⚡ <b>Orphan Closed (Restart):</b> {s1}-{s2}\n\n"
+                                                   f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>\n"
+                                                   f"   {s1}: {pnl1:+.2f} USDT\n"
+                                                   f"   {s2}: {pnl2:+.2f} USDT")
+                            except Exception as e:
+                                print(f"      ⚠️ Failed to close orphan: {e}")
+                                pairs_to_fix.append((pair_info, 'close_db'))
+                                await self._notify(f"🚨 ORPHAN FAILED: {s1}-{s2}\n{remaining_sym} still open!\nError: {e}")
                     else:
-                        # Both open - check for SL orders (STOP type in algo orders)
-                        has_sl1 = any(o.get('type') == 'STOP' for o in orders_by_symbol.get(s1, []))
-                        has_sl2 = any(o.get('type') == 'STOP' for o in orders_by_symbol.get(s2, []))
-                        if not has_sl1 or not has_sl2:
-                            print(f"  ⚠️ WARNING: {s1}-{s2} is open but lacks SL orders! (s1:{has_sl1}, s2:{has_sl2})")
-                            await self._notify(f"⚠️ PROTECT: {s1}-{s2} is open but lacks hardware SL protection on exchange!")
+                        # Both open - check algo orders for SL/TP protection
+                        # Use pre-fetched all_algo_orders (not API call per pair!)
+                        s1_orders = [o for o in all_algo_orders if o.get('symbol') == s1]
+                        s2_orders = [o for o in all_algo_orders if o.get('symbol') == s2]
+                        
+                        has_sl1 = any(o.get('orderType') == 'STOP' for o in s1_orders)
+                        has_sl2 = any(o.get('orderType') == 'STOP' for o in s2_orders)
+                        has_tp1 = any(o.get('orderType') == 'TAKE_PROFIT' for o in s1_orders)
+                        has_tp2 = any(o.get('orderType') == 'TAKE_PROFIT' for o in s2_orders)
+                        
+                        missing = []
+                        if not has_sl1: missing.append(f"{s1} SL")
+                        if not has_sl2: missing.append(f"{s2} SL")
+                        if not has_tp1: missing.append(f"{s1} TP")
+                        if not has_tp2: missing.append(f"{s2} TP")
+                        
+                        if missing:
+                            print(f"  ⚠️ MISSING PROTECTION for {s1}-{s2}: {', '.join(missing)}")
+                            await self._notify(f"⚠️ <b>MISSING PROTECTION:</b> {s1}-{s2}\n"
+                                               f"Missing: {', '.join(missing)}\n\n"
+                                               f"Bot will attempt to restore SL/TP...")
+                            
+                            # TODO: Implement SL/TP restoration
+                            # For now, just notify - restoration requires recalculating ATR
                 else:
                     # DB says position is CLOSED
                     if s1_open or s2_open:
@@ -313,9 +658,52 @@ class PairsManager:
                             })
                         
                         print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as OPEN in DB (synced from exchange)")
+                
+                elif action == 'close_db_with_pnl' and len(fix) >= 5:
+                    # Mark as closed in DB with PnL info
+                    total_pnl = fix[2]
+                    pnl1 = fix[3]
+                    pnl2 = fix[4]
+                    
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+                    pair_info.is_trading = False
+                    
+                    if pair_info.db_id:
+                        import time as time_mod
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0,
+                            'close_time': int(time_mod.time()),
+                            'close_pnl': total_pnl,
+                            'close_reason': 'orphan_restart',
+                            'pnl1': pnl1,
+                            'pnl2': pnl2
+                        })
+                    
+                    # Close trade record
+                    if pair_info.current_trade_id:
+                        await db.update_trade_fields(
+                            pair_info.current_trade_id,
+                            status='CLOSED_ORPHAN',
+                            close_time=int(time.time() * 1000)
+                        )
+                        pair_info.current_trade_id = None
+                    
+                    print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan closed with PnL={total_pnl:.2f}")
             
             active_count = self.count_active_positions()
             print(f"🔄 Reconciliation complete. Active pairs in DB: {active_count}")
+            
+            # Cleanup orphaned algo orders immediately
+            await self._cleanup_orphaned_algo_orders()
             
         except Exception as e:
             print(f"❌ Error during reconciliation: {e}")
@@ -610,7 +998,7 @@ class PairsManager:
         Prioritizes active pairs and priority pairs.
         """
         symbols_to_load = target_symbols if target_symbols else list(self.all_symbols.keys())
-        print(f"Initializing history for {len(symbols_to_load)} symbols (Concurrency: {concurrency})...")
+        #print(f"Initializing history for {len(symbols_to_load)} symbols (Concurrency: {concurrency})...")
         start_time = time.time()
         
         # 1. Identify priority symbols
@@ -831,13 +1219,13 @@ class PairsManager:
         """
         Loads historical data to initialize deques.
         """
-        print(f"Initializing history for {symbol}...")
+        #print(f"Initializing history for {symbol}...")
         try:
             klines = await self.client.klines(symbol, self.timeframe, limit=self.max_len)
             data = self.all_data[symbol]
             for k in klines:
                 data.add_kline(k[0], k[1], k[2], k[3], k[4])
-            print(f"History for {symbol} initialized with {len(data.ts)} candles.")
+            #print(f"History for {symbol} initialized with {len(data.ts)} candles.")
         except Exception as e:
             print(f"Error initializing history for {symbol}: {e}")
             if symbol in self.all_data:
@@ -1250,11 +1638,11 @@ class PairsManager:
         elapsed = time.time() - start_time
         print(f"Discovery process finished in {elapsed:.2f}s. Found {new_pairs_count} new pairs.")
 
-    async def _notify(self, message, reply_to_msg_id=None):
+    async def _notify(self, message, reply_to_msg_id=None, reply_markup=None):
         """Sends a notification via the configured callback. Returns msg_id for reply threading."""
         if self.notify_callback:
             try:
-                return await self.notify_callback(message, reply_to_msg_id)
+                return await self.notify_callback(message, reply_to_msg_id, reply_markup)
             except Exception as e:
                 print(f"Error in _notify: {e}")
         return None
@@ -2029,7 +2417,7 @@ class PairsManager:
                     # Start confirmation timer
                     pair_info.pending_signal = z_score
                     pair_info.pending_since = time.time()
-                    print(f"🔔 Signal detected for {pair_info.symbol1}-{pair_info.symbol2}: Z={z_score:.2f}. Confirming...")
+                    # Fprint(f"🔔 Signal detected for {pair_info.symbol1}-{pair_info.symbol2}: Z={z_score:.2f}. Confirming...")
             else:
                 # Signal went away - reset
                 if pair_info.pending_signal is not None:
@@ -2083,4 +2471,4 @@ class PairsManager:
         """Start the signal confirmation loop."""
         if self._signal_confirmation_task is None:
             self._signal_confirmation_task = self.loop.create_task(self._signal_confirmation_loop())
-            print("🔄 Started real-time signal confirmation loop")
+            print("🔄 Started real-time signal confirmation loop") 

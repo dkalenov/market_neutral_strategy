@@ -41,7 +41,61 @@ config.read('market_neutral/config.ini')
 # Parse admin list
 tg_admins = []
 
+# Track orphan close cancellation requests (symbol -> True if cancelled)
+orphan_cancel_flags = {}
+
+def request_orphan_cancel(symbol: str):
+    """Mark orphan close as cancelled for this symbol."""
+    orphan_cancel_flags[symbol] = True
+
+def check_orphan_cancelled(symbol: str) -> bool:
+    """Check if orphan close was cancelled for this symbol and clear flag."""
+    cancelled = orphan_cancel_flags.pop(symbol, False)
+    return cancelled
+
+# Callback handler for orphan cancel buttons
+@dp.callback_query(F.data.startswith("orphan_cancel:"))
+async def orphan_cancel_callback(callback: types.CallbackQuery):
+    """Handle cancel button press for orphan auto-close."""
+    symbol = callback.data.split(":")[1]
+    request_orphan_cancel(symbol)
+    await callback.answer(f"✅ Keep Position: {symbol}", show_alert=True)
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ <b>CANCELLED by user</b>",
+        parse_mode="HTML"
+    )
+
 # Function to run the bot
+async def init_bot():
+    """Initialize TG bot (call this BEFORE pairs_manager.initialize for notifications to work)."""
+    global bot
+    global tg_admins
+    
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    load_dotenv(env_path)
+    
+    tg_token = os.getenv('TG_TOKEN')
+    tg_admins_str = os.getenv('TG_ADMINS', '')
+    
+    if not tg_token:
+        print("ERROR: TG_TOKEN not set in .env file!")
+        return False
+    
+    # Parse admins
+    tg_admins = [int(admin_id) for admin_id in tg_admins_str.split(',') if admin_id.strip()]
+    
+    # Initialize bot
+    try:
+        bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'))
+        print(f"TG: Bot initialized. Token: {tg_token[:10]}...")
+        print(f"TG: Authorized admins: {tg_admins}")
+        return True
+    except Exception as e:
+        print(f"TG: Bot initialization failed: {e}")
+        return False
+
+
 async def run(_session, _client: binance.Futures, _pairs_manager):
     # Pass parameters from main
     global bot
@@ -55,32 +109,13 @@ async def run(_session, _client: binance.Futures, _pairs_manager):
     client = _client
     pairs_manager = _pairs_manager
 
-    # Load from environment variables
-    from dotenv import load_dotenv
-    env_path = os.path.join(os.path.dirname(__file__), '.env')
-    load_dotenv(env_path)
-    
-    tg_token = os.getenv('TG_TOKEN')
-    tg_admins_str = os.getenv('TG_ADMINS', '')
-    
-    if not tg_token:
-        print("ERROR: TG_TOKEN not set in .env file!")
-        return
-    
-    # Parse admins
-    tg_admins = [int(admin_id) for admin_id in tg_admins_str.split(',') if admin_id.strip()]
-    
-    # Initialize bot
-    try:
-        bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'))
-    except Exception as e:
-        print(f"TG: Bot initialization failed: {e}")
-        raise
+    # Initialize bot if not already done
+    if not bot:
+        success = await init_bot()
+        if not success:
+            return
 
     # Delete webhook
-    print(f"TG: Token used: {tg_token[:10]}...")
-    print(f"TG: Authorized admins: {tg_admins}")
-    print("TG: Deleting webhook...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
