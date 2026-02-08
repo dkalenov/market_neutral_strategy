@@ -117,6 +117,9 @@ class ConfigInfo:
     beta_alert_threshold: float  # Alert if |beta| > this for open positions (default 0.15)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
     trade_mode: bool        # If True, allow opening new positions (default True)
+    # Idle Pair Management
+    max_idle_pairs: int     # Maximum idle pairs without positions (default 150)
+    idle_timeout_hours: float  # Remove idle pairs older than X hours (default 48)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -225,11 +228,13 @@ async def load_config():
             # Half-Life Limits (in days) - optimized for 1h/4h TFs
             'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
             'hl_max_days': '2.0',    # Max 2 days (1h=48 candles, 4h=12 candles)
-            # Market Neutrality
             'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
             'beta_alert_threshold': '0.15',  # Alert if |beta| > this for open positions
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
-            'trade_mode': 'true'             # Allow opening new positions
+            'trade_mode': 'true',            # Allow opening new positions
+            # Idle Pair Management
+            'max_idle_pairs': '150',         # Maximum idle pairs without positions
+            'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

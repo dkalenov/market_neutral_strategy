@@ -67,6 +67,8 @@ class PairInfo:
     # Signal confirmation (for real-time mode)
     pending_signal: float = None  # Pending Z-score signal awaiting confirmation
     pending_since: float = None   # Time when signal started
+    # Idle pair management
+    discovered_at: float = 0.0    # Unix timestamp when pair was discovered
 
 class PairsManager:
     """
@@ -756,23 +758,28 @@ class PairsManager:
         except Exception as e:
             print(f"⚠️ Error cleaning up orphaned orders: {e}")
 
-    async def handle_sl_tp_triggered(self, symbol: str):
+    async def handle_sl_tp_triggered(self, symbol: str, order_type: str = 'STOP'):
         """
         Called when a hardware SL/TP order is filled (via WebSocket).
         Finds the pair containing this symbol and closes the other leg.
+        order_type: 'STOP', 'STOP_MARKET' for SL; 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET' for TP
         """
+        is_tp = 'TAKE_PROFIT' in order_type.upper() if order_type else False
+        close_reason = 'hardware_tp' if is_tp else 'hardware_sl'
+        
         for pair_info in list(self.active_pairs.values()):
             if pair_info.position_status == 0:
                 continue
             if symbol in (pair_info.symbol1, pair_info.symbol2):
                 other_symbol = pair_info.symbol2 if symbol == pair_info.symbol1 else pair_info.symbol1
-                msg = f"🚨 SL/TP triggered on {symbol}! Closing other leg {other_symbol}"
+                tp_or_sl = 'TP' if is_tp else 'SL'
+                msg = f"🎯 Hardware {tp_or_sl} triggered on {symbol}! Closing {other_symbol}"
                 print(msg)
-                await self._notify(msg)
+                # Don't notify here - _execute_trade will send full close notification with PnL
                 
                 # Force close the pair (cancels algo orders + closes other leg if needed)
                 pair_info.is_trading = True
-                await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
+                await self._execute_trade(pair_info, 0, close_reason=close_reason)
                 break
 
     async def _periodic_leg_sync_loop(self):
@@ -783,8 +790,89 @@ class PairsManager:
             try:
                 await self._check_leg_synchronization()
                 await self._cleanup_orphaned_algo_orders()
+                await self._cleanup_idle_pairs()  # Remove old idle pairs
             except Exception as e:
                 print(f"⚠️ Leg sync/cleanup error: {e}")
+
+    async def _cleanup_idle_pairs(self):
+        """
+        Remove old/excess idle pairs to prevent accumulation.
+        Idle pairs = position_status == 0 and not is_trading.
+        Configurable via TG: max_idle_pairs, idle_timeout_hours.
+        """
+        max_idle = getattr(self.config, 'max_idle_pairs', 150) or 150
+        timeout_hours = getattr(self.config, 'idle_timeout_hours', 48) or 48
+        timeout_sec = timeout_hours * 3600
+        now = time.time()
+        
+        # Collect idle pairs (no open position, not currently trading)
+        idle_pairs = []
+        for pair_set, pair_info in list(self.active_pairs.items()):
+            if pair_info.position_status == 0 and not pair_info.is_trading:
+                idle_pairs.append((pair_set, pair_info))
+        
+        removed_count = 0
+        
+        # 1. Remove timed-out pairs first
+        for pair_set, pair_info in idle_pairs:
+            if pair_info.discovered_at > 0 and (now - pair_info.discovered_at) > timeout_sec:
+                await self._remove_idle_pair(pair_set, 'timeout')
+                removed_count += 1
+        
+        # 2. Recalculate idle count after timeout cleanup
+        idle_pairs = [(ps, pi) for ps, pi in list(self.active_pairs.items())
+                      if pi.position_status == 0 and not pi.is_trading]
+        
+        # 3. Remove excess pairs (oldest first) if still over limit
+        if len(idle_pairs) > max_idle:
+            # Sort by discovered_at (oldest first)
+            idle_pairs.sort(key=lambda x: x[1].discovered_at if x[1].discovered_at > 0 else float('inf'))
+            excess = len(idle_pairs) - max_idle
+            for pair_set, pair_info in idle_pairs[:excess]:
+                await self._remove_idle_pair(pair_set, 'limit')
+                removed_count += 1
+        
+        if removed_count > 0:
+            print(f"🗑️ Cleaned up {removed_count} idle pairs (limit: {max_idle}, timeout: {timeout_hours}h)")
+    
+    async def _remove_idle_pair(self, pair_set: frozenset, reason: str):
+        """
+        Remove an idle pair from active_pairs and DB.
+        Does NOT close any positions (pair must be idle).
+        """
+        pair_info = self.active_pairs.get(pair_set)
+        if not pair_info:
+            return
+        
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        
+        # Safety check: never remove pairs with open positions
+        if pair_info.position_status != 0 or pair_info.is_trading:
+            print(f"⚠️ Cannot remove {s1}-{s2}: has open position or is trading")
+            return
+        
+        # Remove from active_pairs
+        del self.active_pairs[pair_set]
+        
+        # Remove markPrice subscription if symbols not used by other pairs
+        self._cleanup_unused_subscription(s1)
+        self._cleanup_unused_subscription(s2)
+        
+        # Delete from DB
+        if pair_info.db_id:
+            await db.delete_pair(pair_info.db_id)
+        
+        print(f"  🗑️ Removed idle pair {s1}-{s2} (reason: {reason})")
+    
+    def _cleanup_unused_subscription(self, symbol: str):
+        """Remove symbol from subscribed set if no other pairs use it."""
+        # Check if any other pair uses this symbol
+        for pair_info in self.active_pairs.values():
+            if symbol in (pair_info.symbol1, pair_info.symbol2):
+                return  # Still in use
+        
+        # Not used anymore - remove from tracked subscriptions
+        self._subscribed_mark_symbols.discard(symbol)
 
     async def _check_leg_synchronization(self):
         """Check that both legs of each active pair are open."""
@@ -1292,9 +1380,8 @@ class PairsManager:
                     print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                     
                     if pair_info.position_status != 0:
-                        warn_msg = f"🚨 <b>Broken Correlation</b> on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!"
-                        print(warn_msg)
-                        self.loop.create_task(self._notify(warn_msg))
+                        print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
+                        # Don't send notification here - _execute_trade will send full close message with PnL
                         pair_info.is_trading = True
                         
                         # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
@@ -1607,8 +1694,12 @@ class PairsManager:
                         except Exception as e:
                             print(f"⚠️ Beta calc error for {s1}-{s2}: {e}")
                     
-                    # Reject pair if beta is too high
-                    if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
+                    # Reject pair if beta is too high (skip in test_mode)
+                    test_mode = getattr(self.config, 'test_mode', False)
+                    if isinstance(test_mode, str):
+                        test_mode = test_mode.lower() in ('true', '1', 'yes')
+                    
+                    if not test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
                         print(f"⚠️ {s1}-{s2} REJECTED at discovery: |beta|={abs(beta_btc):.3f} >= {beta_threshold}")
                         # Remove from DB since we just added it
                         try:
@@ -1616,6 +1707,8 @@ class PairsManager:
                         except:
                             pass
                         continue  # Skip this pair
+                    elif test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
+                        print(f"🧪 TEST MODE: {s1}-{s2} |beta|={abs(beta_btc):.3f} >= {beta_threshold} - ALLOWED for testing")
                     
                     print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}")
                     
@@ -1632,15 +1725,47 @@ class PairsManager:
                         db_id=new_pair.id
                     )
                     pair_info.beta_btc = beta_btc
+                    pair_info.discovered_at = time.time()  # Track when pair was discovered
                     self.active_pairs[pair_set] = pair_info
                     new_pairs_count += 1
                     
                     # Subscribe to real-time markPrice for this new pair
                     await self._subscribe_new_pair_realtime(s1, s2)
                     
-                    # IMMEDIATE ENTRY CHECK: Don't wait for 5m candle!
-                    # Check signals right now using the data we just downloaded
-                    if self.can_open_new_position(s1, s2):
+                    # TEST MODE: Auto-open trade immediately (skip z_entry check)
+                    test_mode = getattr(self.config, 'test_mode', False)
+                    if isinstance(test_mode, str):
+                        test_mode = test_mode.lower() in ('true', '1', 'yes')
+                    
+                    if test_mode and self.can_open_new_position(s1, s2):
+                        # Calculate current Z-score to determine direction
+                        z_stop = getattr(self.config, 'z_stop', 4.0) or 4.0
+                        z_exit = getattr(self.config, 'z_exit', 0.0) or 0.0
+                        
+                        # Calculate Z-score from available data
+                        try:
+                            if s1 in self.all_data and s2 in self.all_data:
+                                data1 = self.all_data[s1]
+                                data2 = self.all_data[s2]
+                                if len(data1.close) >= 50 and len(data2.close) >= 50:
+                                    log_p1 = np.log(list(data1.close)[-50:])
+                                    log_p2 = np.log(list(data2.close)[-50:])
+                                    spread = log_p1 - pair_info.hedge_ratio * log_p2
+                                    z_score = utils.calculate_z_last(spread)
+                                    
+                                    # Don't open if z_score is already at stop/exit levels
+                                    if z_score is not None and abs(z_score) < z_stop and abs(z_score) > z_exit:
+                                        direction = 1 if z_score < 0 else -1
+                                        print(f"🧪 TEST MODE AUTO-OPEN: {s1}-{s2} Z={z_score:.2f} -> {'LONG' if direction == 1 else 'SHORT'}")
+                                        pair_info.entry_z_score = z_score
+                                        pair_info.is_trading = True
+                                        self.loop.create_task(self._execute_trade(pair_info, direction))
+                                    else:
+                                        print(f"🧪 TEST: {s1}-{s2} Z={z_score:.2f} at stop/exit level, skipping auto-open")
+                        except Exception as e:
+                            print(f"🧪 TEST: Could not auto-open {s1}-{s2}: {e}")
+                    elif self.can_open_new_position(s1, s2):
+                        # IMMEDIATE ENTRY CHECK: Don't wait for 5m candle!
                         print(f"⚡ Checking immediate entry for found pair {s1}-{s2}...")
                         self.loop.create_task(self._check_signals_for_active_pairs(s1))
                         
@@ -1904,6 +2029,10 @@ class PairsManager:
                             'hardware_tp': '🛡️ Hardware Take Profit',
                             'manual': '👤 Manual Close',
                             'desync': '⚠️ Leg Desync',
+                            'beta_drift': '📉 Beta Drift',
+                            'external': '⚡ External Close',
+                            'orphan_restart': '🔄 Orphan on Restart',
+                            'stale_symbols': '⏳ Stale Symbols',
                         }
                         reason_text = CLOSE_REASONS.get(close_reason, '❓ Unknown') if close_reason else '❓ Unknown'
                     

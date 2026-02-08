@@ -608,13 +608,49 @@ async def ws_user_msg(ws, msg):
                                 # So net_pnl = total_pnl (fees shown for info only)
                                 net_pnl = total_pnl
                                 
-                                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                                # Determine close reason from trade data
+                                close_type = '❓ Unknown'
+                                close_hint = '\n💡 Check exchange for details'
                                 
-                                msg_text = (f"⚡ <b>Pair Closed Externally:</b> {s1}-{s2}\n\n"
-                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
-                                            f"   {s1}: {pnl1:+.2f} USDT\n"
-                                            f"   {s2}: {pnl2:+.2f} USDT\n"
-                                            f"💸 Fees (included): {total_fees:.4f} USDT")
+                                # Query recent FILLED orders to get exact order type
+                                try:
+                                    orders1 = await client.get_all_orders(symbol=s1, limit=10)
+                                    orders2 = await client.get_all_orders(symbol=s2, limit=10)
+                                    
+                                    # Filter to recent filled orders (last 5 min)
+                                    now_ms = int(time_mod.time() * 1000)
+                                    recent_filled = []
+                                    for o in orders1 + orders2:
+                                        if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                            recent_filled.append(o)
+                                    
+                                    # Check order types
+                                    for o in recent_filled:
+                                        o_type = o.get('type', '') or o.get('origType', '')
+                                        if 'STOP' in o_type:
+                                            close_type = '🛡️ Hardware SL'
+                                            close_hint = ''
+                                            break
+                                        elif 'TAKE_PROFIT' in o_type:
+                                            close_type = '🛡️ Hardware TP'
+                                            close_hint = ''
+                                            break
+                                        elif o_type == 'MARKET':
+                                            close_type = '👤 Manual/Bot Close'
+                                            close_hint = ''
+                                            break
+                                        elif o_type == 'LIMIT':
+                                            close_type = '📊 Limit Order'
+                                            close_hint = ''
+                                            break
+                                except Exception as e:
+                                    print(f"⚠️ Could not query orders: {e}")
+                                
+                                pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                                msg_text = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
+                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                            f"   {s1}: {pnl1:+.2f} | {s2}: {pnl2:+.2f}\n"
+                                            f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                                 
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                                 await send_tg_notification(msg_text, reply_to)
@@ -713,12 +749,38 @@ async def ws_user_msg(ws, msg):
                                         'fee2': fee2
                                     })
                                 
-                                # Single consolidated notification
-                                done_msg = (f"⚡ <b>Pair Closed Externally:</b> {s1}-{s2}\n\n"
-                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
-                                            f"   {s1}: {pnl1:+.2f} USDT\n"
-                                            f"   {s2}: {pnl2:+.2f} USDT\n"
-                                            f"💸 Fees (included): {total_fees:.4f} USDT")
+                                # Determine close reason from recent orders
+                                close_type = '❓ Unknown'
+                                close_hint = '\n💡 Check exchange for details'
+                                
+                                try:
+                                    orders1 = await client.get_all_orders(symbol=s1, limit=10)
+                                    orders2 = await client.get_all_orders(symbol=s2, limit=10)
+                                    
+                                    now_ms = int(time_mod.time() * 1000)
+                                    for o in orders1 + orders2:
+                                        if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                            o_type = o.get('type', '') or o.get('origType', '')
+                                            if 'STOP' in o_type:
+                                                close_type = '🛡️ Hardware SL'
+                                                close_hint = ''
+                                                break
+                                            elif 'TAKE_PROFIT' in o_type:
+                                                close_type = '🛡️ Hardware TP'
+                                                close_hint = ''
+                                                break
+                                            elif o_type == 'MARKET':
+                                                close_type = '👤 Manual/Bot Close'
+                                                close_hint = ''
+                                                break
+                                except Exception as e:
+                                    print(f"⚠️ Could not query orders: {e}")
+                                
+                                pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                                done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
+                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                            f"   {s1}: {pnl1:+.2f} | {s2}: {pnl2:+.2f}\n"
+                                            f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                                 await send_tg_notification(done_msg, reply_to)
                                 
@@ -744,7 +806,7 @@ async def ws_user_msg(ws, msg):
             # Notify pairs_manager to close the other leg
             if pairs_manager:
                 try:
-                    await pairs_manager.handle_sl_tp_triggered(symbol)
+                    await pairs_manager.handle_sl_tp_triggered(symbol, order_type)
                 except Exception as e:
                     print(f"⚠️ Error handling SL/TP trigger: {e}")
         

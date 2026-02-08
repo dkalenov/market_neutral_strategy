@@ -345,6 +345,8 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     max_pairs = getattr(conf, 'max_active_pairs', 5) or 5
     max_symbols = getattr(conf, 'max_symbols', 150) or 150
+    max_idle = getattr(conf, 'max_idle_pairs', 150) or 150
+    idle_timeout = getattr(conf, 'idle_timeout_hours', 48) or 48
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Capital (USDT)", callback_data="set_capital")],
@@ -357,13 +359,18 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🛡️ Hardware SL/TP", callback_data="hardware_sltp")],
         [InlineKeyboardButton(text=f"📊 Max Pairs: {max_pairs}", callback_data="set_max_pairs")],
         [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
+        [InlineKeyboardButton(text=f"🗑️ Max Idle: {max_idle}", callback_data="set_max_idle"),
+         InlineKeyboardButton(text=f"⏰ Timeout: {idle_timeout}h", callback_data="set_idle_timeout")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Risk Management Settings:\n\n"
                            "<b>Capital</b>: Your purchasing power.\n"
                            "<b>Hardware SL/TP</b>: ATR-based stop orders.\n"
                            f"<b>Max Pairs</b>: {max_pairs} concurrent trades.\n"
-                           f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.", reply_markup=keyboard)
+                           f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.\n\n"
+                           f"<b>Idle Pair Cleanup:</b>\n"
+                           f"  • Max idle pairs: {max_idle}\n"
+                           f"  • Timeout: {idle_timeout}h", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_capital")
 async def set_capital_cb(callback: CallbackQuery, state: FSMContext):
@@ -418,6 +425,18 @@ async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_symbols")
     await answer(callback, "Enter maximum number of symbols by volume (50-300, e.g., 150):\n\n⚠️ Requires restart to take effect.")
+
+@dp.callback_query(F.data == "set_max_idle")
+async def set_max_idle_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="max_idle_pairs")
+    await answer(callback, "🗑️ <b>Max Idle Pairs</b>\n\nIdle pairs = co-integrated but no open position.\n\nEnter max number (e.g., 150):")
+
+@dp.callback_query(F.data == "set_idle_timeout")
+async def set_idle_timeout_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="idle_timeout_hours")
+    await answer(callback, "⏰ <b>Idle Timeout (hours)</b>\n\nRemove pairs idle for more than X hours.\n\nEnter hours (e.g., 48):")
 
 @dp.callback_query(F.data == "toggle_trade_mode")
 async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
@@ -679,6 +698,22 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(max_symbols=val)
             await answer(message, f"📈 Max Symbols: <b>{val}</b>\n⚠️ Requires restart to take effect.")
+        
+        elif waiting_for == "max_idle_pairs":
+            val = int(value)
+            if val < 10 or val > 500:
+                await answer(message, "Value must be between 10 and 500.")
+                return
+            await db.config_update(max_idle_pairs=val)
+            await answer(message, f"🗑️ Max Idle Pairs: <b>{val}</b>")
+        
+        elif waiting_for == "idle_timeout_hours":
+            val = float(value)
+            if val < 1 or val > 168:  # 1 hour to 1 week
+                await answer(message, "Value must be between 1 and 168 hours.")
+                return
+            await db.config_update(idle_timeout_hours=val)
+            await answer(message, f"⏰ Idle Timeout: <b>{val}h</b>")
             
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 
