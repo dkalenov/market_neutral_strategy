@@ -221,7 +221,7 @@ async def load_config():
             'max_active_pairs': '5',
             'test_mode': 'false',
             'test_pairs': '',  # Empty by default - bot handles regular pairs fine
-            'priority_pairs_file': 'market_neutral/best_pairs.json',
+            'priority_pairs_file': 'best_pairs.json',
             # Symbol Filtering
             'max_symbols': '150',
             'tg_channel': '',

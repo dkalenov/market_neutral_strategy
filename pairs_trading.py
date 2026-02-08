@@ -1069,10 +1069,11 @@ class PairsManager:
             priority_symbols.add(pair.symbol1)
             priority_symbols.add(pair.symbol2)
             
-        # Priority file
-        priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
+        # Priority file - resolve relative to script directory
+        priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
         if priority_file_path and not os.path.isabs(priority_file_path):
-             priority_file_path = os.path.join(os.getcwd(), priority_file_path)
+             script_dir = os.path.dirname(os.path.abspath(__file__))
+             priority_file_path = os.path.join(script_dir, priority_file_path)
              
         if priority_file_path and os.path.exists(priority_file_path):
             try:
@@ -1576,10 +1577,11 @@ class PairsManager:
         candidates_to_process = []
         
         # --- 1. Load and process Priority Pairs ---
-        priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
-        # Handle path resolution
+        priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
+        # Handle path resolution - relative to script directory
         if priority_file_path and not os.path.isabs(priority_file_path):
-             priority_file_path = os.path.join(os.getcwd(), priority_file_path)
+             script_dir = os.path.dirname(os.path.abspath(__file__))
+             priority_file_path = os.path.join(script_dir, priority_file_path)
 
         priority_pairs = []
         if priority_file_path and os.path.exists(priority_file_path):
@@ -1814,9 +1816,10 @@ class PairsManager:
         Only adds if the pair doesn't already exist.
         """
         try:
-            priority_file_path = getattr(self.config, 'priority_pairs_file', 'market_neutral/best_pairs.json')
+            priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
             if priority_file_path and not os.path.isabs(priority_file_path):
-                priority_file_path = os.path.join(os.getcwd(), priority_file_path)
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                priority_file_path = os.path.join(script_dir, priority_file_path)
             
             if not priority_file_path:
                 return
