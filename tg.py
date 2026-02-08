@@ -41,30 +41,6 @@ config.read('market_neutral/config.ini')
 # Parse admin list
 tg_admins = []
 
-# Track orphan close cancellation requests (symbol -> True if cancelled)
-orphan_cancel_flags = {}
-
-def request_orphan_cancel(symbol: str):
-    """Mark orphan close as cancelled for this symbol."""
-    orphan_cancel_flags[symbol] = True
-
-def check_orphan_cancelled(symbol: str) -> bool:
-    """Check if orphan close was cancelled for this symbol and clear flag."""
-    cancelled = orphan_cancel_flags.pop(symbol, False)
-    return cancelled
-
-# Callback handler for orphan cancel buttons
-@dp.callback_query(F.data.startswith("orphan_cancel:"))
-async def orphan_cancel_callback(callback: types.CallbackQuery):
-    """Handle cancel button press for orphan auto-close."""
-    symbol = callback.data.split(":")[1]
-    request_orphan_cancel(symbol)
-    await callback.answer(f"✅ Keep Position: {symbol}", show_alert=True)
-    await callback.message.edit_text(
-        callback.message.text + "\n\n✅ <b>CANCELLED by user</b>",
-        parse_mode="HTML"
-    )
-
 # Function to run the bot
 async def init_bot():
     """Initialize TG bot (call this BEFORE pairs_manager.initialize for notifications to work)."""
@@ -121,8 +97,9 @@ async def run(_session, _client: binance.Futures, _pairs_manager):
     except Exception as e:
         print(f"TG: Webhook deletion failed: {e}")
 
-    print("TG: Starting polling...")
     await send_startup_message()
+    
+    print("TG: Starting polling...")
     try:
         # Start polling
         await dp.start_polling(bot)
@@ -168,9 +145,8 @@ async def start(message: Message, state: FSMContext):
     await state.set_state(States.main_menu)
     # Create keyboard
     keyboard = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Statistics"), KeyboardButton(text="Pairs")],
-        [KeyboardButton(text="Settings"), KeyboardButton(text="Blacklist")],
-        [KeyboardButton(text="🔴 Close Positions")],
+        [KeyboardButton(text="Statistics"), KeyboardButton(text="Settings")],
+        [KeyboardButton(text="Blacklist"), KeyboardButton(text="🔴 Close Positions")],
         [KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     # Send message
@@ -184,103 +160,13 @@ async def start_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.main_menu)
     # Create keyboard
     keyboard = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Statistics"), KeyboardButton(text="Pairs")],
-        [KeyboardButton(text="Settings"), KeyboardButton(text="Blacklist")],
-        [KeyboardButton(text="Main Menu")]
+        [KeyboardButton(text="Statistics"), KeyboardButton(text="Settings")],
+        [KeyboardButton(text="Blacklist"), KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     await callback.message.answer("Main Menu", reply_markup=keyboard)
     await callback.answer()
 
 
-# Trading pairs
-@dp.message(F.text == "Pairs")
-@dp.callback_query(F.data == "pairs")
-async def list_pairs(message: Message | CallbackQuery, state: FSMContext):
-    # Set state
-    await state.set_state(States.pairs)
-    # Load pairs from DB
-    pairs = await db.get_all_pairs()
-    keyboard = []
-    # Create keyboard
-    for pair in pairs:
-        keyboard.append([InlineKeyboardButton(text=f"{pair.symbol1}/{pair.symbol2}", callback_data=f"pair:{pair.id}")])
-    # Add pair button
-    keyboard.append([InlineKeyboardButton(text="Add Pair", callback_data="add_pair")])
-    await answer(message, "Trading Pairs List", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-
-
-# Pair edit menu
-@dp.callback_query(F.data.startswith("pair:"))
-async def pair_menu(callback: CallbackQuery, state: FSMContext):
-    pair_id = int(callback.data.split(':')[1])
-    await state.update_data(pair_id=pair_id)
-
-    pairs = await db.get_all_pairs()
-    pair = next((p for p in pairs if p.id == pair_id), None)
-
-    if not pair:
-        await answer(callback, "Pair not found.")
-        return
-
-    text = (f"Trading Pair: <b>{pair.symbol1}/{pair.symbol2}</b>\n"
-            f"Hedge Ratio: <b>{pair.hedge_ratio}</b>\n"
-            f"Half-life: <b>{pair.half_life}</b>")
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Delete Pair", callback_data="delete_pair")],
-        [InlineKeyboardButton(text="Back", callback_data="pairs")]
-    ])
-    await answer(callback, text, reply_markup=keyboard)
-
-
-# Add pair
-@dp.callback_query(States.pairs, F.data == "add_pair")
-async def add_pair(callback: CallbackQuery, state: FSMContext):
-    # Set state
-    await state.set_state(States.add_pair)
-    # Send message
-    await answer(callback, "Enter pair in format SYMBOL1/SYMBOL2")
-
-# Process add pair
-@dp.message(States.add_pair)
-async def add_pair_value(message: Message, state: FSMContext):
-    try:
-        symbol1, symbol2 = message.text.upper().split('/')
-    except ValueError:
-        await answer(message, "Invalid format. Enter pair as SYMBOL1/SYMBOL2")
-        return
-
-    new_pair = db.Pairs(symbol1=symbol1, symbol2=symbol2)
-    await db.add_pair(new_pair)
-    
-    await answer(message, f"Pair <b>{symbol1}/{symbol2}</b> added successfully.")
-    await list_pairs(message, state)
-
-
-# Delete pair
-@dp.callback_query(F.data == "delete_pair")
-async def delete_pair(callback: CallbackQuery, state: FSMContext):
-    # Set state
-    await state.set_state(States.delete_pair)
-    # Load data
-    data = await state.get_data()
-    # Create keyboard
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Yes", callback_data="delete_pair_yes"),
-         InlineKeyboardButton(text="No", callback_data=f"pair:{data['pair_id']}")]
-    ])
-    # Send message
-    await answer(callback, f"Are you sure you want to delete this pair?", reply_markup=keyboard)
-
-# Confirm delete pair
-@dp.callback_query(States.delete_pair, F.data == "delete_pair_yes")
-async def delete_pair_yes(callback: CallbackQuery, state: FSMContext):
-    # Load state
-    data = await state.get_data()
-    pair_id = data['pair_id']
-    await db.delete_pair(pair_id)
-    await answer(callback, f"Pair deleted successfully")
-    await list_pairs(callback, state)
 
 
 @dp.message(F.text == "Statistics")
@@ -290,23 +176,65 @@ async def open_trades(message: Message | CallbackQuery, state: FSMContext):
     text = "📊 <b>Open Trades:</b>"
     
     if pairs_manager:
-        # Get live positions from pairs_manager
-        has_trades = False
-        for pair_info in pairs_manager.active_pairs.values():
-            if pair_info.position_status != 0:
-                has_trades = True
-                direction = "🟢 LONG" if pair_info.position_status == 1 else "🔴 SHORT"
-                text += (f"\n\n<b>{direction}</b> {pair_info.symbol1}/{pair_info.symbol2}\n"
-                        f"  Qty1: {pair_info.qty1:.4f} @ {pair_info.entry_price1:.4f}\n"
-                        f"  Qty2: {pair_info.qty2:.4f} @ {pair_info.entry_price2:.4f}")
-        
-        if has_trades:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Refresh", callback_data="trades")]
-            ])
-            await answer(message, text, reply_markup=keyboard)
-        else:
-            await answer(message, "📊 No open trades")
+        try:
+            # Fetch live positions from exchange for PnL
+            positions = await client.get_position_risk()
+            pnl_by_symbol = {}
+            for pos in positions:
+                sym = pos.get('symbol', '')
+                qty = abs(float(pos.get('positionAmt', 0)))
+                if qty > 0:
+                    pnl_by_symbol[sym] = {
+                        'pnl': float(pos.get('unRealizedProfit', 0)),
+                        'entry': float(pos.get('entryPrice', 0)),
+                        'mark': float(pos.get('markPrice', 0)),
+                        'side': 'LONG' if float(pos.get('positionAmt', 0)) > 0 else 'SHORT'
+                    }
+            
+            # Get active pairs with PnL
+            has_trades = False
+            total_pnl = 0.0
+            
+            for pair_info in pairs_manager.active_pairs.values():
+                if pair_info.position_status != 0:
+                    has_trades = True
+                    s1, s2 = pair_info.symbol1, pair_info.symbol2
+                    
+                    # Get PnL for each leg
+                    pnl1 = pnl_by_symbol.get(s1, {}).get('pnl', 0)
+                    pnl2 = pnl_by_symbol.get(s2, {}).get('pnl', 0)
+                    pair_pnl = pnl1 + pnl2
+                    total_pnl += pair_pnl
+                    
+                    # Direction
+                    direction = "🟢 LONG" if pair_info.position_status == 1 else "🔴 SHORT"
+                    pnl_emoji = "🟢" if pair_pnl >= 0 else "🔴"
+                    
+                    # Mark price and unrealized PnL
+                    s1_info = pnl_by_symbol.get(s1, {})
+                    s2_info = pnl_by_symbol.get(s2, {})
+                    
+                    text += f"\n\n<b>{direction}</b> {s1}/{s2}"
+                    text += f"\n  {s1}: {s1_info.get('side', '?')} @ {s1_info.get('entry', 0):.4f}"
+                    text += f" → {pnl1:+.2f}"
+                    text += f"\n  {s2}: {s2_info.get('side', '?')} @ {s2_info.get('entry', 0):.4f}"
+                    text += f" → {pnl2:+.2f}"
+                    text += f"\n  💰 Pair PnL: {pnl_emoji} <b>{pair_pnl:+.2f} USDT</b>"
+            
+            if has_trades:
+                # Add total PnL summary
+                total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                text += f"\n\n━━━━━━━━━━━━━━━━"
+                text += f"\n💎 <b>Total Unrealized: {total_emoji} {total_pnl:+.2f} USDT</b>"
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Refresh", callback_data="trades")]
+                ])
+                await answer(message, text, reply_markup=keyboard)
+            else:
+                await answer(message, "📊 No open trades")
+        except Exception as e:
+            await answer(message, f"⚠️ Error fetching data: {e}")
     else:
         await answer(message, "⚠️ Pairs manager not initialized")
 
@@ -882,6 +810,13 @@ async def blacklist_menu(event: Message | CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(States.blacklist))
 async def process_blacklist_update(message: Message, state: FSMContext):
+    # Skip processing for menu buttons - let other handlers deal with them
+    menu_buttons = ["Statistics", "Settings", "Blacklist", "Main Menu", "🔴 Close Positions"]
+    if message.text in menu_buttons:
+        await state.clear()  # Exit blacklist state
+        await answer(message, "No changes made.")
+        return
+    
     if message.text.lower() == 'clear':
         await db.config_update(blacklist="")
         await answer(message, "Blacklist cleared.")

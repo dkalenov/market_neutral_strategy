@@ -404,19 +404,39 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
             active_symbols.add(pair_info.symbol1)
             active_symbols.add(pair_info.symbol2)
         
+        # Define markPrice handler FIRST (before any subscription)
+        async def ws_mark_price(ws, msg):
+            """Handle markPrice updates for real-time Z-score."""
+            if 'data' not in msg:
+                return
+            data = msg['data']
+            symbol = data.get('s')
+            price = float(data.get('p', 0))
+            if symbol and price > 0 and pairs_manager:
+                await pairs_manager.on_ticker_update(symbol, price)
+        
+        # Track already subscribed symbols in pairs_manager
+        pairs_manager._subscribed_mark_symbols = set(active_symbols)
+        
+        # Create callback for dynamic subscription (used when new pairs are discovered)
+        async def subscribe_new_marks(symbols):
+            """Subscribe to markPrice streams for new symbols dynamically."""
+            if not symbols:
+                return
+            streams = [f"{s.lower()}@markPrice@1s" for s in symbols]
+            try:
+                ws = await client.websocket(streams, on_message=ws_mark_price, on_error=ws_error)
+                websockets_list.append(ws)
+            except Exception as e:
+                print(f"⚠️ Failed to subscribe markPrice for {symbols}: {e}")
+        
+        # Set the callback on pairs_manager so it can subscribe new pairs
+        pairs_manager._subscribe_mark_callback = subscribe_new_marks
+        
+        # Subscribe to initial symbols
         if active_symbols:
             mark_streams = [f"{sym.lower()}@markPrice@1s" for sym in active_symbols]
             mark_chunks = [mark_streams[i:i + chunk_size] for i in range(0, len(mark_streams), chunk_size)]
-            
-            async def ws_mark_price(ws, msg):
-                """Handle markPrice updates for real-time Z-score."""
-                if 'data' not in msg:
-                    return
-                data = msg['data']
-                symbol = data.get('s')
-                price = float(data.get('p', 0))
-                if symbol and price > 0 and pairs_manager:
-                    await pairs_manager.on_ticker_update(symbol, price)
             
             for marks in mark_chunks:
                 try:
@@ -425,7 +445,9 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
                 except Exception as e:
                     print(f"Error subscribing to markPrice: {e}")
             
-            print(f"Connected to markPrice websocket ({len(active_symbols)} symbols).")
+            print(f"Connected to markPrice websocket ({len(active_symbols)} initial symbols).")
+        else:
+            print("ℹ️ No active pairs at startup - markPrice will be subscribed dynamically.")
 
 
 # Disconnect from websockets

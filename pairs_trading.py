@@ -107,6 +107,10 @@ class PairsManager:
         self.last_prices: dict[str, float] = {}  # {symbol: last_price} from WebSocket ticker
         self._signal_confirmation_task = None    # Task for checking confirmed signals
         
+        # Dynamic markPrice subscription for newly discovered pairs
+        self._subscribed_mark_symbols: set = set()  # Symbols with active markPrice subscription
+        self._subscribe_mark_callback = None  # Callback to subscribe new symbols (set by main.py)
+        
         # NOTE: Initialization is now EXPLICIT - call await pairs_manager.initialize() in main.py
         self._initialized = False
 
@@ -160,6 +164,11 @@ class PairsManager:
             for p in pairs:
                 pair_set = frozenset([p.symbol1, p.symbol2])
                 
+                # DUPLICATE CHECK: Skip if pair already loaded
+                if pair_set in self.active_pairs:
+                    print(f"  ⚠️ Skipping duplicate: {p.symbol1}-{p.symbol2} (already in active_pairs)")
+                    continue
+                
                 if p.position_status != 0:
                     # DB says position is open - verify against exchange
                     s1_open = p.symbol1 in open_on_exchange
@@ -210,61 +219,35 @@ class PairsManager:
                         closed_leg_trades = await self.client.get_account_trades(symbol=closed_sym, startTime=start_ms, limit=100)
                         closed_leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in closed_leg_trades)
                         
-                        # PnL-based decision
-                        should_close = True
-                        if unrealized_pnl < 0:
-                            # Losing position - notify and wait with cancel button
-                            pnl_emoji = "🔴"
-                            
-                            # Import for inline keyboard
-                            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                            import tg
-                            
-                            cancel_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                                [InlineKeyboardButton(text="✅ Keep Position", callback_data=f"orphan_cancel:{remaining_sym}")]
-                            ])
-                            
-                            await self._notify(
-                                f"🚨 <b>ORPHAN PAIR DETECTED</b>\n\n"
-                                f"Pair: {p.symbol1}-{p.symbol2}\n"
-                                f"❌ Closed externally: {closed_sym}\n"
-                                f"   └─ PnL: {closed_leg_pnl:+.2f} USDT\n\n"
-                                f"⚠️ Remaining: {remaining_sym} ({remaining_side})\n"
-                                f"   └─ Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
-                                f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
-                                f"Click button below to KEEP position:",
-                                reply_to_msg_id=tg_msg_id,
-                                reply_markup=cancel_keyboard
-                            )
-                            import asyncio
-                            await asyncio.sleep(30)
-                            
-                            # Check if user cancelled via button
-                            if tg.check_orphan_cancelled(remaining_sym):
-                                print(f"      → Cancelled by user via button")
-                                should_close = False
-                                # Don't update DB - keep pair active
-                                continue
-                            
-                            # Re-check if position still exists
-                            check_positions = await self.client.get_position_risk()
-                            still_open = False
-                            for pos in check_positions:
+                        # Close orphan immediately (no wait, no buttons)
+                        pnl_emoji = "🔴" if unrealized_pnl < 0 else "🟢"
+                        
+                        # Notify about orphan detection
+                        await self._notify(
+                            f"🚨 <b>ORPHAN PAIR DETECTED</b>\n\n"
+                            f"Pair: {p.symbol1}-{p.symbol2}\n"
+                            f"❌ Closed externally: {closed_sym}\n"
+                            f"   └─ PnL: {closed_leg_pnl:+.2f} USDT\n\n"
+                            f"⚠️ Closing: {remaining_sym} ({remaining_side})\n"
+                            f"   └─ Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>",
+                            reply_to_msg_id=tg_msg_id
+                        )
+                        
+                        # Close the remaining position
+                        try:
+                            # Re-verify position still exists before closing
+                            verify_positions = await self.client.get_position_risk()
+                            position_exists = False
+                            for pos in verify_positions:
                                 if pos.get('symbol') == remaining_sym and abs(float(pos.get('positionAmt', 0))) > 0:
-                                    still_open = True
+                                    position_exists = True
                                     remaining_qty = abs(float(pos.get('positionAmt', 0)))
                                     remaining_side = 'LONG' if float(pos.get('positionAmt', 0)) > 0 else 'SHORT'
                                     break
                             
-                            if not still_open:
-                                print(f"      → Closed by user during wait")
-                                should_close = False
-                        else:
-                            pnl_emoji = "🟢"
-                            print(f"      → PnL >= 0, auto-closing...")
-                        
-                        if should_close:
-                            try:
+                            if not position_exists:
+                                print(f"      → Position {remaining_sym} already closed, skipping")
+                            else:
                                 await self.client.cancel_open_orders(remaining_sym)
                                 close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
                                 await self.client.new_order(
@@ -275,30 +258,30 @@ class PairsManager:
                                     reduceOnly='true'
                                 )
                                 print(f"      ✅ Closed orphan {remaining_sym}")
-                                
-                                import asyncio
-                                await asyncio.sleep(1)
-                                
-                                # Fetch PnL for remaining leg
-                                now_ms = int(time_mod.time() * 1000)
-                                start_ms = now_ms - 300_000
-                                remaining_trades = await self.client.get_account_trades(symbol=remaining_sym, startTime=start_ms, limit=50)
-                                remaining_leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in remaining_trades)
-                                
-                                total_pnl = closed_leg_pnl + remaining_leg_pnl
-                                total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-                                
-                                await self._notify(
-                                    f"⚡ <b>Orphan Pair Closed</b>\n\n"
-                                    f"Pair: {p.symbol1}-{p.symbol2}\n\n"
-                                    f"❌ {closed_sym}: {closed_leg_pnl:+.2f} USDT (closed externally)\n"
-                                    f"⚡ {remaining_sym}: {remaining_leg_pnl:+.2f} USDT (closed by bot)\n\n"
-                                    f"💰 <b>Total PnL: {total_emoji} {total_pnl:+.2f} USDT</b>",
-                                    reply_to_msg_id=tg_msg_id
-                                )
-                            except Exception as e:
-                                print(f"      ⚠️ Failed to close orphan: {e}")
-                                await self._notify(f"🚨 ORPHAN CLOSE FAILED: {remaining_sym}\nError: {e}")
+                            
+                            import asyncio
+                            await asyncio.sleep(1)
+                            
+                            # Fetch PnL for remaining leg
+                            now_ms = int(time_mod.time() * 1000)
+                            start_ms = now_ms - 300_000
+                            remaining_trades = await self.client.get_account_trades(symbol=remaining_sym, startTime=start_ms, limit=50)
+                            remaining_leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in remaining_trades)
+                            
+                            total_pnl = closed_leg_pnl + remaining_leg_pnl
+                            total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                            
+                            await self._notify(
+                                f"⚡ <b>Orphan Pair Closed</b>\n\n"
+                                f"Pair: {p.symbol1}-{p.symbol2}\n\n"
+                                f"❌ {closed_sym}: {closed_leg_pnl:+.2f} USDT (closed externally)\n"
+                                f"⚡ {remaining_sym}: {remaining_leg_pnl:+.2f} USDT (closed by bot)\n\n"
+                                f"💰 <b>Total PnL: {total_emoji} {total_pnl:+.2f} USDT</b>",
+                                reply_to_msg_id=tg_msg_id
+                            )
+                        except Exception as e:
+                            print(f"      ⚠️ Failed to close orphan: {e}")
+                            await self._notify(f"🚨 ORPHAN CLOSE FAILED: {remaining_sym}\nError: {e}")
                         
                         # Mark pair as closed in DB
                         await db.update_pair({
@@ -385,9 +368,10 @@ class PairsManager:
             # Warn about positions on exchange that are NOT in our DB
             tracked_symbols = set()
             for pair_info in self.active_pairs.values():
-                if pair_info.position_status != 0:
-                    tracked_symbols.add(pair_info.symbol1)
-                    tracked_symbols.add(pair_info.symbol2)
+                # Include ALL symbols from active_pairs (even orphans with position_status=0)
+                # If pair is in active_pairs, its symbols should not be flagged as unknown
+                tracked_symbols.add(pair_info.symbol1)
+                tracked_symbols.add(pair_info.symbol2)
             
             unknown_positions = [s for s in open_on_exchange.keys() if s not in tracked_symbols]
             if unknown_positions:
@@ -403,40 +387,31 @@ class PairsManager:
                     
                     print(f"      Unknown: {symbol} ({side} {qty}) PnL: {unrealized_pnl:.2f}")
                     
-                    should_close = True
-                    if unrealized_pnl < 0:
-                        # Losing position - wait 30 seconds
-                        pnl_emoji = "🔴"
-                        await self._notify(
-                            f"🚨 <b>UNKNOWN POSITION DETECTED</b>\n\n"
-                            f"Symbol: {symbol} ({side})\n"
-                            f"Qty: {qty}\n"
-                            f"💵 Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
-                            f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
-                            f"Close manually in Binance if you want to keep it."
-                        )
-                        await asyncio.sleep(30)
-                        
-                        # Re-check if position still exists
-                        check_positions = await self.client.get_position_risk()
-                        still_open = False
-                        for p in check_positions:
+                    # Close unknown positions immediately
+                    pnl_emoji = "🔴" if unrealized_pnl < 0 else "🟢"
+                    await self._notify(
+                        f"🚨 <b>UNKNOWN POSITION DETECTED</b>\n\n"
+                        f"Symbol: {symbol} ({side})\n"
+                        f"Qty: {qty}\n"
+                        f"💵 Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
+                        f"⏱️ <b>Closing...</b>"
+                    )
+                    
+                    try:
+                        # Re-verify position still exists before closing
+                        verify_positions = await self.client.get_position_risk()
+                        position_exists = False
+                        for p in verify_positions:
                             if p.get('symbol') == symbol and abs(float(p.get('positionAmt', 0))) > 0:
-                                still_open = True
+                                position_exists = True
                                 qty = abs(float(p.get('positionAmt', 0)))
                                 side = 'LONG' if float(p.get('positionAmt', 0)) > 0 else 'SHORT'
                                 break
                         
-                        if not still_open:
-                            print(f"      → Unknown position {symbol} was closed by user")
-                            await self._notify(f"✅ Unknown position {symbol} was closed manually.")
-                            should_close = False
-                    else:
-                        pnl_emoji = "🟢"
-                        print(f"      → PnL >= 0, auto-closing {symbol}...")
-                    
-                    if should_close:
-                        try:
+                        if not position_exists:
+                            print(f"      → Position {symbol} already closed, skipping")
+                            await self._notify(f"✅ Unknown position {symbol} was already closed.")
+                        else:
                             await self.client.cancel_open_orders(symbol)
                             
                             close_side = 'SELL' if side == 'LONG' else 'BUY'
@@ -460,9 +435,9 @@ class PairsManager:
                             
                             await self._notify(f"⚡ <b>Unknown Position Closed:</b> {symbol}\n"
                                                f"💵 PnL: {pnl_emoji} <b>{pnl:.2f} USDT</b>")
-                        except Exception as e:
-                            print(f"      ⚠️ Failed to close {symbol}: {e}")
-                            await self._notify(f"🚨 FAILED to close: {symbol}\nError: {e}")
+                    except Exception as e:
+                        print(f"      ⚠️ Failed to close {symbol}: {e}")
+                        await self._notify(f"🚨 FAILED to close: {symbol}\nError: {e}")
             
             # Check each pair in DB
             pairs_to_fix = []
@@ -499,26 +474,8 @@ class PairsManager:
                                 f"Pair: {s1}-{s2}\n"
                                 f"Remaining: {remaining_sym} ({remaining_side})\n"
                                 f"💵 Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
-                                f"⏱️ <b>Auto-closing in 30 seconds...</b>\n"
-                                f"Close the position manually in Binance if you want to keep it."
+                                f"⏱️ <b>Closing orphan...</b>"
                             )
-                            import asyncio
-                            await asyncio.sleep(30)
-                            
-                            # Re-check if position still exists
-                            check_positions = await self.client.get_position_risk()
-                            still_open = False
-                            for p in check_positions:
-                                if p.get('symbol') == remaining_sym and abs(float(p.get('positionAmt', 0))) > 0:
-                                    still_open = True
-                                    unrealized_pnl = float(p.get('unRealizedProfit', 0))
-                                    break
-                            
-                            if not still_open:
-                                print(f"      → Position was closed by user during wait")
-                                pairs_to_fix.append((pair_info, 'close_db'))
-                                await self._notify(f"✅ Orphan {remaining_sym} was closed manually.")
-                                should_close = False
                         else:
                             # Profitable or breakeven - auto close immediately
                             pnl_emoji = "🟢"
@@ -526,19 +483,34 @@ class PairsManager:
                         
                         if should_close:
                             try:
-                                # Cancel any remaining orders for this symbol
-                                await self.client.cancel_open_orders(remaining_sym)
+                                # Re-verify position still exists before closing
+                                verify_positions = await self.client.get_position_risk()
+                                position_exists = False
+                                for p in verify_positions:
+                                    if p.get('symbol') == remaining_sym and abs(float(p.get('positionAmt', 0))) > 0:
+                                        position_exists = True
+                                        remaining_qty = abs(float(p.get('positionAmt', 0)))
+                                        remaining_side = 'LONG' if float(p.get('positionAmt', 0)) > 0 else 'SHORT'
+                                        break
                                 
-                                # Close remaining leg with market order
-                                close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
-                                await self.client.new_order(
-                                    symbol=remaining_sym,
-                                    side=close_side,
-                                    type='MARKET',
-                                    quantity=remaining_qty,
-                                    reduceOnly='true'
-                                )
-                                print(f"      ✅ Closed orphan leg {remaining_sym}")
+                                if not position_exists:
+                                    print(f"      → Position {remaining_sym} already closed, skipping")
+                                    pairs_to_fix.append((pair_info, 'close_db'))
+                                    should_close = False
+                                else:
+                                    # Cancel any remaining orders for this symbol
+                                    await self.client.cancel_open_orders(remaining_sym)
+                                    
+                                    # Close remaining leg with market order
+                                    close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
+                                    await self.client.new_order(
+                                        symbol=remaining_sym,
+                                        side=close_side,
+                                        type='MARKET',
+                                        quantity=remaining_qty,
+                                        reduceOnly='true'
+                                    )
+                                    print(f"      ✅ Closed orphan leg {remaining_sym}")
                                 
                                 # Wait for trade data
                                 import asyncio
@@ -1615,16 +1587,56 @@ class PairsManager:
                     await db.add_pair_history(history_item)
                     
                     pair_set = frozenset([s1, s2])
-                    print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}")
                     
-                    self.active_pairs[pair_set] = PairInfo(
+                    # === BETA CHECK BEFORE ADDING TO ACTIVE PAIRS ===
+                    # Calculate beta to BTC to ensure pair is market-neutral
+                    beta_btc = 0.0
+                    beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
+                    
+                    if 'BTCUSDT' in self.all_data and s1 in data_snapshot and s2 in data_snapshot:
+                        try:
+                            btc_data = self.all_data['BTCUSDT']
+                            if len(btc_data.close) >= self.min_data_points:
+                                log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
+                                log_p1 = data_snapshot[s1]
+                                log_p2 = data_snapshot[s2]
+                                # Spread returns = d(log1) - hedge * d(log2)
+                                spread_returns = np.diff(log_p1) - hedge * np.diff(log_p2)
+                                btc_returns = np.diff(log_btc)
+                                beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
+                        except Exception as e:
+                            print(f"⚠️ Beta calc error for {s1}-{s2}: {e}")
+                    
+                    # Reject pair if beta is too high
+                    if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
+                        print(f"⚠️ {s1}-{s2} REJECTED at discovery: |beta|={abs(beta_btc):.3f} >= {beta_threshold}")
+                        # Remove from DB since we just added it
+                        try:
+                            await db.delete_pair(new_pair.id)
+                        except:
+                            pass
+                        continue  # Skip this pair
+                    
+                    print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}")
+                    
+                    # Final duplicate check before adding (race condition protection)
+                    if pair_set in self.active_pairs:
+                        print(f"  ⚠️ Skipping duplicate (race condition): {s1}-{s2}")
+                        continue
+                    
+                    pair_info = PairInfo(
                         symbol1=s1, 
                         symbol2=s2, 
                         hedge_ratio=hedge, 
                         half_life=hl,
                         db_id=new_pair.id
                     )
+                    pair_info.beta_btc = beta_btc
+                    self.active_pairs[pair_set] = pair_info
                     new_pairs_count += 1
+                    
+                    # Subscribe to real-time markPrice for this new pair
+                    await self._subscribe_new_pair_realtime(s1, s2)
                     
                     # IMMEDIATE ENTRY CHECK: Don't wait for 5m candle!
                     # Check signals right now using the data we just downloaded
@@ -2466,6 +2478,33 @@ class PairsManager:
                         # Reset pending after check
                         pair_info.pending_signal = None
                         pair_info.pending_since = None
+    
+    async def _subscribe_new_pair_realtime(self, symbol1: str, symbol2: str):
+        """
+        Subscribe to markPrice streams for a newly discovered pair.
+        This enables real-time Z-score monitoring for new pairs.
+        """
+        if not self._subscribe_mark_callback:
+            return  # No callback configured - skip silently
+        
+        new_symbols = []
+        
+        # Only subscribe if not already subscribed
+        if symbol1 not in self._subscribed_mark_symbols:
+            new_symbols.append(symbol1)
+            self._subscribed_mark_symbols.add(symbol1)
+        
+        if symbol2 not in self._subscribed_mark_symbols:
+            new_symbols.append(symbol2)
+            self._subscribed_mark_symbols.add(symbol2)
+        
+        # Subscribe to markPrice for new symbols
+        if new_symbols:
+            try:
+                await self._subscribe_mark_callback(new_symbols)
+                print(f"🔔 Subscribed to markPrice for new pair: {symbol1}-{symbol2} (symbols: {new_symbols})")
+            except Exception as e:
+                print(f"⚠️ Failed to subscribe markPrice for {symbol1}-{symbol2}: {e}")
     
     def start_realtime_monitoring(self):
         """Start the signal confirmation loop."""
