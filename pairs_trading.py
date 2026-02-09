@@ -68,7 +68,10 @@ class PairInfo:
     pending_signal: float = None  # Pending Z-score signal awaiting confirmation
     pending_since: float = None   # Time when signal started
     # Idle pair management
-    discovered_at: float = 0.0    # Unix timestamp when pair was discovered
+    discovered_at: float = field(default_factory=time.time)  # When pair was discovered
+    # Close tracking - prevents duplicate notifications
+    close_handled: bool = False    # True if bot already processed close notification
+    last_close_reason: str = ''    # Reason for last close (for debugging)
 
 class PairsManager:
     """
@@ -1943,6 +1946,9 @@ class PairsManager:
 
                 print(f"EXECUTING CLOSE for {s1}-{s2}")
                 
+                # Store close reason IMMEDIATELY so external handlers can see it
+                pair_info.last_close_reason = close_reason or 'unknown'
+                
                 # Cancel all open orders (including algo SL/TP) before closing
                 try:
                     results = await asyncio.gather(
@@ -2073,6 +2079,8 @@ class PairsManager:
                         pair_info.position_status = 0
                         pair_info.qty1 = 0
                         pair_info.qty2 = 0
+                        pair_info.close_handled = True  # Mark as handled to prevent duplicate notification
+                        pair_info.last_close_reason = close_reason or 'unknown'
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                     
@@ -2121,7 +2129,6 @@ class PairsManager:
                         
                         # Update DB with close details
                         if pair_info.db_id:
-                            import time
                             await db.update_pair({
                                 'id': pair_info.db_id,
                                 'position_status': 0,
