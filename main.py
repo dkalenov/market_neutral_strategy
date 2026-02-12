@@ -631,6 +631,7 @@ async def ws_user_msg(ws, msg):
                                     'external': '⚡ External Close',
                                     'orphan_restart': '🔄 Orphan on Restart',
                                     'stale_symbols': '⏳ Stale Symbols',
+                                    'manual_partial': '👤 Manual Close (1 leg)',
                                 }
                                 
                                 # FIRST: Check if bot stored exact reason
@@ -642,28 +643,49 @@ async def ws_user_msg(ws, msg):
                                 else:
                                     # FALLBACK: Query orders to detect external close type
                                     try:
-                                        orders1 = await client.get_all_orders(symbol=s1, limit=10)
-                                        orders2 = await client.get_all_orders(symbol=s2, limit=10)
+                                        orders1 = await client.get_all_orders(symbol=s1, limit=15)
+                                        orders2 = await client.get_all_orders(symbol=s2, limit=15)
                                         
                                         now_ms = int(time_mod.time() * 1000)
-                                        for o in orders1 + orders2:
-                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
-                                                o_type = o.get('type', '') or o.get('origType', '')
-                                                if 'STOP' in o_type:
-                                                    close_type = '�️ Hardware SL'
-                                                    close_hint = ''
-                                                    break
-                                                elif 'TAKE_PROFIT' in o_type:
-                                                    close_type = '�️ Hardware TP'
-                                                    close_hint = ''
-                                                    break
+                                        recent_orders = [o for o in orders1 + orders2 
+                                                        if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000]
+                                        
+                                        if recent_orders:
+                                            recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
+                                            o = recent_orders[0]
+                                            o_type = o.get('type', '') or o.get('origType', '')
+                                            
+                                            if 'STOP' in o_type:
+                                                close_type = '🛡️ Hardware SL'
+                                            elif 'TAKE_PROFIT' in o_type:
+                                                close_type = '🛡️ Hardware TP'
+                                            elif o_type == 'MARKET':
+                                                close_type = '👤 Manual Market' if not o.get('reduceOnly') else '🤖 Bot Close'
+                                            elif o_type == 'LIMIT':
+                                                close_type = '📊 Limit Order'
+                                            elif 'TRAILING' in o_type:
+                                                close_type = '📈 Trailing Stop'
+                                            else:
+                                                close_type = f'⚡ {o_type}'
+                                            print(f"� Detected: {o_type} -> {close_type}")
+                                        else:
+                                            close_type = '⚡ External Close'
+                                            close_hint = ' (no orders found)'
+                                            print(f"⚠️ No orders for {s1}/{s2}")
                                     except Exception as e:
-                                        print(f"⚠️ Could not query orders: {e}")
+                                        print(f"⚠️ Query error: {e}")
+                                        close_type = '⚡ External'
                                 
                                 pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                                # Get Z-score and Beta from pair_info
+                                zscore = getattr(pair_info, 'zscore', 0) or 0
+                                beta = getattr(pair_info, 'beta', 0) or 0
+                                e1 = '🟢' if pnl1 >= 0 else '🔴'
+                                e2 = '🟢' if pnl2 >= 0 else '🔴'
                                 msg_text = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
+                                            f"📊 Z: {zscore:+.2f} | β: {beta:.3f}\n"
                                             f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
-                                            f"   {s1}: {pnl1:+.2f} | {s2}: {pnl2:+.2f}\n"
+                                            f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
                                             f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                                 
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
@@ -684,7 +706,7 @@ async def ws_user_msg(ws, msg):
                                         'qty2': 0,
                                         'close_time': int(time_mod.time()),
                                         'close_pnl': net_pnl,
-                                        'close_reason': 'external',
+                                        'close_reason': stored_reason if stored_reason else 'external',
                                         'pnl1': pnl1,
                                         'pnl2': pnl2,
                                         'fee1': fee1,
@@ -695,8 +717,9 @@ async def ws_user_msg(ws, msg):
                                 import traceback
                                 traceback.print_exc()
                         else:
-                            # Only one leg closed - close the other
+                            # Only one leg closed - user manually closed one position
                             print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol}...")
+                            pair_info.last_close_reason = 'manual_partial'  # User manually closed one leg
                             try:
                                 await client.cancel_open_orders(s1)
                                 await client.cancel_open_orders(s2)
@@ -747,6 +770,9 @@ async def ws_user_msg(ws, msg):
                                 pair_info.qty2 = 0
                                 pair_info.is_trading = False
                                 
+                                # Get stored reason from pair_info (set by bot when closing)
+                                stored_reason = getattr(pair_info, 'last_close_reason', '')
+                                
                                 # Update DB with PnL details
                                 if pair_info.db_id:
                                     await db.update_pair({
@@ -756,7 +782,7 @@ async def ws_user_msg(ws, msg):
                                         'qty2': 0,
                                         'close_time': int(time_mod.time()),
                                         'close_pnl': net_pnl,
-                                        'close_reason': 'external',
+                                        'close_reason': stored_reason if stored_reason else 'external',
                                         'pnl1': pnl1,
                                         'pnl2': pnl2,
                                         'fee1': fee1,
@@ -777,7 +803,12 @@ async def ws_user_msg(ws, msg):
                                     'external': '⚡ External Close',
                                     'orphan_restart': '🔄 Orphan on Restart',
                                     'stale_symbols': '⏳ Stale Symbols',
+                                    'manual_partial': '👤 Manual Close (1 leg)',
                                 }
+                                
+                                # Default values (in case no reason is found)
+                                close_type = '❓ Unknown'
+                                close_hint = ''
                                 
                                 # FIRST: Check if bot stored exact reason
                                 stored_reason = getattr(pair_info, 'last_close_reason', '')
@@ -788,28 +819,60 @@ async def ws_user_msg(ws, msg):
                                 else:
                                     # FALLBACK: Query orders to detect external close type
                                     try:
-                                        orders1 = await client.get_all_orders(symbol=s1, limit=10)
-                                        orders2 = await client.get_all_orders(symbol=s2, limit=10)
+                                        orders1 = await client.get_all_orders(symbol=s1, limit=15)
+                                        orders2 = await client.get_all_orders(symbol=s2, limit=15)
                                         
                                         now_ms = int(time_mod.time() * 1000)
+                                        recent_orders = []
                                         for o in orders1 + orders2:
                                             if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
-                                                o_type = o.get('type', '') or o.get('origType', '')
-                                                if 'STOP' in o_type:
-                                                    close_type = '🛡️ Hardware SL'
-                                                    close_hint = ''
-                                                    break
-                                                elif 'TAKE_PROFIT' in o_type:
-                                                    close_type = '🛡️ Hardware TP'
-                                                    close_hint = ''
-                                                    break
+                                                recent_orders.append(o)
+                                        
+                                        if recent_orders:
+                                            # Sort by time, newest first
+                                            recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
+                                            o = recent_orders[0]
+                                            o_type = o.get('type', '') or o.get('origType', '')
+                                            
+                                            if 'STOP' in o_type:
+                                                close_type = '🛡️ Hardware SL'
+                                            elif 'TAKE_PROFIT' in o_type:
+                                                close_type = '🛡️ Hardware TP'
+                                            elif o_type == 'MARKET':
+                                                # Check if reduceOnly - that's bot closing
+                                                if o.get('reduceOnly', False):
+                                                    close_type = '🤖 Bot Close (reason unknown)'
+                                                else:
+                                                    close_type = '👤 Manual Market Order'
+                                            elif o_type == 'LIMIT':
+                                                close_type = '📊 Limit Order Filled'
+                                            elif 'TRAILING' in o_type:
+                                                close_type = '📈 Trailing Stop'
+                                            else:
+                                                close_type = f'⚡ Order: {o_type}'
+                                            
+                                            print(f"� Detected from orders: {o_type} -> {close_type}")
+                                        else:
+                                            # No recent orders found - truly external or WebSocket miss
+                                            close_type = '⚡ External Close'
+                                            close_hint = ' (no matching orders)'
+                                            print(f"⚠️ No recent orders found for {s1}/{s2} - external close")
+                                            
                                     except Exception as e:
                                         print(f"⚠️ Could not query orders: {e}")
+                                        close_type = '⚡ External Close'
+                                        close_hint = ' (query failed)'
                                 
                                 pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                                # Get Z-score and Beta from pair_info
+                                zscore = getattr(pair_info, 'zscore', 0) or 0
+                                beta = getattr(pair_info, 'beta', 0) or 0
+                                e1 = '🟢' if pnl1 >= 0 else '🔴'
+                                e2 = '🟢' if pnl2 >= 0 else '🔴'
                                 done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
+                                            f"📊 Z: {zscore:+.2f} | β: {beta:.3f}\n"
                                             f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
-                                            f"   {s1}: {pnl1:+.2f} | {s2}: {pnl2:+.2f}\n"
+                                            f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
                                             f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                                 await send_tg_notification(done_msg, reply_to)
