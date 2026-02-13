@@ -505,7 +505,7 @@ async def ws_user_msg(ws, msg):
     event_type = msg.get('e')
     
     # DEBUG: Log all userdata events
-    if event_type in ('ACCOUNT_UPDATE', 'ORDER_TRADE_UPDATE'):
+    if event_type in ('ACCOUNT_UPDATE', 'ORDER_TRADE_UPDATE', 'ALGO_UPDATE'):
         print(f"📡 UserData WS: {event_type} received")
     
     # Check for ACCOUNT_UPDATE (position changes - including manual closes)
@@ -677,9 +677,20 @@ async def ws_user_msg(ws, msg):
                                         close_type = '⚡ External'
                                 
                                 pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
-                                # Get Z-score and Beta from pair_info
-                                zscore = getattr(pair_info, 'zscore', 0) or 0
-                                beta = getattr(pair_info, 'beta', 0) or 0
+                                # Calculate real-time Z-score (last_z_score may be stale)
+                                try:
+                                    p1 = pairs_manager.last_prices.get(s1, 0)
+                                    p2 = pairs_manager.last_prices.get(s2, 0)
+                                    if p1 > 0 and p2 > 0:
+                                        zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
+                                        import math
+                                        if math.isnan(zscore):
+                                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                    else:
+                                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                except Exception:
+                                    zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                beta = getattr(pair_info, 'beta_btc', 0) or 0
                                 e1 = '🟢' if pnl1 >= 0 else '🔴'
                                 e2 = '🟢' if pnl2 >= 0 else '🔴'
                                 msg_text = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
@@ -717,7 +728,13 @@ async def ws_user_msg(ws, msg):
                                 import traceback
                                 traceback.print_exc()
                         else:
-                            # Only one leg closed - user manually closed one position
+                            # Only one leg closed - check if bot is already handling this
+                            if getattr(pair_info, 'close_handled', False):
+                                print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping single-leg handler")
+                                pair_info.is_trading = False
+                                continue
+                            
+                            # External close - user manually closed one position
                             print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol}...")
                             pair_info.last_close_reason = 'manual_partial'  # User manually closed one leg
                             try:
@@ -864,9 +881,20 @@ async def ws_user_msg(ws, msg):
                                         close_hint = ' (query failed)'
                                 
                                 pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
-                                # Get Z-score and Beta from pair_info
-                                zscore = getattr(pair_info, 'zscore', 0) or 0
-                                beta = getattr(pair_info, 'beta', 0) or 0
+                                # Calculate real-time Z-score (last_z_score may be stale)
+                                try:
+                                    p1 = pairs_manager.last_prices.get(s1, 0)
+                                    p2 = pairs_manager.last_prices.get(s2, 0)
+                                    if p1 > 0 and p2 > 0:
+                                        zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
+                                        import math
+                                        if math.isnan(zscore):
+                                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                    else:
+                                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                except Exception:
+                                    zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                beta = getattr(pair_info, 'beta_btc', 0) or 0
                                 e1 = '🟢' if pnl1 >= 0 else '🔴'
                                 e2 = '🟢' if pnl2 >= 0 else '🔴'
                                 done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
@@ -926,10 +954,62 @@ async def ws_user_msg(ws, msg):
                         
                         # Trigger immediate leg sync check for this pair
                         try:
-                            await pairs_manager._check_and_sync_legs()
+                            await pairs_manager._check_leg_synchronization()
                         except Exception as e:
                             print(f"⚠️ Leg sync error after cancel: {e}")
                         break
+    
+    # Check for ALGO_UPDATE (algo order triggered/finished - SL/TP via algo endpoint)
+    if event_type == 'ALGO_UPDATE':
+        algo_data = msg.get('o', {})
+        algo_id = str(algo_data.get('aid', ''))  # Algo order ID (Binance field: "aid")
+        algo_status = algo_data.get('X', '')     # Algo Status (Binance field: "X"): NEW, CANCELED, TRIGGERING, TRIGGERED, FINISHED, REJECTED, EXPIRED
+        algo_symbol = algo_data.get('s', '')     # Symbol (Binance field: "s")
+        algo_type = algo_data.get('o', '')       # Order Type (Binance field: "o"): STOP, TAKE_PROFIT, etc.
+        
+        print(f"📡 ALGO_UPDATE: {algo_symbol} {algo_type} {algo_status} (algoId={algo_id})")
+        
+        if algo_status in ('TRIGGERING', 'TRIGGERED') and pairs_manager:
+            # Check if this algoId is tracked
+            algo_info = pairs_manager.algo_orders.get(algo_id)
+            if algo_info:
+                order_type = algo_info.get('type', algo_type)
+                pair_key = algo_info.get('pair_key')
+                symbol = algo_info.get('symbol', algo_symbol)
+                
+                is_tp = 'TAKE_PROFIT' in order_type.upper() if order_type else False
+                tp_or_sl = 'TP' if is_tp else 'SL'
+                
+                print(f"🎯 Algo {tp_or_sl} triggered: {symbol} (algoId={algo_id})")
+                
+                try:
+                    await pairs_manager.handle_sl_tp_triggered(symbol, order_type)
+                    
+                    # Clean up all algo orders for this pair
+                    if pair_key:
+                        to_remove = [aid for aid, info in pairs_manager.algo_orders.items()
+                                     if info.get('pair_key') == pair_key]
+                        for aid in to_remove:
+                            del pairs_manager.algo_orders[aid]
+                        print(f"🗑️ Cleaned up {len(to_remove)} algo order mappings for pair")
+                except Exception as e:
+                    print(f"⚠️ Error handling algo SL/TP trigger: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"ℹ️ Algo order {algo_id} not tracked (may be from previous session)")
+                # Fallback: try to match by symbol
+                if algo_status == 'TRIGGERING':
+                    try:
+                        await pairs_manager.handle_sl_tp_triggered(algo_symbol, algo_type)
+                    except Exception as e:
+                        print(f"⚠️ Fallback algo handler error: {e}")
+        
+        elif algo_status == 'CANCELED' and pairs_manager:
+            # Remove from tracking
+            if algo_id in pairs_manager.algo_orders:
+                del pairs_manager.algo_orders[algo_id]
+                print(f"🗑️ Removed canceled algo order {algo_id} from tracking")
 
 
 if __name__ == '__main__':

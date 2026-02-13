@@ -991,6 +991,7 @@ async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(f"⏳ Closing position {s1}/{s2}...")
     
     try:
+        pair_info.close_handled = True
         pair_info.is_trading = True
         await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
         await callback.message.answer(f"✅ Position {s1}/{s2} closed successfully!")
@@ -1036,6 +1037,7 @@ async def close_all_yes_handler(callback: CallbackQuery, state: FSMContext):
     
     for pair_info in pairs_to_close:
         try:
+            pair_info.close_handled = True
             pair_info.is_trading = True
             await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
             closed += 1

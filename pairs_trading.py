@@ -118,6 +118,9 @@ class PairsManager:
         
         # NOTE: Initialization is now EXPLICIT - call await pairs_manager.initialize() in main.py
         self._initialized = False
+        
+        # Algo order tracking: algoId -> {pair_key, symbol, order_type}
+        self.algo_orders: dict[str, dict] = {}
 
     async def initialize(self):
         """
@@ -781,6 +784,7 @@ class PairsManager:
                 # Don't notify here - _execute_trade will send full close notification with PnL
                 
                 # Force close the pair (cancels algo orders + closes other leg if needed)
+                pair_info.close_handled = True
                 pair_info.is_trading = True
                 await self._execute_trade(pair_info, 0, close_reason=close_reason)
                 break
@@ -919,6 +923,7 @@ class PairsManager:
                     
                     print(f"⚡ Desync detected: {s1}-{s2}. {closed_leg} closed, closing {remaining_leg}...")
                     
+                    pair_info.close_handled = True  # Prevent WS handler from sending duplicate notification
                     pair_info.is_trading = True
                     
                     try:
@@ -1386,6 +1391,7 @@ class PairsManager:
                     if pair_info.position_status != 0:
                         print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
                         # Don't send notification here - _execute_trade will send full close message with PnL
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         
                         # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
@@ -1457,7 +1463,9 @@ class PairsManager:
                             cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
                                       f"Loss: {roi*100:.2f}% ({total_pnl:.2f} USDT). Force Closing...")
                             print(cb_msg)
-                            self.loop.create_task(self._notify(cb_msg))
+                            reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                            self.loop.create_task(self._notify(cb_msg, reply_to))
+                            pair_info.close_handled = True
                             pair_info.is_trading = True
                             self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='circuit'))
                             # pair_info.position_status = 0 # Will be set in execute_trade
@@ -1485,6 +1493,7 @@ class PairsManager:
                                         f"PnL: +{total_pnl:.2f} USDT. Auto-closing...")
                             print(beta_msg)
                             self.loop.create_task(self._notify(beta_msg))
+                            pair_info.close_handled = True
                             pair_info.is_trading = True
                             self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='beta_drift'))
                             continue
@@ -1537,20 +1546,24 @@ class PairsManager:
                 elif pair_info.position_status == 1: # Long spread
                     if z_score >= z_exit:
                         print(f"💰 TAKE PROFIT (Long) on {s1}-{s2}. Z: {z_score:.2f} >= {z_exit}. Closing...")
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
                     elif z_score <= -z_stop:
                         print(f"🛑 STOP LOSS (Long) on {s1}-{s2}. Z: {z_score:.2f} <= -{z_stop}. Closing...")
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
 
                 elif pair_info.position_status == -1: # Short spread
                     if z_score <= -z_exit:
                         print(f"💰 TAKE PROFIT (Short) on {s1}-{s2}. Z: {z_score:.2f} <= {-z_exit}. Closing...")
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
                     elif z_score >= z_stop:
                         print(f"🛑 STOP LOSS (Short) on {s1}-{s2}. Z: {z_score:.2f} >= {z_stop}. Closing...")
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
 
@@ -2425,10 +2438,23 @@ class PairsManager:
                         
                         if failed_count == 0 and len(successful_algo_ids) == 4:
                             print(f"🛡️ Protection placed successfully (4 orders)")
+                            # Store algo order mapping for ALGO_UPDATE event handling
+                            pair_key = frozenset([s1, s2])
+                            for i, aid in enumerate(successful_algo_ids):
+                                aid_str = str(aid)  # Ensure consistent string keys
+                                if i == 0:
+                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s1, 'type': 'STOP'}
+                                elif i == 1:
+                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s2, 'type': 'STOP'}
+                                elif i == 2:
+                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s1, 'type': 'TAKE_PROFIT'}
+                                elif i == 3:
+                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s2, 'type': 'TAKE_PROFIT'}
                         elif failed_count > 0:
                             warn_msg = f"⚠️ CRITICAL: Protection partially FAILED for {s1}-{s2} ({failed_count}/4 failed). Force closing!"
                             print(warn_msg)
-                            await self._notify(warn_msg)
+                            reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                            await self._notify(warn_msg, reply_to)
                             
                             # Cancel successfully placed orders using algoId from results
                             if successful_algo_ids:
@@ -2440,15 +2466,18 @@ class PairsManager:
                                     print(f"⚠️ Could not cancel partial orders: {ce}")
                             
                             # Force close position
+                            pair_info.close_handled = True  # Prevent duplicate notification from WS handler
                             pair_info.is_trading = True
                             self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
                             
                     except Exception as e:
                         warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
                         print(warn_msg)
-                        await self._notify(warn_msg)
+                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        await self._notify(warn_msg, reply_to)
                         
                         # Force close position (algo orders will be cancelled by _execute_trade)
+                        pair_info.close_handled = True  # Prevent duplicate notification from WS handler
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
                     # === END HARDWARE SL/TP ===
