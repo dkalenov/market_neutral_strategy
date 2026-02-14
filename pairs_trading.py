@@ -92,6 +92,8 @@ class PairInfo:
     # Close tracking - prevents duplicate notifications
     close_handled: bool = False    # True if bot already processed close notification
     last_close_reason: str = ''    # Reason for last close (for debugging)
+    # Cooldown after stop-loss to prevent immediate re-entry
+    _close_cooldown_until: float = 0.0  # Unix timestamp: skip entry signals until this time
 
 class PairsManager:
     """
@@ -924,6 +926,7 @@ class PairsManager:
                 # Force close the pair (cancels algo orders + closes other leg if needed)
                 pair_info.close_handled = True
                 pair_info.is_trading = True
+                pair_info._triggered_symbol = symbol  # Tell _execute_trade which leg is already closed
                 await self._execute_trade(pair_info, 0, close_reason=close_reason)
                 break
 
@@ -931,7 +934,7 @@ class PairsManager:
         """BACKUP: Periodically check leg sync and cleanup orphaned orders every 30 seconds.
         Primary sync is handled by userdata WebSocket."""
         while True:
-            await asyncio.sleep(30)  # Backup check
+            await asyncio.sleep(5)  # Backup check (5s for fast manual close detection)
             try:
                 await self._check_leg_synchronization()
                 await self._cleanup_orphaned_algo_orders()
@@ -2095,6 +2098,10 @@ class PairsManager:
             if pair_info.position_status != 0:
                 continue  # Skip pairs with open positions
             
+            # Skip pairs in cooldown (recently closed by SL)
+            if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
+                continue
+            
             s1, s2 = pair_info.symbol1, pair_info.symbol2
             if s1 in self.all_data and s2 in self.all_data:
                 await self._check_signals_for_active_pairs(s1)
@@ -2216,84 +2223,183 @@ class PairsManager:
                 if pair_info.position_status == 0:
                     return
 
-                print(f"EXECUTING CLOSE for {s1}-{s2}")
+                print(f"EXECUTING CLOSE for {s1}-{s2} (reason: {close_reason})")
                 
                 # Store close reason IMMEDIATELY so external handlers can see it
                 pair_info.last_close_reason = close_reason or 'unknown'
-                
-                # Cancel all open orders (including algo SL/TP) before closing
-                try:
-                    results = await asyncio.gather(
-                        self.client.cancel_open_orders(symbol=s1),
-                        self.client.cancel_open_orders(symbol=s2),
-                        return_exceptions=True
-                    )
-                    # Log any errors
-                    for i, res in enumerate(results):
-                        if isinstance(res, Exception):
-                            print(f"⚠️ Cancel orders error for {[s1, s2][i]}: {res}")
-                        else:
-                            print(f"🗑️ Cancelled orders for {[s1, s2][i]}")
-                except Exception as e:
-                    print(f"⚠️ Could not cancel orders: {e}")
                 
                 side1_close = 'SELL' if pair_info.position_status == 1 else 'BUY'
                 side2_close = 'BUY' if pair_info.position_status == 1 else 'SELL'
                 qty1_close = pair_info.qty1
                 qty2_close = pair_info.qty2
+                
+                # FAST PATH: For SL/TP triggered closes, one leg is already closed
+                # Close the other leg IMMEDIATELY, cancel orders AFTER
+                is_hardware_close = close_reason in ('hardware_sl', 'hardware_tp')
+                
+                if is_hardware_close:
+                    # One leg already closed by exchange - close the other one ASAP
+                    # Determine which leg is still open
+                    triggered_symbol = getattr(pair_info, '_triggered_symbol', None)
+                    if triggered_symbol == s1:
+                        # s1 closed by SL/TP, close s2
+                        if qty2_close and qty2_close > 0:
+                            try:
+                                await self.client.new_order(
+                                    symbol=s2, side=side2_close, type='MARKET',
+                                    quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT'
+                                )
+                                print(f"✅ FAST closed {s2} (qty={qty2_close})")
+                            except Exception as e:
+                                print(f"⚠️ Fast close {s2} failed: {e}")
+                    elif triggered_symbol == s2:
+                        # s2 closed by SL/TP, close s1
+                        if qty1_close and qty1_close > 0:
+                            try:
+                                await self.client.new_order(
+                                    symbol=s1, side=side1_close, type='MARKET',
+                                    quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT'
+                                )
+                                print(f"✅ FAST closed {s1} (qty={qty1_close})")
+                            except Exception as e:
+                                print(f"⚠️ Fast close {s1} failed: {e}")
+                    else:
+                        # Unknown which leg triggered - close both using stored qty
+                        close_tasks = []
+                        if qty1_close and qty1_close > 0:
+                            close_tasks.append(self.client.new_order(
+                                symbol=s1, side=side1_close, type='MARKET',
+                                quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT'
+                            ))
+                        if qty2_close and qty2_close > 0:
+                            close_tasks.append(self.client.new_order(
+                                symbol=s2, side=side2_close, type='MARKET',
+                                quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT'
+                            ))
+                        if close_tasks:
+                            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+                            for r in results:
+                                if isinstance(r, Exception):
+                                    print(f"⚠️ Close error: {r}")
+                    
+                    # Cancel remaining algo/SL/TP orders AFTER closing
+                    try:
+                        await asyncio.gather(
+                            self.client.cancel_open_orders(symbol=s1),
+                            self.client.cancel_open_orders(symbol=s2),
+                            return_exceptions=True
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Cancel orders error: {e}")
+                
+                    # State cleanup for hardware close
+                    # PnL notification handled by main.py ACCOUNT_UPDATE handler  
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+                    pair_info.current_trade_id = None
+                    
+                    # Update exchange position cache
+                    self._exchange_positions_cache.pop(s1, None)
+                    self._exchange_positions_cache.pop(s2, None)
+                    self._exchange_position_count = len(self._exchange_positions_cache)
+                    
+                    # COOLDOWN after SL
+                    COOLDOWN_REASONS = ('hardware_sl', 'z_sl', 'circuit', 'broken_coint', 'beta_drift', 'beta_critical', 'btc_shock')
+                    if close_reason in COOLDOWN_REASONS:
+                        cooldown_seconds = 300
+                        pair_info._close_cooldown_until = time.time() + cooldown_seconds
+                        print(f"⏸️ Cooldown set for {s1}-{s2}: {cooldown_seconds}s after {close_reason}")
+                    
+                    # Update DB
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0,
+                            'close_time': int(time.time()),
+                            'close_reason': close_reason or 'unknown'
+                        })
+                    
+                    # Trigger re-analysis for freed slot
+                    self.loop.create_task(self._trigger_immediate_analysis())
+                    return  # PnL/notification handled by main.py WebSocket handler
+                
+                else:
+                    # NORMAL CLOSE PATH: cancel orders first, then close both legs
+                    # Cancel all open orders (including algo SL/TP) before closing
+                    try:
+                        results = await asyncio.gather(
+                            self.client.cancel_open_orders(symbol=s1),
+                            self.client.cancel_open_orders(symbol=s2),
+                            return_exceptions=True
+                        )
+                        for i, res in enumerate(results):
+                            if isinstance(res, Exception):
+                                print(f"⚠️ Cancel orders error for {[s1, s2][i]}: {res}")
+                            else:
+                                print(f"🗑️ Cancelled orders for {[s1, s2][i]}")
+                    except Exception as e:
+                        print(f"⚠️ Could not cancel orders: {e}")
 
                 try:
-                    # Check which legs still have open positions
-                    account = await self.client.account()
-                    open_positions = {}
-                    for pos in account.get('positions', []):
-                        amt = float(pos.get('positionAmt', 0))
-                        if amt != 0:
-                            open_positions[pos['symbol']] = amt
-                    
-                    leg1_exists = s1 in open_positions
-                    leg2_exists = s2 in open_positions
-                    
-                    close_tasks = []
-                    close_symbols = []
-                    
-                    if leg1_exists:
-                        close_tasks.append(self.client.new_order(
-                            symbol=s1, side=side1_close, type='MARKET', 
-                            quantity=abs(open_positions[s1]), reduceOnly='true', newOrderRespType='RESULT'
-                        ))
-                        close_symbols.append(s1)
-                    else:
-                        print(f"ℹ️ {s1} already closed, skipping")
+                    if not is_hardware_close:
+                        # Normal path: check which legs still have open positions
+                        account = await self.client.account()
+                        open_positions = {}
+                        for pos in account.get('positions', []):
+                            amt = float(pos.get('positionAmt', 0))
+                            if amt != 0:
+                                open_positions[pos['symbol']] = amt
                         
-                    if leg2_exists:
-                        close_tasks.append(self.client.new_order(
-                            symbol=s2, side=side2_close, type='MARKET', 
-                            quantity=abs(open_positions[s2]), reduceOnly='true', newOrderRespType='RESULT'
-                        ))
-                        close_symbols.append(s2)
-                    else:
-                        print(f"ℹ️ {s2} already closed, skipping")
-                    
-                    if close_tasks:
-                        results = await asyncio.gather(*close_tasks, return_exceptions=True)
-                    else:
-                        results = []
-                    
-                    # Check for errors
-                    errors = []
-                    for i, res in enumerate(results):
-                        if isinstance(res, Exception):
-                            sym = close_symbols[i]
-                            # Simplify error message
-                            err_str = str(res)
-                            if 'ReduceOnly' in err_str:
-                                errors.append(f"{sym}: already closed")
-                            else:
-                                errors.append(f"{sym}: {err_str[:50]}")
+                        leg1_exists = s1 in open_positions
+                        leg2_exists = s2 in open_positions
+                        
+                        close_tasks = []
+                        close_symbols = []
+                        
+                        if leg1_exists:
+                            close_tasks.append(self.client.new_order(
+                                symbol=s1, side=side1_close, type='MARKET', 
+                                quantity=abs(open_positions[s1]), reduceOnly='true', newOrderRespType='RESULT'
+                            ))
+                            close_symbols.append(s1)
                         else:
-                            if close_symbols:
-                                print(f"✅ Closed {close_symbols[i]}")
+                            print(f"ℹ️ {s1} already closed, skipping")
+                            
+                        if leg2_exists:
+                            close_tasks.append(self.client.new_order(
+                                symbol=s2, side=side2_close, type='MARKET', 
+                                quantity=abs(open_positions[s2]), reduceOnly='true', newOrderRespType='RESULT'
+                            ))
+                            close_symbols.append(s2)
+                        else:
+                            print(f"ℹ️ {s2} already closed, skipping")
+                        
+                        if close_tasks:
+                            results = await asyncio.gather(*close_tasks, return_exceptions=True)
+                        else:
+                            results = []
+                        
+                        # Check for errors
+                        errors = []
+                        for i, res in enumerate(results):
+                            if isinstance(res, Exception):
+                                sym = close_symbols[i]
+                                # Simplify error message
+                                err_str = str(res)
+                                if 'ReduceOnly' in err_str:
+                                    errors.append(f"{sym}: already closed")
+                                else:
+                                    errors.append(f"{sym}: {err_str[:50]}")
+                            else:
+                                if close_symbols:
+                                    print(f"✅ Closed {close_symbols[i]}")
                 
                     if errors:
                         err_msg = f"⚠️ Close {s1}-{s2}: {', '.join(errors)}"
@@ -2471,6 +2577,14 @@ class PairsManager:
                         # AUTO-ADD to best_pairs.json on successful TP
                         if close_reason in ('z_tp', 'hardware_tp') or total_pnl > 0:
                             self._add_to_best_pairs(s1, s2)
+                        
+                        # COOLDOWN: After stop-loss or forced close, prevent immediate re-entry
+                        # This prevents the exact same pair from re-opening right after SL
+                        COOLDOWN_REASONS = ('hardware_sl', 'z_sl', 'circuit', 'broken_coint', 'beta_drift', 'beta_critical', 'btc_shock')
+                        if close_reason in COOLDOWN_REASONS:
+                            cooldown_seconds = 300  # 5 minutes
+                            pair_info._close_cooldown_until = time.time() + cooldown_seconds
+                            print(f"⏸️ Cooldown set for {s1}-{s2}: {cooldown_seconds}s after {close_reason}")
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -3047,6 +3161,10 @@ class PairsManager:
             z_entry = getattr(self.config, 'z_entry', 2.0) or 2.0
             z_entry_max = getattr(self.config, 'z_entry_max', 3.0) or 3.0
             
+            # Skip entry if pair is in cooldown after SL
+            if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
+                continue
+            
             # Check if signal (between z_entry and z_entry_max)
             # Reject if already too extreme - spread may be broken
             if abs(z_score) >= z_entry and abs(z_score) < z_entry_max:
@@ -3347,6 +3465,13 @@ class PairsManager:
                                     # Check cooldown from failed leverage/trade
                                     fail_until = getattr(pair_info, '_leverage_fail_until', 0)
                                     if fail_until and time.time() < fail_until:
+                                        continue
+                                    
+                                    # Check cooldown after stop-loss close
+                                    close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
+                                    if close_cooldown and time.time() < close_cooldown:
+                                        remaining = int(close_cooldown - time.time())
+                                        print(f"⏸️ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
                                         continue
                                     
                                     direction = 1 if current_z < 0 else -1

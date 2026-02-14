@@ -558,23 +558,24 @@ async def ws_user_msg(ws, msg):
         
         processed_pairs = set()  # Track pairs we've already handled in this update
         
+        # PHASE 1: Pre-mark ALL affected pairs to prevent leg sync from racing
+        # Collect pairs to process BEFORE doing any async work
+        pairs_to_process = []  # List of (pair_set, pair_info, symbol, other_symbol, other_closed_in_batch)
+        
         for pos in positions:
             symbol = pos.get('s')
             position_amt = float(pos.get('pa', 0))
             
-            # Position closed (amount = 0)
             if position_amt == 0 and pairs_manager:
-                # Check if this symbol is part of an active pair
                 for pair_set, pair_info in list(pairs_manager.active_pairs.items()):
-                    # Skip if already processed in this batch
                     if pair_set in processed_pairs:
                         continue
-                        
+                    
                     if pair_info.position_status != 0 and symbol in [pair_info.symbol1, pair_info.symbol2]:
                         s1, s2 = pair_info.symbol1, pair_info.symbol2
                         other_symbol = s2 if symbol == s1 else s1
                         
-                        # VALIDATION: Skip stale pairs where symbols don't exist anymore
+                        # VALIDATION: Skip stale pairs
                         if s1 not in pairs_manager.all_symbols or s2 not in pairs_manager.all_symbols:
                             print(f"⚠️ Skipping stale pair {s1}-{s2}: symbols not in trading list. Cleaning up...")
                             pair_info.position_status = 0
@@ -590,323 +591,347 @@ async def ws_user_msg(ws, msg):
                                 })
                             continue
                         
-                        # Check if both legs were closed in this same update (bulk close)
                         other_closed_in_batch = any(
                             p.get('s') == other_symbol and float(p.get('pa', 0)) == 0 
                             for p in positions
                         )
                         
-                        pnl = float(pos.get('up', 0))
-                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                        
-                        # Mark as processed in THIS batch only (prevents duplicate handling in same message)
                         processed_pairs.add(pair_set)
-                        
-                        # Set is_trading to prevent duplicate handling from pairs_trading leg sync
+                        # CRITICAL: Set is_trading NOW to prevent leg sync from racing
                         pair_info.is_trading = True
                         
-                        if other_closed_in_batch:
-                            # Check if bot already handled this close (prevent duplicate notification)
-                            if getattr(pair_info, 'close_handled', False):
-                                print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping external notification")
-                                pair_info.close_handled = False  # Reset for next trade
-                                continue
+                        pairs_to_process.append((pair_set, pair_info, symbol, other_symbol, other_closed_in_batch))
+                        break  # Found the pair for this symbol
+        
+        # PHASE 2: Process each pair (now safe from leg sync races)
+        for pair_set, pair_info, symbol, other_symbol, other_closed_in_batch in pairs_to_process:
+            s1, s2 = pair_info.symbol1, pair_info.symbol2
+            
+            if other_closed_in_batch:
+                # Check if bot already handled this close (prevent duplicate notification)
+                if getattr(pair_info, 'close_handled', False):
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping external notification")
+                    pair_info.close_handled = False  # Reset for next trade
+                    continue
+                
+                # Both legs closed together - fetch actual PnL and cleanup
+                print(f"⚡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
+                try:
+                    await client.cancel_open_orders(s1)
+                    await client.cancel_open_orders(s2)
+                    
+                    # Small delay to ensure trade data is available
+                    await asyncio.sleep(1)
+                    
+                    # Fetch actual PnL from recent trades
+                    now_ms = int(time_mod.time() * 1000)
+                    start_ms = now_ms - 300_000  # Last 5 minutes
+                    
+                    trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                    trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    
+                    print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                    print(f"📊 Trades for {s2}: {len(trades2)} entries")
+                    
+                    pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                    pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                    fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                    fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                    total_pnl = pnl1 + pnl2
+                    total_fees = fee1 + fee2
+                    net_pnl = total_pnl
+                    
+                    # Determine close reason
+                    close_type = '❓ Unknown'
+                    close_hint = '\n💡 Check exchange for details'
+                    
+                    stored_reason = getattr(pair_info, 'last_close_reason', '')
+                    if stored_reason and stored_reason in CLOSE_REASONS:
+                        close_type = CLOSE_REASONS[stored_reason]
+                        close_hint = ''
+                        print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
+                    else:
+                        try:
+                            orders1 = await client.get_all_orders(symbol=s1, limit=15)
+                            orders2 = await client.get_all_orders(symbol=s2, limit=15)
                             
-                            # Both legs closed together - fetch actual PnL and cleanup
-                            print(f"⚡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
-                            try:
-                                await client.cancel_open_orders(s1)
-                                await client.cancel_open_orders(s2)
+                            now_ms = int(time_mod.time() * 1000)
+                            recent_orders = []
+                            for o in orders1 + orders2:
+                                if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                    recent_orders.append(o)
+                            
+                            if recent_orders:
+                                recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
+                                o = recent_orders[0]
+                                o_type = o.get('type', '') or o.get('origType', '')
                                 
-                                # Small delay to ensure trade data is available
-                                await asyncio.sleep(1)
-                                
-                                # Fetch actual PnL from recent trades (more reliable than Income API)
-                                now_ms = int(time_mod.time() * 1000)
-                                start_ms = now_ms - 300_000  # Last 5 minutes
-                                
-                                trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
-                                trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
-                                
-                                # Debug: show what API returned
-                                print(f"📊 Trades for {s1}: {len(trades1)} entries")
-                                print(f"📊 Trades for {s2}: {len(trades2)} entries")
-                                
-                                # Sum realized PnL and commissions from trades
-                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
-                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
-                                fee1 = sum(float(t.get('commission', 0)) for t in trades1)
-                                fee2 = sum(float(t.get('commission', 0)) for t in trades2)
-                                total_pnl = pnl1 + pnl2
-                                total_fees = fee1 + fee2
-                                
-                                # realizedPnl from Binance ALREADY includes fee deduction
-                                # So net_pnl = total_pnl (fees shown for info only)
-                                net_pnl = total_pnl
-                                
-                                # Determine close reason from trade data
-                                close_type = '❓ Unknown'
-                                close_hint = '\n💡 Check exchange for details'
-                                
-                                # FIRST: Check if bot stored exact reason
-                                stored_reason = getattr(pair_info, 'last_close_reason', '')
-                                if stored_reason and stored_reason in CLOSE_REASONS:
-                                    close_type = CLOSE_REASONS[stored_reason]
-                                    close_hint = ''
-                                    print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
+                                if 'STOP' in o_type:
+                                    close_type = '🛡️ Hardware SL'
+                                elif 'TAKE_PROFIT' in o_type:
+                                    close_type = '🛡️ Hardware TP'
+                                elif o_type == 'MARKET':
+                                    close_type = '👤 Manual Market' if not o.get('reduceOnly') else '🤖 Bot Close'
+                                elif o_type == 'LIMIT':
+                                    close_type = '📊 Limit Order'
+                                elif 'TRAILING' in o_type:
+                                    close_type = '📈 Trailing Stop'
                                 else:
-                                    # FALLBACK: Query orders to detect external close type
-                                    try:
-                                        orders1 = await client.get_all_orders(symbol=s1, limit=15)
-                                        orders2 = await client.get_all_orders(symbol=s2, limit=15)
-                                        
-                                        now_ms = int(time_mod.time() * 1000)
-                                        recent_orders = []
-                                        for o in orders1 + orders2:
-                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
-                                                recent_orders.append(o)
-                                        
-                                        if recent_orders:
-                                            recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
-                                            o = recent_orders[0]
-                                            o_type = o.get('type', '') or o.get('origType', '')
-                                            
-                                            if 'STOP' in o_type:
-                                                close_type = '🛡️ Hardware SL'
-                                            elif 'TAKE_PROFIT' in o_type:
-                                                close_type = '🛡️ Hardware TP'
-                                            elif o_type == 'MARKET':
-                                                close_type = '👤 Manual Market' if not o.get('reduceOnly') else '🤖 Bot Close'
-                                            elif o_type == 'LIMIT':
-                                                close_type = '📊 Limit Order'
-                                            elif 'TRAILING' in o_type:
-                                                close_type = '📈 Trailing Stop'
-                                            else:
-                                                close_type = f'⚡ {o_type}'
-                                            print(f"📋 Detected: {o_type} -> {close_type}")
-                                        else:
-                                            close_type = '⚡ External Close'
-                                            close_hint = ' (no orders found)'
-                                            print(f"⚠️ No orders for {s1}/{s2}")
-                                    except Exception as e:
-                                        print(f"⚠️ Query error: {e}")
-                                        close_type = '⚡ External'
-                                
-                                pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
-                                # Calculate real-time Z-score (last_z_score may be stale)
-                                try:
-                                    p1 = pairs_manager.last_prices.get(s1, 0)
-                                    p2 = pairs_manager.last_prices.get(s2, 0)
-                                    if p1 > 0 and p2 > 0:
-                                        zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
-                                        if math.isnan(zscore):
-                                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
-                                    else:
-                                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
-                                except Exception:
-                                    zscore = getattr(pair_info, 'last_z_score', 0) or 0
-                                beta = getattr(pair_info, 'beta_btc', 0) or 0
-                                e1 = '🟢' if pnl1 >= 0 else '🔴'
-                                e2 = '🟢' if pnl2 >= 0 else '🔴'
-                                done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
-                                            f"📊 Z: {zscore:+.2f} | β: {beta:.3f}\n"
-                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
-                                            f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
-                                            f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
-                                
-                                reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                                await send_tg_notification(done_msg, reply_to)
-                                
-                                # Update memory state
-                                pair_info.position_status = 0
-                                pair_info.qty1 = 0
-                                pair_info.qty2 = 0
-                                pair_info.is_trading = False
-                                
-                                # Update DB with PnL details
-                                if pair_info.db_id:
-                                    await db.update_pair({
-                                        'id': pair_info.db_id,
-                                        'position_status': 0,
-                                        'qty1': 0,
-                                        'qty2': 0,
-                                        'close_time': int(time_mod.time()),
-                                        'close_pnl': net_pnl,
-                                        'close_reason': stored_reason if stored_reason else 'external',
-                                        'pnl1': pnl1,
-                                        'pnl2': pnl2,
-                                        'fee1': fee1,
-                                        'fee2': fee2
-                                    })
-                            except Exception as e:
-                                print(f"⚠️ Cleanup error: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                    close_type = f'⚡ {o_type}'
+                                print(f"📋 Detected: {o_type} -> {close_type}")
+                            else:
+                                close_type = '⚡ External Close'
+                                close_hint = ' (no orders found)'
+                                print(f"⚠️ No orders for {s1}/{s2}")
+                        except Exception as e:
+                            print(f"⚠️ Query error: {e}")
+                            close_type = '⚡ External'
+                    
+                    pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                    try:
+                        p1 = pairs_manager.last_prices.get(s1, 0)
+                        p2 = pairs_manager.last_prices.get(s2, 0)
+                        if p1 > 0 and p2 > 0:
+                            zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
+                            if math.isnan(zscore):
+                                zscore = getattr(pair_info, 'last_z_score', 0) or 0
                         else:
-                            # Only one leg closed - check if bot is already handling this
-                            if getattr(pair_info, 'close_handled', False):
-                                print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping single-leg handler")
-                                pair_info.is_trading = False
-                                continue
+                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    except Exception:
+                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    beta = getattr(pair_info, 'beta_btc', 0) or 0
+                    close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                    # Format half-life
+                    hl = getattr(pair_info, 'half_life', 0) or 0
+                    if hl > 0:
+                        if hl >= 24:
+                            hl_d = int(hl // 24)
+                            hl_h = int(hl % 24)
+                            close_hl = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
+                        else:
+                            hl_h = int(hl)
+                            hl_m = int((hl - hl_h) * 60)
+                            close_hl = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
+                    else:
+                        close_hl = 'N/A'
+                    hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
+                    e1 = '🟢' if pnl1 >= 0 else '🔴'
+                    e2 = '🟢' if pnl2 >= 0 else '🔴'
+                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
+                                f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
+                                f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
+                                f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
+                                f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
+                    
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await send_tg_notification(done_msg, reply_to)
+                    
+                    # Update memory state
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.is_trading = False
+                    
+                    # Update DB
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'close_time': int(time_mod.time()),
+                            'close_pnl': net_pnl,
+                            'close_reason': stored_reason if stored_reason else 'external',
+                            'pnl1': pnl1,
+                            'pnl2': pnl2,
+                            'fee1': fee1,
+                            'fee2': fee2
+                        })
+                except Exception as e:
+                    print(f"⚠️ Cleanup error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                # Only one leg closed - check if bot is already handling this
+                if getattr(pair_info, 'close_handled', False):
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping single-leg handler")
+                    pair_info.is_trading = False
+                    continue
+                
+                # External close - user manually closed one position
+                print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol} IMMEDIATELY...")
+                pair_info.last_close_reason = 'manual_partial'
+                try:
+                    # PRIORITY: Close the other leg FIRST using stored qty (no API query needed)
+                    # Determine qty and direction from pair_info
+                    is_other_s1 = (other_symbol == pair_info.symbol1)
+                    other_qty = pair_info.qty1 if is_other_s1 else pair_info.qty2
+                    
+                    if other_qty and other_qty > 0:
+                        # Determine side: if pair_info.position_status=1, s1 is LONG, s2 is SHORT
+                        # if position_status=-1, s1 is SHORT, s2 is LONG
+                        if is_other_s1:
+                            is_long = pair_info.position_status == 1
+                        else:
+                            is_long = pair_info.position_status == -1
+                        close_side = 'SELL' if is_long else 'BUY'
+                        
+                        await client.new_order(symbol=other_symbol, side=close_side, type='MARKET',
+                                              quantity=other_qty, reduceOnly='true')
+                        print(f"✅ Closed remaining leg {other_symbol} (qty={other_qty}, side={close_side})")
+                    else:
+                        # Fallback: query exchange if stored qty is missing
+                        positions_data = await client.get_position_risk(symbol=other_symbol)
+                        other_pos = positions_data[0] if positions_data else {}
+                        other_amt = float(other_pos.get('positionAmt', 0))
+                        if other_amt != 0:
+                            close_side = 'SELL' if other_amt > 0 else 'BUY'
+                            await client.new_order(symbol=other_symbol, side=close_side, type='MARKET',
+                                                  quantity=abs(other_amt), reduceOnly='true')
+                            print(f"✅ Closed remaining leg {other_symbol} (fallback, qty={abs(other_amt)})")
+                    
+                    # THEN cancel remaining algo/SL/TP orders (non-critical, can be slower)
+                    try:
+                        await client.cancel_open_orders(s1)
+                        await client.cancel_open_orders(s2)
+                    except Exception as cancel_err:
+                        print(f"⚠️ Cancel orders error (non-critical): {cancel_err}")
+                    
+                    await asyncio.sleep(1)
+                    
+                    now_ms = int(time_mod.time() * 1000)
+                    start_ms = now_ms - 300_000
+                    
+                    trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
+                    trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    
+                    print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                    print(f"📊 Trades for {s2}: {len(trades2)} entries")
+                    
+                    pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                    pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                    fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                    fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                    total_pnl = pnl1 + pnl2
+                    total_fees = fee1 + fee2
+                    net_pnl = total_pnl
+                    
+                    pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+                    
+                    # Update memory state
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.is_trading = False
+                    
+                    stored_reason = getattr(pair_info, 'last_close_reason', '')
+                    
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'close_time': int(time_mod.time()),
+                            'close_pnl': net_pnl,
+                            'close_reason': stored_reason if stored_reason else 'external',
+                            'pnl1': pnl1,
+                            'pnl2': pnl2,
+                            'fee1': fee1,
+                            'fee2': fee2
+                        })
+                    
+                    close_type = '❓ Unknown'
+                    close_hint = ''
+                    
+                    if stored_reason and stored_reason in CLOSE_REASONS:
+                        close_type = CLOSE_REASONS[stored_reason]
+                        print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
+                    else:
+                        try:
+                            orders1 = await client.get_all_orders(symbol=s1, limit=15)
+                            orders2 = await client.get_all_orders(symbol=s2, limit=15)
                             
-                            # External close - user manually closed one position
-                            print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol}...")
-                            pair_info.last_close_reason = 'manual_partial'  # User manually closed one leg
-                            try:
-                                await client.cancel_open_orders(s1)
-                                await client.cancel_open_orders(s2)
+                            now_time = int(time_mod.time() * 1000)
+                            recent_orders = []
+                            for o in orders1 + orders2:
+                                if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_time - 300_000:
+                                    recent_orders.append(o)
+                            
+                            if recent_orders:
+                                recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
+                                o = recent_orders[0]
+                                o_type = o.get('type', '') or o.get('origType', '')
                                 
-                                # Use get_position_risk to get position info
-                                positions_data = await client.get_position_risk(symbol=other_symbol)
-                                other_pos = positions_data[0] if positions_data else {}
-                                other_amt = float(other_pos.get('positionAmt', 0))
-                                
-                                if other_amt != 0:
-                                    close_side = 'SELL' if other_amt > 0 else 'BUY'
-                                    await client.new_order(symbol=other_symbol, side=close_side, type='MARKET', 
-                                                          quantity=abs(other_amt), reduceOnly='true')
-                                    print(f"✅ Closed remaining leg {other_symbol}")
-                                
-                                # Small delay to ensure trade data is available
-                                await asyncio.sleep(1)
-                                
-                                # Fetch actual PnL from recent trades (more reliable than Income API)
-                                now_ms = int(time_mod.time() * 1000)
-                                start_ms = now_ms - 300_000  # Last 5 minutes
-                                
-                                trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
-                                trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
-                                
-                                # Debug: show what API returned
-                                print(f"📊 Trades for {s1}: {len(trades1)} entries")
-                                print(f"📊 Trades for {s2}: {len(trades2)} entries")
-                                
-                                # Sum realized PnL and commissions from trades
-                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
-                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
-                                fee1 = sum(float(t.get('commission', 0)) for t in trades1)
-                                fee2 = sum(float(t.get('commission', 0)) for t in trades2)
-                                total_pnl = pnl1 + pnl2
-                                total_fees = fee1 + fee2
-                                
-                                # realizedPnl from Binance ALREADY includes fee deduction
-                                net_pnl = total_pnl
-                                
-                                pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
-                                
-                                # Update memory state
-                                pair_info.position_status = 0
-                                pair_info.qty1 = 0
-                                pair_info.qty2 = 0
-                                pair_info.is_trading = False
-                                
-                                # Get stored reason from pair_info (set by bot when closing)
-                                stored_reason = getattr(pair_info, 'last_close_reason', '')
-                                
-                                # Update DB with PnL details
-                                if pair_info.db_id:
-                                    await db.update_pair({
-                                        'id': pair_info.db_id,
-                                        'position_status': 0,
-                                        'qty1': 0,
-                                        'qty2': 0,
-                                        'close_time': int(time_mod.time()),
-                                        'close_pnl': net_pnl,
-                                        'close_reason': stored_reason if stored_reason else 'external',
-                                        'pnl1': pnl1,
-                                        'pnl2': pnl2,
-                                        'fee1': fee1,
-                                        'fee2': fee2
-                                    })
-                                
-                                # Use canonical CLOSE_REASONS from pairs_trading module
-                                
-                                # Default values (in case no reason is found)
-                                close_type = '❓ Unknown'
-                                close_hint = ''
-                                
-                                # FIRST: Check if bot stored exact reason
-                                stored_reason = getattr(pair_info, 'last_close_reason', '')
-                                if stored_reason and stored_reason in CLOSE_REASONS:
-                                    close_type = CLOSE_REASONS[stored_reason]
-                                    close_hint = ''
-                                    print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
-                                else:
-                                    # FALLBACK: Query orders to detect external close type
-                                    try:
-                                        orders1 = await client.get_all_orders(symbol=s1, limit=15)
-                                        orders2 = await client.get_all_orders(symbol=s2, limit=15)
-                                        
-                                        now_time = int(time_mod.time() * 1000)
-                                        recent_orders = []
-                                        for o in orders1 + orders2:
-                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_time - 300_000:
-                                                recent_orders.append(o)
-                                        
-                                        if recent_orders:
-                                            # Sort by time, newest first
-                                            recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
-                                            o = recent_orders[0]
-                                            o_type = o.get('type', '') or o.get('origType', '')
-                                            
-                                            if 'STOP' in o_type:
-                                                close_type = '🛡️ Hardware SL'
-                                            elif 'TAKE_PROFIT' in o_type:
-                                                close_type = '🛡️ Hardware TP'
-                                            elif o_type == 'MARKET':
-                                                # Check if reduceOnly - that's bot closing
-                                                if o.get('reduceOnly', False):
-                                                    close_type = '🤖 Bot Close (reason unknown)'
-                                                else:
-                                                    close_type = '👤 Manual Market Order'
-                                            elif o_type == 'LIMIT':
-                                                close_type = '📊 Limit Order Filled'
-                                            elif 'TRAILING' in o_type:
-                                                close_type = '📈 Trailing Stop'
-                                            else:
-                                                close_type = f'⚡ Order: {o_type}'
-                                            
-                                            print(f"📋 Detected from orders: {o_type} -> {close_type}")
-                                        else:
-                                            # No recent orders found - truly external or WebSocket miss
-                                            close_type = '⚡ External Close'
-                                            close_hint = ' (no matching orders)'
-                                            print(f"⚠️ No recent orders found for {s1}/{s2} - external close")
-                                            
-                                    except Exception as e:
-                                        print(f"⚠️ Could not query orders: {e}")
-                                        close_type = '⚡ External Close'
-                                        close_hint = ' (query failed)'
-                                
-                                pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
-                                # Calculate real-time Z-score (last_z_score may be stale)
-                                try:
-                                    p1 = pairs_manager.last_prices.get(s1, 0)
-                                    p2 = pairs_manager.last_prices.get(s2, 0)
-                                    if p1 > 0 and p2 > 0:
-                                        zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
-                                        if math.isnan(zscore):
-                                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                                if 'STOP' in o_type:
+                                    close_type = '🛡️ Hardware SL'
+                                elif 'TAKE_PROFIT' in o_type:
+                                    close_type = '🛡️ Hardware TP'
+                                elif o_type == 'MARKET':
+                                    if o.get('reduceOnly', False):
+                                        close_type = '🤖 Bot Close (reason unknown)'
                                     else:
-                                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
-                                except Exception:
-                                    zscore = getattr(pair_info, 'last_z_score', 0) or 0
-                                beta = getattr(pair_info, 'beta_btc', 0) or 0
-                                e1 = '🟢' if pnl1 >= 0 else '🔴'
-                                e2 = '🟢' if pnl2 >= 0 else '🔴'
-                                done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
-                                            f"📊 Z: {zscore:+.2f} | β: {beta:.3f}\n"
-                                            f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
-                                            f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
-                                            f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
-                                reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                                await send_tg_notification(done_msg, reply_to)
-                                
-                            except Exception as e:
-                                print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
-                                import traceback
-                                traceback.print_exc()
-                        break
+                                        close_type = '👤 Manual Market Order'
+                                elif o_type == 'LIMIT':
+                                    close_type = '📊 Limit Order Filled'
+                                elif 'TRAILING' in o_type:
+                                    close_type = '📈 Trailing Stop'
+                                else:
+                                    close_type = f'⚡ Order: {o_type}'
+                                print(f"📋 Detected from orders: {o_type} -> {close_type}")
+                            else:
+                                close_type = '⚡ External Close'
+                                close_hint = ' (no matching orders)'
+                                print(f"⚠️ No recent orders found for {s1}/{s2}")
+                        except Exception as e:
+                            print(f"⚠️ Could not query orders: {e}")
+                            close_type = '⚡ External Close'
+                            close_hint = ' (query failed)'
+                    
+                    pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
+                    try:
+                        p1 = pairs_manager.last_prices.get(s1, 0)
+                        p2 = pairs_manager.last_prices.get(s2, 0)
+                        if p1 > 0 and p2 > 0:
+                            zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
+                            if math.isnan(zscore):
+                                zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                        else:
+                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    except Exception:
+                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    beta = getattr(pair_info, 'beta_btc', 0) or 0
+                    close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                    # Format half-life
+                    hl = getattr(pair_info, 'half_life', 0) or 0
+                    if hl > 0:
+                        if hl >= 24:
+                            hl_d = int(hl // 24)
+                            hl_h = int(hl % 24)
+                            close_hl = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
+                        else:
+                            hl_h = int(hl)
+                            hl_m = int((hl - hl_h) * 60)
+                            close_hl = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
+                    else:
+                        close_hl = 'N/A'
+                    hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
+                    e1 = '🟢' if pnl1 >= 0 else '🔴'
+                    e2 = '🟢' if pnl2 >= 0 else '🔴'
+                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
+                                f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
+                                f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
+                                f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
+                                f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await send_tg_notification(done_msg, reply_to)
+                    
+                except Exception as e:
+                    print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
+                    import traceback
+                    traceback.print_exc()
     
     # Check for ORDER_TRADE_UPDATE (order filled/canceled)
     if msg.get('e') == 'ORDER_TRADE_UPDATE':

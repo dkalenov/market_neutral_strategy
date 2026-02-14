@@ -161,7 +161,8 @@ async def start_callback(callback: CallbackQuery, state: FSMContext):
     # Create keyboard
     keyboard = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Statistics"), KeyboardButton(text="Settings")],
-        [KeyboardButton(text="Blacklist"), KeyboardButton(text="Main Menu")]
+        [KeyboardButton(text="Blacklist"), KeyboardButton(text="🔴 Close Positions")],
+        [KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     await callback.message.answer("Main Menu", reply_markup=keyboard)
     await callback.answer()
@@ -215,6 +216,38 @@ async def open_trades(message: Message | CallbackQuery, state: FSMContext):
                     s2_info = pnl_by_symbol.get(s2, {})
                     
                     text += f"\n\n<b>{direction}</b> {s1}/{s2}"
+                    
+                    # Statistical info
+                    import math
+                    try:
+                        p1 = pairs_manager.last_prices.get(s1, 0)
+                        p2 = pairs_manager.last_prices.get(s2, 0)
+                        if p1 > 0 and p2 > 0:
+                            zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
+                            if math.isnan(zscore):
+                                zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                        else:
+                            zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    except Exception:
+                        zscore = getattr(pair_info, 'last_z_score', 0) or 0
+                    beta = getattr(pair_info, 'beta_btc', 0) or 0
+                    pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                    hl = getattr(pair_info, 'half_life', 0) or 0
+                    if hl > 0:
+                        if hl >= 24:
+                            hl_d = int(hl // 24)
+                            hl_h = int(hl % 24)
+                            hl_str = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
+                        else:
+                            hl_h = int(hl)
+                            hl_m = int((hl - hl_h) * 60)
+                            hl_str = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
+                    else:
+                        hl_str = 'N/A'
+                    hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
+                    
+                    text += f"\n  📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {pval:.4f}"
+                    text += f"\n  ⏳ HL: {hl_str} | Hedge: {hedge:.4f}"
                     text += f"\n  {s1}: {s1_info.get('side', '?')} @ {s1_info.get('entry', 0):.4f}"
                     text += f" → {pnl1:+.2f}"
                     text += f"\n  {s2}: {s2_info.get('side', '?')} @ {s2_info.get('entry', 0):.4f}"
