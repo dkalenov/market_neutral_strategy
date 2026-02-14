@@ -944,12 +944,10 @@ class PairsManager:
                             print(f"✅ Closed remaining leg {remaining_leg}")
                         
                         # Wait for trade data to be available
-                        import asyncio
                         await asyncio.sleep(1)
                         
                         # Fetch actual PnL from recent trades
-                        import time as time_mod
-                        now_ms = int(time_mod.time() * 1000)
+                        now_ms = int(time.time() * 1000)
                         start_ms = now_ms - 300_000  # Last 5 minutes
                         
                         trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
@@ -981,7 +979,7 @@ class PairsManager:
                                 'position_status': 0,
                                 'qty1': 0,
                                 'qty2': 0,
-                                'close_time': int(time_mod.time()),
+                                'close_time': int(time.time()),
                                 'close_pnl': total_pnl,
                                 'close_reason': 'desync',
                                 'pnl1': pnl1,
@@ -1814,17 +1812,19 @@ class PairsManager:
             return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
 
     async def _set_leverage(self, symbol, leverage):
-        """Sets leverage for the symbol if not already set."""
+        """Sets leverage for the symbol if not already set. Returns True on success."""
         if not leverage or leverage < 1:
-            return
+            return True
         if self.leverage_cache.get(symbol) == leverage:
-            return
+            return True
         try:
             print(f"⚖️ Setting leverage {leverage}x for {symbol}...")
             await self.client.change_leverage(symbol=symbol, leverage=leverage)
             self.leverage_cache[symbol] = leverage
+            return True
         except Exception as e:
             print(f"⚠️ Failed to set leverage for {symbol}: {e}")
+            return False
 
     def _add_to_best_pairs(self, symbol1: str, symbol2: str):
         """
@@ -1949,8 +1949,18 @@ class PairsManager:
                 pair_info.position_status = direction  # Tentatively set to prevent other trades
             
             # Now proceed with actual execution (lock released for API calls)
-            await self._set_leverage(s1, leverage)
-            await self._set_leverage(s2, leverage)
+            lev1_ok = await self._set_leverage(s1, leverage)
+            lev2_ok = await self._set_leverage(s2, leverage)
+            
+            if not lev1_ok or not lev2_ok:
+                print(f"[X] Trade aborted for {s1}-{s2}: leverage setting failed")
+                pair_info.position_status = 0
+                pair_info.is_trading = False
+                # Cooldown to prevent immediate retry
+                pair_info.pending_signal = None
+                pair_info.pending_since = None
+                pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
+                return
         
         try:
             if direction == 0:
@@ -2249,6 +2259,46 @@ class PairsManager:
             print(f"  {side1} {qty1_rounded} {s1} at {s1_price}")
             print(f"  {side2} {qty2_rounded} {s2} at {s2_price}")
 
+            # === PRE-FLIGHT: Validate both positions can be opened ===
+            try:
+                preflight_ok = True
+                for sym, qty, price in [(s1, qty1_rounded, s1_price), (s2, qty2_rounded, s2_price)]:
+                    notional = qty * price
+                    brackets = await self.client.leverage_brackets(symbol=sym)
+                    if brackets:
+                        # Find the bracket for our leverage level
+                        bracket_data = brackets[0] if isinstance(brackets, list) else brackets
+                        bracket_list = bracket_data.get('brackets', [])
+                        max_notional = None
+                        for b in bracket_list:
+                            if b.get('initialLeverage', 0) >= leverage:
+                                max_notional = float(b.get('notionalCap', 0))
+                                break
+                        
+                        if max_notional and notional > max_notional:
+                            print(f"🚫 PRE-FLIGHT FAIL: {sym} notional ${notional:.2f} exceeds max ${max_notional:.2f} at {leverage}x leverage")
+                            preflight_ok = False
+                            break
+                        
+                        # Also check if leverage is even supported
+                        max_lev = max((b.get('initialLeverage', 0) for b in bracket_list), default=0)
+                        if leverage > max_lev:
+                            print(f"🚫 PRE-FLIGHT FAIL: {sym} max leverage is {max_lev}x, requested {leverage}x")
+                            preflight_ok = False
+                            break
+                
+                if not preflight_ok:
+                    print(f"🚫 Trade aborted for {s1}-{s2}: pre-flight validation failed")
+                    pair_info.position_status = 0
+                    pair_info.is_trading = False
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
+                    return
+                    
+            except Exception as e:
+                print(f"⚠️ Pre-flight check warning (proceeding): {e}")
+
             try:
                 task1 = self.loop.create_task(
                     self.client.new_order(symbol=s1, side=side1, type='MARKET', quantity=qty1_rounded, newOrderRespType='RESULT')
@@ -2269,6 +2319,11 @@ class PairsManager:
             
                 if has_error:
                     print("ERROR: Orders failed. Reverting executed legs...")
+                    
+                    # CRITICAL: Prevent WS handler from spamming "Manual Close" during revert
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
+                    
                     revert_tasks = []
                     for executed in executed_orders:
                         try:
@@ -2286,6 +2341,13 @@ class PairsManager:
                         await asyncio.gather(*revert_tasks, return_exceptions=True)
                 
                     pair_info.position_status = 0
+                    pair_info.is_trading = False
+                    pair_info.close_handled = False  # Reset after revert completes
+                    
+                    # Cooldown to prevent immediate retry loop
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
                 else:
                     pair_info.position_status = direction
                     pair_info.qty1 = float(executed_orders[0]['executedQty'])
@@ -2302,7 +2364,6 @@ class PairsManager:
                     pair_info.entry_price2 = get_price(executed_orders[1])
                     
                     # Set open time
-                    import time
                     from datetime import datetime
                     pair_info.open_time = int(time.time())
                     open_dt = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2635,6 +2696,11 @@ class PairsManager:
                             if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
                                 # Check can open
                                 if self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
+                                    # Check cooldown from failed leverage/trade
+                                    fail_until = getattr(pair_info, '_leverage_fail_until', 0)
+                                    if fail_until and time.time() < fail_until:
+                                        continue
+                                    
                                     direction = 1 if current_z < 0 else -1
                                     pair_info.entry_z_score = current_z
                                     print(f"✅ Signal CONFIRMED for {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f}. Opening position...")
