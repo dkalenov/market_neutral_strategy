@@ -68,10 +68,12 @@ def calculate_half_life(spread):
 
 from numpy.linalg import LinAlgError
 
-def calculate_cointegration(log1, log2, p_value_threshold: float = 0.05):
+def calculate_cointegration(log1, log2, p_value_threshold: float = 0.05, strict_hl: bool = True):
     """
     log1, log2: numpy arrays of log(prices) (length WINDOW)
     p_value_threshold: Maximum p-value for valid cointegration (default 0.05)
+    strict_hl: If True (discovery mode), reject pairs with bad half-life (NaN/<=0/>200).
+               If False (monitoring mode), only check p-value + t-stat, return hl as-is.
     Returns:
         flag (0/1), hedge_ratio (beta), half_life, p_value
     """
@@ -94,7 +96,7 @@ def calculate_cointegration(log1, log2, p_value_threshold: float = 0.05):
         except Exception:
             t_check = True
 
-        if np.isnan(hl) or hl <= 0 or hl > 200:
+        if strict_hl and (np.isnan(hl) or hl <= 0 or hl > 200):
             return 0, hedge, np.nan, safe_p_value
 
         flag = 1 if (safe_p_value < p_value_threshold and t_check) else 0
@@ -162,19 +164,28 @@ def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h',
     return results
 
 def vol_parity_notional(log1, log2, hedge, capital=CAPITAL, max_notional_per_pair=MAX_NOTIONAL_PER_PAIR, lookback=VOL_LOOKBACK):
+    """
+    Hedge-ratio balanced position sizing for pairs trading.
+    
+    Spread: S = log(P1) - hedge * log(P2)
+    PnL = D1 * Δlog(P1) - D2 * Δlog(P2)
+        = (D1*hedge - D2) * Δlog(P2)  +  D1 * Δε
+    
+    For market neutrality (PnL independent of common moves):
+        D2 = hedge * D1
+    
+    Solving  D1 + D2 = cap  and  D2 = |hedge| * D1:
+        D1 = cap / (1 + |hedge|)
+        D2 = cap * |hedge| / (1 + |hedge|)
+    
+    Example: hedge=0.94, cap=$23 → D1=$11.86, D2=$11.14 (≈50/50)
+    Example: hedge=0.50, cap=$23 → D1=$15.33, D2=$7.67 (intentional)
+    """
     cap_pair_usd = capital * max_notional_per_pair
-    r1 = np.diff(log1[-lookback:]) if len(log1) >= lookback else np.diff(log1)
-    r2 = np.diff(log2[-lookback:]) if len(log2) >= lookback else np.diff(log2)
-    sigma1 = np.std(r1) if len(r1) > 0 else 0.0
-    sigma2 = np.std(r2) if len(r2) > 0 else 0.0
-    w1_raw = 1.0 / sigma1 if sigma1 > 0 else 0.0
-    w2_raw = abs(hedge) / sigma2 if sigma2 > 0 else 0.0
-    W = w1_raw + w2_raw
-    if W <= 0:
-        return 0.0, 0.0
-    w1 = w1_raw / W
-    w2 = w2_raw / W
-    return float(cap_pair_usd * w1), float(cap_pair_usd * w2)
+    abs_h = abs(hedge) if abs(hedge) > 0.01 else 1.0
+    dollar1 = cap_pair_usd / (1.0 + abs_h)
+    dollar2 = cap_pair_usd * abs_h / (1.0 + abs_h)
+    return float(dollar1), float(dollar2)
 
 def calculate_qty(dollar1, dollar2, price1, price2, capital=CAPITAL, max_notional_per_pair=MAX_NOTIONAL_PER_PAIR):
     max_notional = capital * max_notional_per_pair

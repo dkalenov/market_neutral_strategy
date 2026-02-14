@@ -115,6 +115,7 @@ class ConfigInfo:
     # Market Neutrality (Phase 3)
     beta_threshold: float   # Max |beta_btc| for pair acceptance (default 0.11)
     beta_alert_threshold: float  # Alert if |beta| > this for open positions (default 0.15)
+    beta_critical: float    # Force-close if |beta| > this, regardless of PnL (default 1.0)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
     trade_mode: bool        # If True, allow opening new positions (default True)
     # Idle Pair Management
@@ -230,6 +231,7 @@ async def load_config():
             'hl_max_days': '2.0',    # Max 2 days (1h=48 candles, 4h=12 candles)
             'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
             'beta_alert_threshold': '0.15',  # Alert if |beta| > this for open positions
+            'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
             # Idle Pair Management

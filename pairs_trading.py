@@ -10,10 +10,29 @@ import json
 import os
 from concurrent.futures import ProcessPoolExecutor
 import db
+import math
 
 
 MAX_LEN = 500
 COINT_WINDOW = 200
+
+# Canonical close reason mapping (used in pairs_trading and main.py)
+CLOSE_REASONS = {
+    'z_tp': '💰 Z-Score Take Profit',
+    'z_sl': '🛑 Z-Score Stop Loss',
+    'circuit': '🔴 Circuit Breaker',
+    'broken_coint': '🚨 Broken Correlation',
+    'hardware_sl': '🛡️ Hardware SL',
+    'hardware_tp': '🛡️ Hardware TP',
+    'manual': '👤 Manual Close',
+    'desync': '⚠️ Leg Desync',
+    'beta_drift': '📉 Beta Drift',
+    'btc_shock': '💥 BTC Market Shock',
+    'external': '⚡ External Close',
+    'orphan_restart': '🔄 Orphan on Restart',
+    'stale_symbols': '⏳ Stale Symbols',
+    'manual_partial': '👤 Manual Close (1 leg)',
+}
 
 class Data:
     """
@@ -64,6 +83,7 @@ class PairInfo:
     entry_z_score: float = 0.0 # Z-score at trade entry
     # Market neutrality
     beta_btc: float = 0.0      # Beta to BTC (should be near 0 for market-neutral)
+    last_pvalue: float = 0.0   # Last p-value from cointegration test
     # Signal confirmation (for real-time mode)
     pending_signal: float = None  # Pending Z-score signal awaiting confirmation
     pending_since: float = None   # Time when signal started
@@ -121,6 +141,19 @@ class PairsManager:
         
         # Algo order tracking: algoId -> {pair_key, symbol, order_type}
         self.algo_orders: dict[str, dict] = {}
+        
+        # Grace period: prevent broken_coint closures right after init (data may not be warm yet)
+        self._init_complete_time = 0  # Set after initialize() finishes
+        self._broken_coint_grace_sec = 120  # 2 minutes grace period
+        
+        # BTC Market Shock Protector: track BTC price over rolling window
+        self._btc_price_history: deque = deque(maxlen=300)  # (timestamp, price) — ~5 min at 1s ticks
+        self._btc_shock_triggered = False  # Prevent duplicate closures during same shock event
+        self._btc_shock_cooldown = 0       # Timestamp until shock protection resets
+        
+        # Cached exchange position count (updated periodically and inside trade lock)
+        self._exchange_position_count = 0
+        self._exchange_positions_cache: dict[str, float] = {}  # {symbol: qty}
 
     async def initialize(self):
         """
@@ -129,8 +162,17 @@ class PairsManager:
         """
         if self._initialized:
             return
+        
+        print("🔄 Initializing PairsManager...")
+        
+        # Load from DB first (also runs _reconcile_with_exchange internally)
         await self._load_state_from_db()
+        
+        # Update exchange position cache
+        await self._refresh_exchange_position_count()
+        
         self._initialized = True
+        self._init_complete_time = time.time()
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         print(f"✅ PairsManager initialized. Max active pairs: {max_pairs}")
         
@@ -169,12 +211,19 @@ class PairsManager:
             restored_count = 0
             closed_count = 0
             
+            # Detailed logging for debugging
+            open_pairs_in_db = [p for p in pairs if p.position_status != 0]
+            print(f"  DB has {len(pairs)} total pairs, {len(open_pairs_in_db)} with open positions")
+            for p in open_pairs_in_db:
+                print(f"    📋 DB open: {p.symbol1}-{p.symbol2} status={p.position_status} db_id={p.id}")
+            
             for p in pairs:
                 pair_set = frozenset([p.symbol1, p.symbol2])
                 
                 # DUPLICATE CHECK: Skip if pair already loaded
                 if pair_set in self.active_pairs:
-                    print(f"  ⚠️ Skipping duplicate: {p.symbol1}-{p.symbol2} (already in active_pairs)")
+                    if p.position_status != 0:
+                        print(f"  ⚠️ Skipping duplicate WITH POSITION: {p.symbol1}-{p.symbol2} (db_id={p.id}, already in active_pairs)")
                     continue
                 
                 if p.position_status != 0:
@@ -317,16 +366,19 @@ class PairsManager:
             
             print(f"  Restored {restored_count} pairs, marked {closed_count} stale pairs as CLOSED")
             
+            # Continue with full reconciliation (orphan handling, unknown positions, etc.)
+            # MUST be inside try block - if DB load failed, we must NOT reconcile with empty active_pairs
+            await self._reconcile_with_exchange()
+            
+            # Add test pairs if test_mode is enabled
+            await self._add_test_pairs()
+            
         except Exception as e:
             print(f"❌ Error loading state: {e}")
             import traceback
             traceback.print_exc()
-        
-        # Continue with full reconciliation (orphan handling, unknown positions, etc.)
-        await self._reconcile_with_exchange()
-        
-        # Add test pairs if test_mode is enabled
-        await self._add_test_pairs()
+            # Do NOT call _reconcile_with_exchange here - it would close all positions as "unknown"
+            print("⚠️ SKIPPING reconciliation due to DB load error. Positions on exchange are safe.")
 
     async def _reconcile_with_exchange(self):
         """
@@ -387,6 +439,27 @@ class PairsManager:
                 
                 import asyncio
                 
+                # SAFETY: If active_pairs is empty but exchange has positions, 
+                # this is likely a DB load failure - do NOT close anything
+                if len(self.active_pairs) == 0 and len(open_on_exchange) > 0:
+                    warn_msg = (f"⚠️ SAFETY: active_pairs is EMPTY but exchange has {len(open_on_exchange)} positions. "
+                                f"Possible DB load failure. NOT closing unknown positions.")
+                    print(warn_msg)
+                    await self._notify(f"⚠️ <b>SAFETY BLOCK</b>\n\n{warn_msg}")
+                    return
+                
+                # SAFETY: Check DB directly before closing - maybe the pair exists but wasn't loaded
+                try:
+                    all_db_pairs = await db.get_all_pairs()
+                    db_pair_map = {}  # symbol → list of (pair, other_symbol)
+                    for p in all_db_pairs:
+                        if p.position_status != 0:
+                            db_pair_map.setdefault(p.symbol1, []).append((p, p.symbol2))
+                            db_pair_map.setdefault(p.symbol2, []).append((p, p.symbol1))
+                except Exception as e:
+                    print(f"  ⚠️ Could not query DB for safety check: {e}")
+                    db_pair_map = {}
+                
                 for symbol in unknown_positions:
                     pos_data = open_on_exchange[symbol]
                     qty = pos_data['qty']
@@ -395,7 +468,41 @@ class PairsManager:
                     
                     print(f"      Unknown: {symbol} ({side} {qty}) PnL: {unrealized_pnl:.2f}")
                     
-                    # Close unknown positions immediately
+                    # CHECK DB: Does this symbol belong to a pair with open position?
+                    if symbol in db_pair_map:
+                        for db_pair, other_sym in db_pair_map[symbol]:
+                            other_on_exchange = other_sym in open_on_exchange
+                            if other_on_exchange:
+                                # BOTH legs are on exchange AND pair exists in DB with position_status != 0
+                                # This is NOT an unknown position - RESTORE it!
+                                pair_set = frozenset([symbol, other_sym])
+                                if pair_set not in self.active_pairs:
+                                    info = PairInfo(
+                                        symbol1=db_pair.symbol1,
+                                        symbol2=db_pair.symbol2,
+                                        hedge_ratio=db_pair.hedge_ratio,
+                                        half_life=db_pair.half_life,
+                                        position_status=db_pair.position_status,
+                                        qty1=db_pair.qty1,
+                                        qty2=db_pair.qty2,
+                                        entry_price1=db_pair.entry_price1,
+                                        entry_price2=db_pair.entry_price2,
+                                        db_id=db_pair.id,
+                                        tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0
+                                    )
+                                    self.active_pairs[pair_set] = info
+                                    tracked_symbols.add(db_pair.symbol1)
+                                    tracked_symbols.add(db_pair.symbol2)
+                                    print(f"      🔄 RECOVERED from DB: {db_pair.symbol1}-{db_pair.symbol2} (was missed during load)")
+                                    await self._notify(
+                                        f"🔄 <b>PAIR RECOVERED</b>\n\n"
+                                        f"Pair: {db_pair.symbol1}-{db_pair.symbol2}\n"
+                                        f"Was missed during DB load but found on exchange + DB.\n"
+                                        f"Restored to active trading."
+                                    )
+                                continue  # Skip closing - recovered
+                    
+                    # Only close if truly unknown (not found in DB either)
                     pnl_emoji = "🔴" if unrealized_pnl < 0 else "🟢"
                     await self._notify(
                         f"🚨 <b>UNKNOWN POSITION DETECTED</b>\n\n"
@@ -771,13 +878,44 @@ class PairsManager:
         order_type: 'STOP', 'STOP_MARKET' for SL; 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET' for TP
         """
         is_tp = 'TAKE_PROFIT' in order_type.upper() if order_type else False
-        close_reason = 'hardware_tp' if is_tp else 'hardware_sl'
         
         for pair_info in list(self.active_pairs.values()):
             if pair_info.position_status == 0:
                 continue
             if symbol in (pair_info.symbol1, pair_info.symbol2):
                 other_symbol = pair_info.symbol2 if symbol == pair_info.symbol1 else pair_info.symbol1
+                
+                # VERIFY SL vs TP using actual PnL (order_type from WS can be unreliable for algo orders)
+                # If the triggered leg closed with PROFIT, it's a TP; if LOSS, it's SL
+                try:
+                    entry_price = pair_info.entry_price1 if symbol == pair_info.symbol1 else pair_info.entry_price2
+                    qty = pair_info.qty1 if symbol == pair_info.symbol1 else pair_info.qty2
+                    is_s1 = symbol == pair_info.symbol1
+                    
+                    # Determine position direction for this leg
+                    if is_s1:
+                        side_dir = 1 if pair_info.position_status == 1 else -1  # s1: long if status=1
+                    else:
+                        side_dir = -1 if pair_info.position_status == 1 else 1  # s2: short if status=1
+                    
+                    # Get current/close price from last_prices or use a recent trades lookup
+                    close_price = self.last_prices.get(symbol, 0)
+                    if close_price > 0 and entry_price > 0:
+                        leg_pnl = (close_price - entry_price) * qty * side_dir
+                        
+                        # Override order_type classification based on actual PnL
+                        if leg_pnl > 0:
+                            is_tp = True
+                            print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed TAKE PROFIT")
+                        else:
+                            is_tp = False
+                            print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed STOP LOSS")
+                    else:
+                        print(f"📊 PnL verification skipped (close_price={close_price}, entry={entry_price})")
+                except Exception as e:
+                    print(f"⚠️ PnL verification error: {e}. Using order_type={order_type}")
+                
+                close_reason = 'hardware_tp' if is_tp else 'hardware_sl'
                 tp_or_sl = 'TP' if is_tp else 'SL'
                 msg = f"🎯 Hardware {tp_or_sl} triggered on {symbol}! Closing {other_symbol}"
                 print(msg)
@@ -891,6 +1029,10 @@ class PairsManager:
                 if amt != 0:
                     pos_by_symbol[pos['symbol']] = amt
             
+            # Update exchange position cache while we have the data
+            self._exchange_positions_cache = {s: abs(q) for s, q in pos_by_symbol.items()}
+            self._exchange_position_count = len(pos_by_symbol)
+            
             for pair_info in list(self.active_pairs.values()):
                 if pair_info.position_status == 0 or pair_info.is_trading:
                     continue
@@ -922,6 +1064,59 @@ class PairsManager:
                     remaining_qty = pos_by_symbol.get(remaining_leg, 0)
                     
                     print(f"⚡ Desync detected: {s1}-{s2}. {closed_leg} closed, closing {remaining_leg}...")
+                    
+                    # INVESTIGATE: Why was the closed leg closed?
+                    desync_reason = ''
+                    try:
+                        # Check recent orders for the closed leg to determine cause
+                        now_ms = int(time.time() * 1000)
+                        recent_orders = await self.client.get_all_orders(symbol=closed_leg, limit=10)
+                        
+                        # Find the most recent FILLED order that could have closed it
+                        close_candidates = []
+                        for o in recent_orders:
+                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                close_candidates.append(o)
+                        
+                        if close_candidates:
+                            close_candidates.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
+                            trigger_order = close_candidates[0]
+                            o_type = trigger_order.get('type', '') or trigger_order.get('origType', '')
+                            
+                            if 'STOP' in o_type:
+                                desync_reason = f'Hardware SL triggered on {closed_leg}'
+                            elif 'TAKE_PROFIT' in o_type:
+                                desync_reason = f'Hardware TP triggered on {closed_leg}'
+                            elif o_type == 'MARKET':
+                                reduce_only = trigger_order.get('reduceOnly', False)
+                                if reduce_only:
+                                    desync_reason = f'Bot/reduceOnly market close on {closed_leg}'
+                                else:
+                                    desync_reason = f'Manual market close on {closed_leg}'
+                            elif o_type == 'LIMIT':
+                                desync_reason = f'Limit order closed {closed_leg}'
+                            elif 'TRAILING' in o_type:
+                                desync_reason = f'Trailing stop on {closed_leg}'
+                            else:
+                                desync_reason = f'{o_type} order on {closed_leg}'
+                        else:
+                            # Check algo orders
+                            try:
+                                algo_orders = await self.client.get_algo_orders()
+                                triggered_algos = [a for a in algo_orders 
+                                                   if a.get('symbol') == closed_leg 
+                                                   and a.get('algoStatus') in ('TRIGGERED', 'FINISHED')]
+                                if triggered_algos:
+                                    algo_type = triggered_algos[0].get('orderType', 'ALGO')
+                                    desync_reason = f'Algo {algo_type} triggered on {closed_leg}'
+                                else:
+                                    desync_reason = f'Unknown cause (no recent orders for {closed_leg})'
+                            except Exception:
+                                desync_reason = f'Unknown cause (could not query orders for {closed_leg})'
+                    except Exception as e:
+                        desync_reason = f'Could not determine cause: {str(e)[:50]}'
+                    
+                    print(f"  🔍 Desync cause: {desync_reason}")
                     
                     pair_info.close_handled = True  # Prevent WS handler from sending duplicate notification
                     pair_info.is_trading = True
@@ -965,6 +1160,8 @@ class PairsManager:
                         total_fees = fee1 + fee2
                         
                         pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+                        e1 = '🟢' if pnl1 >= 0 else '🔴'
+                        e2 = '🟢' if pnl2 >= 0 else '🔴'
                         
                         # Update memory state
                         pair_info.position_status = 0
@@ -988,11 +1185,12 @@ class PairsManager:
                                 'fee2': fee2
                             })
                         
-                        # Send detailed notification
-                        done_msg = (f"⚡ <b>Pair Closed (Desync):</b> {s1}-{s2}\n\n"
+                        # Send detailed notification with CAUSE
+                        done_msg = (f"⚡ <b>Pair Closed (Desync):</b> {s1}-{s2}\n"
+                                    f"🔍 Cause: {desync_reason}\n\n"
                                     f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>\n"
-                                    f"   {s1}: {pnl1:+.2f} USDT\n"
-                                    f"   {s2}: {pnl2:+.2f} USDT\n"
+                                    f"   {e1} {s1}: {pnl1:+.2f} USDT\n"
+                                    f"   {e2} {s2}: {pnl2:+.2f} USDT\n"
                                     f"💸 Fees (included): {total_fees:.4f} USDT")
                         print(done_msg.replace('<b>', '').replace('</b>', ''))
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
@@ -1343,7 +1541,7 @@ class PairsManager:
 
                 # Dynamic recalculation of cointegration (with configurable p-value threshold)
                 p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
-                flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold)
+                flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold, strict_hl=False)
 
                 # === MARKET NEUTRALITY CHECK ===
                 # Calculate beta to BTC to ensure pair is market-neutral
@@ -1365,6 +1563,7 @@ class PairsManager:
                 
                 # Store beta for display
                 pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
+                pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
 
                 # Check if this is a test pair that should not be removed
                 is_protected_test_pair = False
@@ -1383,10 +1582,25 @@ class PairsManager:
                             hl = 24.0
 
                 # Pair rotation: if cointegration breaks (skip for protected test pairs)
-                if (flag == 0 or hl > 200) and not is_protected_test_pair:
+                if flag == 0 and not is_protected_test_pair:
                     print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                     
                     if pair_info.position_status != 0:
+                        # GRACE PERIOD 1: Skip broken_coint closures during warmup
+                        # After bot restart, data may not be fully loaded yet
+                        grace_elapsed = time.time() - self._init_complete_time
+                        if grace_elapsed < self._broken_coint_grace_sec:
+                            print(f"⏳ GRACE PERIOD (init): Skipping broken_coint close for {s1}-{s2} (init {grace_elapsed:.0f}s ago, need {self._broken_coint_grace_sec}s)")
+                            continue
+                        
+                        # GRACE PERIOD 2: Skip broken_coint closures for freshly opened trades
+                        # Cointegration re-test with slightly different data can give false negatives
+                        trade_open_time = getattr(pair_info, '_trade_open_time', 0)
+                        trade_age = time.time() - trade_open_time
+                        if trade_open_time > 0 and trade_age < 60:
+                            print(f"⏳ GRACE PERIOD (trade): Skipping broken_coint close for {s1}-{s2} (trade opened {trade_age:.0f}s ago, need 60s)")
+                            continue
+                        
                         print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
                         # Don't send notification here - _execute_trade will send full close message with PnL
                         pair_info.close_handled = True
@@ -1440,7 +1654,7 @@ class PairsManager:
                 
                 pair_info.last_z_score = z_score
 
-                # Circuit Breaker Logic
+                # Circuit Breaker Logic (candle-close backup — primary is in on_ticker_update)
                 if pair_info.position_status != 0 and pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
                     current_price1 = list(data1.close)[-1]
                     current_price2 = list(data2.close)[-1]
@@ -1462,14 +1676,13 @@ class PairsManager:
                                       f"Loss: {roi*100:.2f}% ({total_pnl:.2f} USDT). Force Closing...")
                             print(cb_msg)
                             reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                            self.loop.create_task(self._notify(cb_msg, reply_to))
+                            await self._notify(cb_msg, reply_to)
                             pair_info.close_handled = True
                             pair_info.is_trading = True
-                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='circuit'))
-                            # pair_info.position_status = 0 # Will be set in execute_trade
+                            await self._execute_trade(pair_info, 0, close_reason='circuit')
                             continue
                 
-                # === BETA DRIFT MONITORING ===
+                # === BETA DRIFT MONITORING (candle-close backup — primary is in on_ticker_update) ===
                 # Check if open position has become correlated with market
                 if pair_info.position_status != 0 and pair_info.beta_btc != 0:
                     beta_alert_threshold = getattr(self.config, 'beta_alert_threshold', 0.15) or 0.15
@@ -1490,10 +1703,10 @@ class PairsManager:
                                         f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
                                         f"PnL: +{total_pnl:.2f} USDT. Auto-closing...")
                             print(beta_msg)
-                            self.loop.create_task(self._notify(beta_msg))
+                            await self._notify(beta_msg)
                             pair_info.close_handled = True
                             pair_info.is_trading = True
-                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='beta_drift'))
+                            await self._execute_trade(pair_info, 0, close_reason='beta_drift')
                             continue
                         else:
                             # Negative PnL - notify user (but don't close)
@@ -1501,7 +1714,7 @@ class PairsManager:
                                          f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
                                          f"PnL: {total_pnl:.2f} USDT. Consider manual close.")
                             print(beta_warn)
-                            self.loop.create_task(self._notify(beta_warn))
+                            await self._notify(beta_warn)
                             # Don't continue - let position stay open
 
                 z_entry = self.config.z_entry if self.config and self.config.z_entry else 2.0
@@ -1542,28 +1755,29 @@ class PairsManager:
                     pass
                 
                 elif pair_info.position_status == 1: # Long spread
+                    # Candle-close Z-score exit (BACKUP — primary is in on_ticker_update)
                     if z_score >= z_exit:
                         print(f"💰 TAKE PROFIT (Long) on {s1}-{s2}. Z: {z_score:.2f} >= {z_exit}. Closing...")
                         pair_info.close_handled = True
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
+                        await self._execute_trade(pair_info, 0, close_reason='z_tp')
                     elif z_score <= -z_stop:
                         print(f"🛑 STOP LOSS (Long) on {s1}-{s2}. Z: {z_score:.2f} <= -{z_stop}. Closing...")
                         pair_info.close_handled = True
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
+                        await self._execute_trade(pair_info, 0, close_reason='z_sl')
 
                 elif pair_info.position_status == -1: # Short spread
                     if z_score <= -z_exit:
                         print(f"💰 TAKE PROFIT (Short) on {s1}-{s2}. Z: {z_score:.2f} <= {-z_exit}. Closing...")
                         pair_info.close_handled = True
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_tp'))
+                        await self._execute_trade(pair_info, 0, close_reason='z_tp')
                     elif z_score >= z_stop:
                         print(f"🛑 STOP LOSS (Short) on {s1}-{s2}. Z: {z_score:.2f} >= {z_stop}. Closing...")
                         pair_info.close_handled = True
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='z_sl'))
+                        await self._execute_trade(pair_info, 0, close_reason='z_sl')
 
     async def _discover_new_pairs(self):
         """
@@ -1908,6 +2122,23 @@ class PairsManager:
                 count += 1
         return count
 
+    async def _refresh_exchange_position_count(self):
+        """Refresh cached exchange position count from exchange API."""
+        try:
+            account = await self.client.account()
+            positions = {}
+            for pos in account.get('positions', []):
+                amt = abs(float(pos.get('positionAmt', 0)))
+                if amt > 0:
+                    positions[pos['symbol']] = amt
+            self._exchange_positions_cache = positions
+            # Count pairs: each pair = 2 positions, so positions / 2 = pairs
+            self._exchange_position_count = len(positions)
+            return len(positions)
+        except Exception as e:
+            print(f"⚠️ Failed to refresh exchange position count: {e}")
+            return self._exchange_position_count
+
     def can_open_new_position(self, s1: str, s2: str) -> bool:
         """Check if we can open a new position for this pair."""
         # Check if trading is enabled
@@ -1915,9 +2146,16 @@ class PairsManager:
         if trade_mode is not None and str(trade_mode).lower() in ('false', '0', 'no'):
             return False
         
-        # Check max active pairs limit
+        # Check max active pairs limit (local memory)
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         if self.count_active_positions() >= max_pairs:
+            return False
+        
+        # SAFETY: Also check exchange position cache (positions / 2 = pairs)
+        # Each pair opens 2 positions, so max positions = max_pairs * 2
+        max_exchange_positions = max_pairs * 2
+        if self._exchange_position_count >= max_exchange_positions:
+            print(f"🚫 Exchange position limit: {self._exchange_position_count}/{max_exchange_positions} positions on exchange")
             return False
         
         # Check symbol lock - each symbol can only be in one active pair
@@ -1944,6 +2182,17 @@ class PairsManager:
                     print(f"🚫 Trade blocked by lock: {s1}-{s2} (limit reached or symbol locked)")
                     pair_info.is_trading = False
                     return
+                
+                # CRITICAL: Also verify against LIVE exchange positions (prevents 25-position bug)
+                max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
+                try:
+                    live_count = await self._refresh_exchange_position_count()
+                    if live_count >= max_pairs * 2:
+                        print(f"🚫 Trade blocked by EXCHANGE limit: {live_count}/{max_pairs * 2} positions on exchange for {s1}-{s2}")
+                        pair_info.is_trading = False
+                        return
+                except Exception as e:
+                    print(f"⚠️ Could not verify exchange positions: {e}. Proceeding with local check only.")
                 
                 # Mark as opening INSIDE lock before releasing
                 pair_info.position_status = direction  # Tentatively set to prevent other trades
@@ -2062,6 +2311,7 @@ class PairsManager:
                             'manual': '👤 Manual Close',
                             'desync': '⚠️ Leg Desync',
                             'beta_drift': '📉 Beta Drift',
+                            'beta_critical': '🚨 Beta Critical',
                             'external': '⚡ External Close',
                             'orphan_restart': '🔄 Orphan on Restart',
                             'stale_symbols': '⏳ Stale Symbols',
@@ -2075,9 +2325,31 @@ class PairsManager:
                                 return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
                             return 0.0
 
-                        # Safely get prices (results may be smaller if some legs already closed)
-                        close_price1 = get_price(results[0]) if len(results) > 0 and not isinstance(results[0], Exception) else pair_info.entry_price1
-                        close_price2 = get_price(results[1]) if len(results) > 1 and not isinstance(results[1], Exception) else pair_info.entry_price2
+                        # Safely get prices - MAP by symbol (results array may not match s1/s2 order!)
+                        close_prices = {}
+                        for i, res in enumerate(results):
+                            if not isinstance(res, Exception) and i < len(close_symbols):
+                                close_prices[close_symbols[i]] = get_price(res)
+                        
+                        # For legs already closed by exchange (SL/TP trigger), fetch actual close price
+                        for sym in [s1, s2]:
+                            if sym not in close_prices:
+                                try:
+                                    now_ms = int(time.time() * 1000)
+                                    start_ms = now_ms - 300_000  # Last 5 minutes
+                                    trades = await self.client.get_account_trades(symbol=sym, startTime=start_ms, limit=50)
+                                    if trades:
+                                        # Last trade price is the close price
+                                        close_prices[sym] = float(trades[-1].get('price', 0))
+                                        print(f"📊 Fetched close price for {sym} from trades: {close_prices[sym]}")
+                                    else:
+                                        close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
+                                except Exception as e:
+                                    print(f"⚠️ Could not fetch close price for {sym}: {e}")
+                                    close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
+                        
+                        close_price1 = close_prices.get(s1, pair_info.entry_price1)
+                        close_price2 = close_prices.get(s2, pair_info.entry_price2)
                     
                         side1_dir = 1 if pair_info.position_status == 1 else -1
                         side2_dir = -1 if pair_info.position_status == 1 else 1
@@ -2106,6 +2378,11 @@ class PairsManager:
                         pair_info.last_close_reason = close_reason or 'unknown'
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
+                        
+                        # Update exchange position cache
+                        self._exchange_positions_cache.pop(s1, None)
+                        self._exchange_positions_cache.pop(s2, None)
+                        self._exchange_position_count = len(self._exchange_positions_cache)
                     
                         # Cancel all algo orders for this pair - track per symbol/type
                         cleanup_status = []
@@ -2117,11 +2394,13 @@ class PairsManager:
                             for o in algo_orders:
                                 sym = o['symbol']
                                 if sym in orders_by_sym:
-                                    order_type = o.get('type', '')
+                                    order_type = o.get('type', '') or o.get('orderType', '')
                                     if 'STOP' in order_type.upper():
                                         orders_by_sym[sym].append(('SL', o['algoId']))
-                                    else:
+                                    elif 'TAKE_PROFIT' in order_type.upper():
                                         orders_by_sym[sym].append(('TP', o['algoId']))
+                                    else:
+                                        orders_by_sym[sym].append((order_type or 'ORDER', o['algoId']))
                             
                             # Cancel each order and track result
                             for sym in [s1, s2]:
@@ -2138,12 +2417,36 @@ class PairsManager:
                         except Exception as e:
                             cleanup_status.append(f"  ❌ Failed: {str(e)[:30]}")
                         
+                        # Calculate real-time Z-score for close message
+                        try:
+                            p1 = self.last_prices.get(s1, 0)
+                            p2 = self.last_prices.get(s2, 0)
+                            if p1 > 0 and p2 > 0:
+                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
+                                import math
+                                if math.isnan(close_zscore):
+                                    close_zscore = pair_info.last_z_score or 0
+                            else:
+                                close_zscore = pair_info.last_z_score or 0
+                        except Exception:
+                            close_zscore = pair_info.last_z_score or 0
+                        
+                        close_beta = getattr(pair_info, 'beta_btc', 0) or 0
+                        
+                        # Per-position PnL with emoji
+                        e1 = '🟢' if pnl1 >= 0 else '🔴'
+                        e2 = '🟢' if pnl2 >= 0 else '🔴'
+                        
                         # Build enhanced close message
                         cleanup_msg = "\n".join(cleanup_status) if cleanup_status else "  ℹ️ No cleanup needed"
-                        full_msg = f"✅ Position Closed: {s1}/{s2}\n"
-                        full_msg += f"📊 Reason: {reason_text}\n\n"
-                        full_msg += f"🛡️ Order Cleanup:\n{cleanup_msg}\n\n"
-                        full_msg += f"💵 PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>"
+                        close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                        close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
+                        full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
+                        full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
+                        full_msg += f"⏳ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
+                        full_msg += f"💵 PnL: {pnl_emoji} <b>{total_pnl:+.2f} USDT</b>\n"
+                        full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n\n"
+                        full_msg += f"🛡️ Order Cleanup:\n{cleanup_msg}"
                         
                         print(full_msg.replace('<b>', '').replace('</b>', ''))
                         # Reply to original open message if available
@@ -2205,6 +2508,31 @@ class PairsManager:
             log_prices1 = np.log(list(data1.close)[-COINT_WINDOW:])
             log_prices2 = np.log(list(data2.close)[-COINT_WINDOW:])
 
+            # === FRESH HEDGE RATIO: Recalculate from current data before sizing ===
+            # Between signal detection and execution, hedge_ratio may have drifted.
+            # This also serves as a final cointegration gate — abort if pair broke.
+            try:
+                p_val_thresh = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
+                fresh_flag, fresh_hedge, fresh_hl, fresh_pval = utils.calculate_cointegration(
+                    log_prices1, log_prices2, p_value_threshold=p_val_thresh, strict_hl=False
+                )
+                if fresh_flag == 1 and not np.isnan(fresh_hedge):
+                    old_hedge = pair_info.hedge_ratio
+                    if abs(fresh_hedge - old_hedge) > 0.001:
+                        print(f"🔄 Hedge refresh for {s1}-{s2}: {old_hedge:.4f} → {fresh_hedge:.4f}")
+                    hedge = fresh_hedge
+                    pair_info.hedge_ratio = fresh_hedge
+                    pair_info.last_pvalue = fresh_pval
+                else:
+                    print(f"⚠️ Fresh cointegration FAILED for {s1}-{s2} (flag={fresh_flag}, p={fresh_pval:.4f}). Aborting trade.")
+                    pair_info.position_status = 0
+                    pair_info.is_trading = False
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    return
+            except Exception as e:
+                print(f"⚠️ Hedge refresh error for {s1}-{s2}: {e}. Using existing hedge={hedge:.4f}")
+
             capital = self.config.capital if self.config and self.config.capital else 1000.0
             max_notional = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1
 
@@ -2254,6 +2582,43 @@ class PairsManager:
             if calculated_notional2 < min_notional2:
                 print(f"INFO: {s2} qty slightly bumped to meet min notional")
                 qty2_rounded = utils.round_up(min_notional2 / s2_price, s2_info.step_size)
+
+            # === REBALANCE: Maintain vol parity ratio after min_notional bumps ===
+            # If either leg was bumped to meet min notional, scale the other
+            # leg by the same factor to preserve the vol parity hedge ratio
+            final_notional1 = qty1_rounded * s1_price
+            final_notional2 = qty2_rounded * s2_price
+            
+            if calculated_notional1 > 0 and calculated_notional2 > 0:
+                # Calculate bump factor for each leg (1.0 = no bump)
+                bump1 = final_notional1 / calculated_notional1
+                bump2 = final_notional2 / calculated_notional2
+                
+                # If either leg was bumped (>1% tolerance for rounding), apply max factor to both
+                max_bump = max(bump1, bump2)
+                if max_bump > 1.01:
+                    # Scale up the leg that had a smaller bump
+                    if bump1 < max_bump:
+                        needed1 = calculated_notional1 * max_bump
+                        new_qty1 = utils.round_up(needed1 / s1_price, s1_info.step_size)
+                        if new_qty1 > qty1_rounded:
+                            print(f"INFO: Rebalanced {s1} ${final_notional1:.2f} → ${new_qty1 * s1_price:.2f} (bump {max_bump:.2f}x)")
+                            qty1_rounded = new_qty1
+                    if bump2 < max_bump:
+                        needed2 = calculated_notional2 * max_bump
+                        new_qty2 = utils.round_up(needed2 / s2_price, s2_info.step_size)
+                        if new_qty2 > qty2_rounded:
+                            print(f"INFO: Rebalanced {s2} ${final_notional2:.2f} → ${new_qty2 * s2_price:.2f} (bump {max_bump:.2f}x)")
+                            qty2_rounded = new_qty2
+                    
+                    # Safety: total notional shouldn't exceed 3x the original pair budget
+                    total_after = qty1_rounded * s1_price + qty2_rounded * s2_price
+                    pair_budget = capital * max_notional
+                    if total_after > pair_budget * 3:
+                        print(f"SKIP: Rebalanced total ${total_after:.2f} exceeds 3x pair budget ${pair_budget:.2f} for {s1}-{s2}")
+                        pair_info.position_status = 0
+                        pair_info.is_trading = False
+                        return
 
             print(f"EXECUTING TRADE for {s1}-{s2}:")
             print(f"  {side1} {qty1_rounded} {s1} at {s1_price}")
@@ -2352,6 +2717,17 @@ class PairsManager:
                     pair_info.position_status = direction
                     pair_info.qty1 = float(executed_orders[0]['executedQty'])
                     pair_info.qty2 = float(executed_orders[1]['executedQty'])
+                    
+                    # CRITICAL: Reset coint failure counter and set trade open time
+                    # Prevents stale fails from instantly closing new trades
+                    pair_info._rt_coint_fails = 0
+                    pair_info._trade_open_time = time.time()
+                    
+                    # CRITICAL: Update exchange position cache immediately
+                    # This prevents race condition where another task checks limit before cache refreshes
+                    self._exchange_positions_cache[s1] = pair_info.qty1
+                    self._exchange_positions_cache[s2] = pair_info.qty2
+                    self._exchange_position_count = len(self._exchange_positions_cache)
                 
                     def get_price(order):
                         if 'avgPrice' in order and float(order['avgPrice']) > 0:
@@ -2401,7 +2777,7 @@ class PairsManager:
                                    f"📉 SHORT: {short_qty} {short_sym} @ {short_price:.4f}\n"
                                    f"     💰 ${short_qty * short_price:.2f}\n\n"
                                    f"⚖️ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}\n"
-                                   f"📊 Beta: {pair_info.beta_btc:.3f}\n"
+                                   f"📊 Beta: {pair_info.beta_btc:.3f} | p-value: {pair_info.last_pvalue:.4f}\n"
                                    # Format half-life as readable hours/days
                                    f"⏳ Half-life: {self._format_half_life(pair_info.half_life)}")
                     print(success_msg.replace('<b>', '').replace('</b>', ''))
@@ -2529,7 +2905,7 @@ class PairsManager:
                             # Force close position
                             pair_info.close_handled = True  # Prevent duplicate notification from WS handler
                             pair_info.is_trading = True
-                            self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
+                            await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                             
                     except Exception as e:
                         warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
@@ -2540,7 +2916,7 @@ class PairsManager:
                         # Force close position (algo orders will be cancelled by _execute_trade)
                         pair_info.close_handled = True  # Prevent duplicate notification from WS handler
                         pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, 0, close_reason='hardware_sl'))
+                        await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                     # === END HARDWARE SL/TP ===
                 
                     if pair_info.db_id:
@@ -2627,15 +3003,26 @@ class PairsManager:
     
     async def on_ticker_update(self, symbol: str, price: float):
         """
-        Called when a price update is received from WebSocket ticker.
-        Updates last_prices and checks for entry signals with confirmation.
+        Called when a price update is received from WebSocket ticker (~1s markPrice).
+        Handles BOTH:
+          - Entry signal detection (for idle pairs)
+          - EXIT monitoring: Z-score TP/SL, circuit breaker, beta drift (for open positions)
+          - BTC Market Shock protection (closes ALL positions on flash crash)
         """
         self.last_prices[symbol] = price
         
+        # Track BTC price for Market Shock Protector
+        if symbol == 'BTCUSDT':
+            self._btc_price_history.append((time.time(), price))
+            
+            # Check for BTC shock (only if we have enough history and not in cooldown)
+            if len(self._btc_price_history) >= 10 and not self._btc_shock_triggered:
+                await self._check_btc_shock()
+        
         # Check all pairs containing this symbol
         for pair_info in self._pairs_with_symbol(symbol):
-            if pair_info.position_status != 0 or pair_info.is_trading:
-                continue  # Already in position or trading
+            if pair_info.is_trading:
+                continue  # Trade in progress, skip
             
             # Get both prices
             price1 = self.last_prices.get(pair_info.symbol1)
@@ -2648,6 +3035,15 @@ class PairsManager:
             if np.isnan(z_score):
                 continue
             
+            # Update last_z_score with real-time value
+            pair_info.last_z_score = z_score
+            
+            # ====== OPEN POSITIONS: Real-time EXIT monitoring ======
+            if pair_info.position_status != 0:
+                await self._check_realtime_exit(pair_info, z_score, price1, price2)
+                continue
+            
+            # ====== IDLE PAIRS: Entry signal detection ======
             z_entry = getattr(self.config, 'z_entry', 2.0) or 2.0
             z_entry_max = getattr(self.config, 'z_entry_max', 3.0) or 3.0
             
@@ -2658,12 +3054,264 @@ class PairsManager:
                     # Start confirmation timer
                     pair_info.pending_signal = z_score
                     pair_info.pending_since = time.time()
-                    # Fprint(f"🔔 Signal detected for {pair_info.symbol1}-{pair_info.symbol2}: Z={z_score:.2f}. Confirming...")
             else:
                 # Signal went away - reset
                 if pair_info.pending_signal is not None:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+    
+    async def _check_btc_shock(self):
+        """
+        BTC Market Shock Protector.
+        If BTC moves > btc_crash_pct within btc_crash_window seconds,
+        force-close ALL open positions immediately.
+        """
+        btc_crash_pct = getattr(self.config, 'btc_crash_pct', 0.05) or 0.05  # 5% default
+        btc_crash_window = getattr(self.config, 'btc_crash_window', 300) or 300  # 5 min default
+        
+        now = time.time()
+        
+        # Cooldown: don't re-trigger for 5 minutes after a shock
+        if now < self._btc_shock_cooldown:
+            return
+        
+        current_price = self._btc_price_history[-1][1]
+        
+        # Find the price from ~btc_crash_window seconds ago
+        reference_price = None
+        for ts, p in self._btc_price_history:
+            if now - ts <= btc_crash_window:
+                reference_price = p
+                break
+        
+        if reference_price is None or reference_price == 0:
+            return
+        
+        btc_change = (current_price - reference_price) / reference_price
+        
+        if abs(btc_change) >= btc_crash_pct:
+            direction = '📉 CRASH' if btc_change < 0 else '📈 PUMP'
+            self._btc_shock_triggered = True
+            self._btc_shock_cooldown = now + btc_crash_window  # Cooldown
+            
+            shock_msg = (f"💥 <b>BTC MARKET SHOCK</b>!\n"
+                         f"{direction}: BTC {btc_change*100:+.2f}% in {btc_crash_window//60:.0f} min\n"
+                         f"Price: {reference_price:.2f} → {current_price:.2f}\n"
+                         f"🚨 Force-closing ALL open positions...")
+            print(shock_msg)
+            await self._notify(shock_msg)
+            
+            # Close ALL open positions
+            closed_count = 0
+            for pair_info in list(self.active_pairs.values()):
+                if pair_info.position_status != 0 and not pair_info.is_trading:
+                    s1, s2 = pair_info.symbol1, pair_info.symbol2
+                    print(f"💥 BTC Shock: closing {s1}-{s2}")
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
+                    try:
+                        await self._execute_trade(pair_info, 0, close_reason='btc_shock')
+                        closed_count += 1
+                    except Exception as e:
+                        print(f"❌ Failed to close {s1}-{s2} during BTC shock: {e}")
+            
+            result_msg = f"💥 BTC Shock: closed {closed_count} positions"
+            print(result_msg)
+            await self._notify(result_msg)
+            
+            # Reset flag after all closures complete
+            self._btc_shock_triggered = False
+    
+    async def _check_realtime_exit(self, pair_info: PairInfo, z_score: float, price1: float, price2: float):
+        """
+        Real-time exit monitoring for open positions. Called on every markPrice update (~1s).
+        Checks: Z-score TP/SL, Circuit Breaker, Beta Drift (with live recalc every 10s).
+        """
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        
+        # --- 1. Z-Score TP / SL (instant, every tick) ---
+        z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
+        z_stop = self.config.z_stop if self.config and self.config.z_stop else 4.0
+        
+        if pair_info.position_status == 1:  # Long spread
+            if z_score >= z_exit:
+                print(f"💰 RT TAKE PROFIT (Long) on {s1}-{s2}. Z: {z_score:.2f} >= {z_exit}. Closing...")
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0, close_reason='z_tp')
+                return
+            elif z_score <= -z_stop:
+                print(f"🛑 RT STOP LOSS (Long) on {s1}-{s2}. Z: {z_score:.2f} <= -{z_stop}. Closing...")
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0, close_reason='z_sl')
+                return
+        
+        elif pair_info.position_status == -1:  # Short spread
+            if z_score <= -z_exit:
+                print(f"💰 RT TAKE PROFIT (Short) on {s1}-{s2}. Z: {z_score:.2f} <= {-z_exit}. Closing...")
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0, close_reason='z_tp')
+                return
+            elif z_score >= z_stop:
+                print(f"🛑 RT STOP LOSS (Short) on {s1}-{s2}. Z: {z_score:.2f} >= {z_stop}. Closing...")
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0, close_reason='z_sl')
+                return
+        
+        # --- 2. Circuit Breaker (instant, every tick) ---
+        if pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
+            side1 = 1 if pair_info.position_status == 1 else -1
+            side2 = -side1
+            
+            pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
+            pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
+            total_pnl = pnl1 + pnl2
+            
+            initial_investment = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
+            circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
+            
+            if initial_investment > 0:
+                roi = total_pnl / initial_investment
+                if roi < -circuit_breaker_pct:
+                    cb_msg = (f"🚨 <b>RT CIRCUIT BREAKER</b> on {s1}-{s2}!\n"
+                              f"Loss: {roi*100:.2f}% ({total_pnl:.2f} USDT). Force Closing...")
+                    print(cb_msg)
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await self._notify(cb_msg, reply_to)
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
+                    await self._execute_trade(pair_info, 0, close_reason='circuit')
+                    return
+        
+        # --- 3. Beta + Cointegration recalculation (every 10s) ---
+        # CRITICAL: Cointegration (ADF test) uses ONLY closed candles.
+        # Substituting 1 live price out of 200 can cause p-value jumps
+        # (e.g., 0.005 → 0.21), creating false broken-coint signals.
+        # Beta recalc still uses hybrid data (less sensitive to 1 point).
+        now = time.time()
+        last_recheck = getattr(pair_info, '_last_rt_recheck', 0)
+        if now - last_recheck >= 10:  # Every 10 seconds
+            pair_info._last_rt_recheck = now
+            
+            data1 = self.all_data.get(s1)
+            data2 = self.all_data.get(s2)
+            if data1 and data2 and len(data1.close) >= self.min_data_points and len(data2.close) >= self.min_data_points:
+                # Use ONLY closed candles for cointegration test (no live price substitution)
+                log1 = np.log(list(data1.close)[-self.min_data_points:])
+                log2 = np.log(list(data2.close)[-self.min_data_points:])
+                
+                try:
+                    p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
+                    flag, hedge, hl, pval = utils.calculate_cointegration(log1, log2, p_value_threshold, strict_hl=False)
+                    
+                    if flag == 1 and not np.isnan(hedge):
+                        # Cointegration holds — update params, reset failure counter
+                        pair_info.hedge_ratio = hedge
+                        pair_info.half_life = hl
+                        pair_info.last_pvalue = pval
+                        pair_info._rt_coint_fails = 0
+                    else:
+                        # Cointegration BROKEN
+                        pair_info.last_pvalue = pval
+                        fails = getattr(pair_info, '_rt_coint_fails', 0) + 1
+                        pair_info._rt_coint_fails = fails
+                        
+                        if fails >= 3:  # 3 consecutive failures (3 × 10s = 30 seconds)
+                            # Respect grace period after init
+                            if time.time() - self._init_complete_time < self._broken_coint_grace_sec:
+                                return
+                            
+                            # Respect per-trade grace period (60s after trade opened)
+                            trade_open_time = getattr(pair_info, '_trade_open_time', 0)
+                            if trade_open_time > 0 and time.time() - trade_open_time < 60:
+                                return
+                            
+                            print(f"🚨 RT BROKEN COINTEGRATION on {s1}-{s2}! p={pval:.4f} ({fails}× consecutive). Closing...")
+                            pair_info.close_handled = True
+                            pair_info.is_trading = True
+                            await self._execute_trade(pair_info, 0, close_reason='broken_coint')
+                            return
+                        else:
+                            print(f"⚠️ RT Coint check failed for {s1}-{s2} (#{fails}/3, p={pval:.4f})")
+                    
+                    # Recalculate beta with hybrid data (live price OK here — simple regression, less sensitive)
+                    if 'BTCUSDT' in self.all_data:
+                        btc_data = self.all_data['BTCUSDT']
+                        btc_price = self.last_prices.get('BTCUSDT')
+                        if btc_price and len(btc_data.close) >= self.min_data_points:
+                            log_btc_hist = np.log(list(btc_data.close)[-(self.min_data_points - 1):])
+                            log_btc = np.append(log_btc_hist, np.log(btc_price))
+                            # Use hybrid data for spread returns (beta is less sensitive)
+                            log1_hybrid = np.append(log1[:-1], np.log(price1))
+                            log2_hybrid = np.append(log2[:-1], np.log(price2))
+                            spread_returns = np.diff(log1_hybrid) - pair_info.hedge_ratio * np.diff(log2_hybrid)
+                            btc_returns = np.diff(log_btc)
+                            beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
+                            if not np.isnan(beta_btc):
+                                pair_info.beta_btc = beta_btc
+                except Exception:
+                    pass  # Keep existing values on error
+        
+        # --- 4. Beta Drift CHECK (every tick, uses latest beta value) ---
+        if pair_info.beta_btc != 0:
+            beta_alert_threshold = getattr(self.config, 'beta_alert_threshold', 0.15) or 0.15
+            beta_critical = getattr(self.config, 'beta_critical', 1.0) or 1.0
+            
+            abs_beta = abs(pair_info.beta_btc)
+            
+            if abs_beta >= beta_critical:
+                # CRITICAL: Force-close regardless of PnL — pair is pure directional exposure
+                side1 = 1 if pair_info.position_status == 1 else -1
+                side2 = -side1
+                pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
+                pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
+                total_pnl = pnl1 + pnl2
+                
+                beta_msg = (f"🚨 <b>RT BETA CRITICAL</b> on {s1}-{s2}!\n"
+                            f"Beta: {pair_info.beta_btc:.3f} (critical: {beta_critical})\n"
+                            f"PnL: {total_pnl:+.2f} USDT. Force-closing...")
+                print(beta_msg)
+                reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                await self._notify(beta_msg, reply_to)
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await self._execute_trade(pair_info, 0, close_reason='beta_critical')
+                return
+            
+            elif abs_beta >= beta_alert_threshold:
+                # Calculate PnL using real-time prices
+                side1 = 1 if pair_info.position_status == 1 else -1
+                side2 = -side1
+                pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
+                pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
+                total_pnl = pnl1 + pnl2
+                
+                if total_pnl > 0:
+                    beta_msg = (f"⚠️ <b>RT BETA DRIFT</b> on {s1}-{s2}!\n"
+                                f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
+                                f"PnL: +{total_pnl:.2f} USDT. Auto-closing...")
+                    print(beta_msg)
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await self._notify(beta_msg, reply_to)
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
+                    await self._execute_trade(pair_info, 0, close_reason='beta_drift')
+                    return
+                else:
+                    # Negative PnL - warn but don't spam (throttle warnings to every 60s)
+                    now = time.time()
+                    last_warn = getattr(pair_info, '_last_beta_warn', 0)
+                    if now - last_warn >= 60:
+                        pair_info._last_beta_warn = now
+                        beta_warn = (f"⚠️ <b>RT BETA DRIFT WARNING</b> on {s1}-{s2}!\n"
+                                     f"Beta: {pair_info.beta_btc:.3f} (threshold: {beta_alert_threshold})\n"
+                                     f"PnL: {total_pnl:.2f} USDT. Consider manual close.")
+                        print(beta_warn)
+                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        await self._notify(beta_warn, reply_to)
     
     async def _signal_confirmation_loop(self):
         """

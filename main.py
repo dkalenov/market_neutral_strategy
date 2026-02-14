@@ -2,9 +2,12 @@ import asyncio
 import configparser
 import traceback
 import os
+import time as time_mod
+import math
 from dotenv import load_dotenv
 import binance
 import pairs_trading
+from pairs_trading import CLOSE_REASONS
 import db
 import tg
 
@@ -249,8 +252,37 @@ async def load_symbols_loop():
             await asyncio.sleep(3600)
             
             print("Refreshing market symbols...")
-            all_symbols = await client.load_symbols()
-            print(f"Refreshed {len(all_symbols)} symbols.")
+            new_symbols = await client.load_symbols()
+            
+            # Apply volume filter + blacklist (same as initial load in main())
+            conf = await db.load_config()
+            max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
+            blacklist = set((conf.blacklist or '').split(','))
+            
+            try:
+                tickers = await client.ticker_24hr_price_change()
+                valid_tickers = []
+                for t in tickers:
+                    sym = t.get('symbol', '')
+                    if sym.endswith('USDT') and sym not in blacklist and sym in new_symbols:
+                        try:
+                            vol = float(t.get('quoteVolume', 0))
+                            valid_tickers.append((sym, vol))
+                        except Exception:
+                            continue
+                valid_tickers.sort(key=lambda x: x[1], reverse=True)
+                top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+                filtered_symbols = {s: obj for s, obj in new_symbols.items() if s in top_symbols}
+                print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)})")
+                new_symbols = filtered_symbols
+            except Exception as e:
+                print(f"⚠️ Volume filter failed during refresh ({e}). Using all symbols.")
+            
+            # Update BOTH global and pairs_manager references
+            all_symbols = new_symbols
+            if pairs_manager:
+                pairs_manager.all_symbols = new_symbols
+                print(f"✅ pairs_manager.all_symbols updated ({len(new_symbols)} symbols)")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -587,11 +619,9 @@ async def ws_user_msg(ws, msg):
                                 await client.cancel_open_orders(s2)
                                 
                                 # Small delay to ensure trade data is available
-                                import asyncio
                                 await asyncio.sleep(1)
                                 
                                 # Fetch actual PnL from recent trades (more reliable than Income API)
-                                import time as time_mod
                                 now_ms = int(time_mod.time() * 1000)
                                 start_ms = now_ms - 300_000  # Last 5 minutes
                                 
@@ -617,22 +647,6 @@ async def ws_user_msg(ws, msg):
                                 # Determine close reason from trade data
                                 close_type = '❓ Unknown'
                                 close_hint = '\n💡 Check exchange for details'
-                                # Define close reason mapping
-                                CLOSE_REASONS = {
-                                    'z_tp': '💰 Z-Score Take Profit',
-                                    'z_sl': '🛑 Z-Score Stop Loss',
-                                    'circuit': '🔴 Circuit Breaker',
-                                    'broken_coint': '🚨 Broken Correlation',
-                                    'hardware_sl': '🛡️ Hardware SL',
-                                    'hardware_tp': '🛡️ Hardware TP',
-                                    'manual': '👤 Manual Close',
-                                    'desync': '⚠️ Leg Desync',
-                                    'beta_drift': '📉 Beta Drift',
-                                    'external': '⚡ External Close',
-                                    'orphan_restart': '🔄 Orphan on Restart',
-                                    'stale_symbols': '⏳ Stale Symbols',
-                                    'manual_partial': '👤 Manual Close (1 leg)',
-                                }
                                 
                                 # FIRST: Check if bot stored exact reason
                                 stored_reason = getattr(pair_info, 'last_close_reason', '')
@@ -647,8 +661,10 @@ async def ws_user_msg(ws, msg):
                                         orders2 = await client.get_all_orders(symbol=s2, limit=15)
                                         
                                         now_ms = int(time_mod.time() * 1000)
-                                        recent_orders = [o for o in orders1 + orders2 
-                                                        if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000]
+                                        recent_orders = []
+                                        for o in orders1 + orders2:
+                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                                recent_orders.append(o)
                                         
                                         if recent_orders:
                                             recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
@@ -667,7 +683,7 @@ async def ws_user_msg(ws, msg):
                                                 close_type = '📈 Trailing Stop'
                                             else:
                                                 close_type = f'⚡ {o_type}'
-                                            print(f"� Detected: {o_type} -> {close_type}")
+                                            print(f"📋 Detected: {o_type} -> {close_type}")
                                         else:
                                             close_type = '⚡ External Close'
                                             close_hint = ' (no orders found)'
@@ -683,7 +699,6 @@ async def ws_user_msg(ws, msg):
                                     p2 = pairs_manager.last_prices.get(s2, 0)
                                     if p1 > 0 and p2 > 0:
                                         zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
-                                        import math
                                         if math.isnan(zscore):
                                             zscore = getattr(pair_info, 'last_z_score', 0) or 0
                                     else:
@@ -693,14 +708,14 @@ async def ws_user_msg(ws, msg):
                                 beta = getattr(pair_info, 'beta_btc', 0) or 0
                                 e1 = '🟢' if pnl1 >= 0 else '🔴'
                                 e2 = '🟢' if pnl2 >= 0 else '🔴'
-                                msg_text = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
+                                done_msg = (f"{close_type}: <b>{s1}-{s2}</b>\n\n"
                                             f"📊 Z: {zscore:+.2f} | β: {beta:.3f}\n"
                                             f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
                                             f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
                                             f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                                 
                                 reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                                await send_tg_notification(msg_text, reply_to)
+                                await send_tg_notification(done_msg, reply_to)
                                 
                                 # Update memory state
                                 pair_info.position_status = 0
@@ -753,11 +768,9 @@ async def ws_user_msg(ws, msg):
                                     print(f"✅ Closed remaining leg {other_symbol}")
                                 
                                 # Small delay to ensure trade data is available
-                                import asyncio
                                 await asyncio.sleep(1)
                                 
                                 # Fetch actual PnL from recent trades (more reliable than Income API)
-                                import time as time_mod
                                 now_ms = int(time_mod.time() * 1000)
                                 start_ms = now_ms - 300_000  # Last 5 minutes
                                 
@@ -806,22 +819,7 @@ async def ws_user_msg(ws, msg):
                                         'fee2': fee2
                                     })
                                 
-                                # Define close reason mapping
-                                CLOSE_REASONS = {
-                                    'z_tp': '💰 Z-Score Take Profit',
-                                    'z_sl': '🛑 Z-Score Stop Loss',
-                                    'circuit': '🔴 Circuit Breaker',
-                                    'broken_coint': '🚨 Broken Correlation',
-                                    'hardware_sl': '🛡️ Hardware SL',
-                                    'hardware_tp': '🛡️ Hardware TP',
-                                    'manual': '👤 Manual Close',
-                                    'desync': '⚠️ Leg Desync',
-                                    'beta_drift': '📉 Beta Drift',
-                                    'external': '⚡ External Close',
-                                    'orphan_restart': '🔄 Orphan on Restart',
-                                    'stale_symbols': '⏳ Stale Symbols',
-                                    'manual_partial': '👤 Manual Close (1 leg)',
-                                }
+                                # Use canonical CLOSE_REASONS from pairs_trading module
                                 
                                 # Default values (in case no reason is found)
                                 close_type = '❓ Unknown'
@@ -839,10 +837,10 @@ async def ws_user_msg(ws, msg):
                                         orders1 = await client.get_all_orders(symbol=s1, limit=15)
                                         orders2 = await client.get_all_orders(symbol=s2, limit=15)
                                         
-                                        now_ms = int(time_mod.time() * 1000)
+                                        now_time = int(time_mod.time() * 1000)
                                         recent_orders = []
                                         for o in orders1 + orders2:
-                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_ms - 300_000:
+                                            if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_time - 300_000:
                                                 recent_orders.append(o)
                                         
                                         if recent_orders:
@@ -868,7 +866,7 @@ async def ws_user_msg(ws, msg):
                                             else:
                                                 close_type = f'⚡ Order: {o_type}'
                                             
-                                            print(f"� Detected from orders: {o_type} -> {close_type}")
+                                            print(f"📋 Detected from orders: {o_type} -> {close_type}")
                                         else:
                                             # No recent orders found - truly external or WebSocket miss
                                             close_type = '⚡ External Close'
@@ -887,7 +885,6 @@ async def ws_user_msg(ws, msg):
                                     p2 = pairs_manager.last_prices.get(s2, 0)
                                     if p1 > 0 and p2 > 0:
                                         zscore = pairs_manager._calc_realtime_zscore(pair_info, p1, p2)
-                                        import math
                                         if math.isnan(zscore):
                                             zscore = getattr(pair_info, 'last_z_score', 0) or 0
                                     else:

@@ -494,6 +494,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
     cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
     p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
     bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
+    beta_crit = getattr(conf, 'beta_critical', 1.0) or 1.0
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"SL ATR Mult: {sl_atr}", callback_data="set_sl_atr")],
@@ -505,6 +506,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}%", callback_data="set_circuit_breaker")],
         [InlineKeyboardButton(text=f"P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
+        [InlineKeyboardButton(text=f"⚠️ Beta Critical: {beta_crit}", callback_data="set_beta_critical")],
         [InlineKeyboardButton(text="Back", callback_data="risk_settings")]
     ])
     await answer(callback, "🛡️ <b>Hardware SL/TP Settings</b>\n\n"
@@ -515,7 +517,8 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
                            f"  ATR Multiplier: {tp_atr}x\n"
                            f"  Range: {tp_min*100:.0f}% - {tp_max*100:.0f}%\n\n"
                            f"<b>Circuit Breaker:</b> {cb_pct*100:.0f}% total pair loss\n"
-                           f"<b>Min Order Bump:</b> {bump}x max increase", reply_markup=keyboard)
+                           f"<b>Min Order Bump:</b> {bump}x max increase\n"
+                           f"<b>Beta Critical:</b> {beta_crit} (force-close if |β| ≥ this)", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_sl_atr")
 async def set_sl_atr_cb(callback: CallbackQuery, state: FSMContext):
@@ -570,6 +573,16 @@ async def set_min_bump_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.hardware_sltp)
     await state.update_data(waiting_for="min_order_bump")
     await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
+
+@dp.callback_query(F.data == "set_beta_critical")
+async def set_beta_critical_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.hardware_sltp)
+    await state.update_data(waiting_for="beta_critical")
+    await answer(callback, "⚠️ <b>Beta Critical Threshold</b>\n\n"
+                           "Force-close position if |beta| ≥ this value, regardless of PnL.\n\n"
+                           "• 1.0 = pair moves MORE than BTC itself\n"
+                           "• 0.5 = moderate directional exposure\n\n"
+                           "Enter value (e.g., 1.0):")
 
 @dp.message(StateFilter(States.hardware_sltp))
 async def process_hardware_sltp_settings(message: Message, state: FSMContext):
