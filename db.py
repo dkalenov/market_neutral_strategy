@@ -98,7 +98,7 @@ class ConfigInfo:
     tp_atr_mult: float      # ATR multiplier for take-profit (default 4.0)
     tp_min_pct: float       # Minimum TP distance in % (default 0.15)
     tp_max_pct: float       # Maximum TP distance in % (default 0.50)
-    circuit_breaker_pct: float  # Total pair PnL stop (default 0.20)
+    circuit_breaker_pct: float  # Max loss as % of margin before force-close (default 0.50)
     p_value_threshold: float    # Max p-value for correlation validity (default 0.05)
     min_order_bump: float   # Max allowed order size increase ratio (default 1.5)
     # Position Management (Phase 2)
@@ -203,8 +203,8 @@ async def load_config():
             'capital': '1000',
             'leverage': '20',
             'max_notional_pct': '0.1',
-            'z_entry': '2.0',
-            'z_entry_max': '3.0',  # Upper bound for entry window
+            'z_entry': '1.9',
+            'z_entry_max': '2.5',  # Upper bound for entry window
             'z_exit': '0.0',
             'z_stop': '4.0',
             'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
@@ -215,7 +215,7 @@ async def load_config():
             'tp_atr_mult': '4.0',
             'tp_min_pct': '0.15',
             'tp_max_pct': '0.50',
-            'circuit_breaker_pct': '0.20',
+            'circuit_breaker_pct': '0.50',
             'p_value_threshold': '0.05',
             'min_order_bump': '1.5',
             # Position Management (Phase 2)

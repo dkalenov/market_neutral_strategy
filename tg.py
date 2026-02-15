@@ -309,8 +309,8 @@ async def settings(message: Message, state: FSMContext):
     cap = conf.capital if conf.capital else "1000 (default)"
     lev = conf.leverage if conf.leverage else "20 (default)"
     risk = f"{conf.max_notional_pct*100}%" if conf.max_notional_pct else "10% (default)"
-    z_in = conf.z_entry if conf.z_entry else "2.0 (default)"
-    z_in_max = conf.z_entry_max if conf.z_entry_max else "3.0 (default)"
+    z_in = conf.z_entry if conf.z_entry else "1.9 (default)"
+    z_in_max = conf.z_entry_max if conf.z_entry_max else "2.5 (default)"
     z_ex = conf.z_exit if conf.z_exit is not None else "0.0 (default)"
     z_out = conf.z_stop if conf.z_stop else "4.0 (default)"
 
@@ -427,7 +427,7 @@ async def set_max_notional_cb(callback: CallbackQuery, state: FSMContext):
 async def set_z_entry_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="z_entry")
-    await answer(callback, "Enter Z-Score for ENTRY (e.g., 2.0):")
+    await answer(callback, "Enter Z-Score for ENTRY (lower bound of entry window, e.g., 1.9):")
 
 @dp.callback_query(F.data == "set_z_exit")
 async def set_z_exit_cb(callback: CallbackQuery, state: FSMContext):
@@ -439,7 +439,7 @@ async def set_z_exit_cb(callback: CallbackQuery, state: FSMContext):
 async def set_z_entry_max_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="z_entry_max")
-    await answer(callback, "Enter Z-Score MAX for ENTRY (upper bound of entry window, e.g., 3.0):")
+    await answer(callback, "Enter Z-Score MAX for ENTRY (upper bound of entry window, e.g., 2.5):")
 
 @dp.callback_query(F.data == "set_z_stop")
 async def set_z_stop_cb(callback: CallbackQuery, state: FSMContext):
@@ -524,7 +524,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
     tp_atr = getattr(conf, 'tp_atr_mult', 4.0) or 4.0
     tp_min = getattr(conf, 'tp_min_pct', 0.15) or 0.15
     tp_max = getattr(conf, 'tp_max_pct', 0.50) or 0.50
-    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
+    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.50) or 0.50
     p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
     bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
     beta_crit = getattr(conf, 'beta_critical', 1.0) or 1.0
@@ -536,7 +536,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"TP ATR Mult: {tp_atr}", callback_data="set_tp_atr")],
         [InlineKeyboardButton(text=f"TP Min: {tp_min*100:.0f}%", callback_data="set_tp_min"),
          InlineKeyboardButton(text=f"TP Max: {tp_max*100:.0f}%", callback_data="set_tp_max")],
-        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}%", callback_data="set_circuit_breaker")],
+        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}% margin", callback_data="set_circuit_breaker")],
         [InlineKeyboardButton(text=f"P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
         [InlineKeyboardButton(text=f"⚠️ Beta Critical: {beta_crit}", callback_data="set_beta_critical")],
@@ -549,7 +549,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
                            "<b>Take-Profit (ATR-based):</b>\n"
                            f"  ATR Multiplier: {tp_atr}x\n"
                            f"  Range: {tp_min*100:.0f}% - {tp_max*100:.0f}%\n\n"
-                           f"<b>Circuit Breaker:</b> {cb_pct*100:.0f}% total pair loss\n"
+                           f"<b>Circuit Breaker:</b> {cb_pct*100:.0f}% of margin (={cb_pct/(conf.leverage or 20)*100:.1f}% notional at {conf.leverage or 20}x)\n"
                            f"<b>Min Order Bump:</b> {bump}x max increase\n"
                            f"<b>Beta Critical:</b> {beta_crit} (force-close if |β| ≥ this)", reply_markup=keyboard)
 
@@ -593,7 +593,14 @@ async def set_tp_max_cb(callback: CallbackQuery, state: FSMContext):
 async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.hardware_sltp)
     await state.update_data(waiting_for="circuit_breaker_pct")
-    await answer(callback, "Enter Circuit Breaker % as decimal (e.g., 0.20 for 20%):")
+    conf = await db.load_config()
+    lev = conf.leverage if conf.leverage else 20
+    await answer(callback, 
+        f"Enter Circuit Breaker as % of <b>margin</b> (deployed capital).\n\n"
+        f"At {lev}x leverage:\n"
+        f"  50% margin = {50/lev:.1f}% of notional\n"
+        f"  30% margin = {30/lev:.1f}% of notional\n\n"
+        f"Enter as decimal (e.g., 0.50 for 50%):")
 
 @dp.callback_query(F.data == "set_p_value")
 async def set_p_value_cb(callback: CallbackQuery, state: FSMContext):

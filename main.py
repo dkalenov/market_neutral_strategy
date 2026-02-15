@@ -608,10 +608,15 @@ async def ws_user_msg(ws, msg):
             s1, s2 = pair_info.symbol1, pair_info.symbol2
             
             if other_closed_in_batch:
-                # Check if bot already handled this close (prevent duplicate notification)
-                if getattr(pair_info, 'close_handled', False):
-                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping external notification")
+                # Check if bot already handled this close AND sent its own notification
+                stored_reason = getattr(pair_info, 'last_close_reason', '')
+                bot_close_reasons = ('manual', 'z_tp', 'z_sl', 'circuit', 'broken_coint', 
+                                     'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
+                                     'btc_shock', 'desync', 'orphan_restart', 'stale_symbols')
+                if getattr(pair_info, 'close_handled', False) and stored_reason in bot_close_reasons:
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping external notification")
                     pair_info.close_handled = False  # Reset for next trade
+                    pair_info.is_trading = False
                     continue
                 
                 # Both legs closed together - fetch actual PnL and cleanup
@@ -754,8 +759,11 @@ async def ws_user_msg(ws, msg):
                     traceback.print_exc()
             else:
                 # Only one leg closed - check if bot is already handling this
-                if getattr(pair_info, 'close_handled', False):
-                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {getattr(pair_info, 'last_close_reason', 'unknown')}), skipping single-leg handler")
+                stored_reason = getattr(pair_info, 'last_close_reason', '')
+                if getattr(pair_info, 'close_handled', False) and stored_reason in ('manual', 'z_tp', 'z_sl', 'circuit', 'broken_coint', 
+                        'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
+                        'btc_shock', 'desync', 'orphan_restart', 'stale_symbols'):
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping single-leg handler")
                     pair_info.is_trading = False
                     continue
                 
@@ -962,6 +970,13 @@ async def ws_user_msg(ws, msg):
                 for pair_info in pairs_manager.active_pairs.values():
                     if pair_info.position_status != 0 and symbol in [pair_info.symbol1, pair_info.symbol2]:
                         s1, s2 = pair_info.symbol1, pair_info.symbol2
+                        
+                        # Skip if pair is already being processed for closure
+                        # (e.g. bulk close on exchange cancels orders then closes positions)
+                        if getattr(pair_info, 'is_trading', False):
+                            print(f"ℹ️ {s1}-{s2} already being processed, skipping cancel handler")
+                            break
+                        
                         other_symbol = s2 if symbol == s1 else s1
                         
                         # Notify user about manual order cancellation

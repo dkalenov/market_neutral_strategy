@@ -119,9 +119,12 @@ def calculate_pair_beta(pair_r, market_r):
     market_r = np.array(market_r, dtype=float)
     if len(pair_r) != len(market_r) or len(pair_r) < 5:
         return np.nan
-    cov = np.cov(pair_r, market_r)[0, 1]
-    var_m = np.var(market_r)
-    if var_m == 0:
+    # CRITICAL: Use consistent ddof=1 for both cov and var.
+    # np.cov defaults to ddof=1 (sample), but np.var defaults to ddof=0 (population).
+    # Mismatch causes beta spikes when BTC variance is low.
+    cov = np.cov(pair_r, market_r)[0, 1]  # ddof=1 (sample)
+    var_m = np.var(market_r, ddof=1)       # ddof=1 (sample) — MUST match cov
+    if var_m < 1e-20:  # Avoid division by near-zero
         return np.nan
     return float(cov / var_m)
 
