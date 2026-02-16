@@ -218,6 +218,14 @@ async def load_config():
             'circuit_breaker_pct': '0.50',
             'p_value_threshold': '0.05',
             'min_order_bump': '1.5',
+            # Hardware SL/TP Parameters (ATR-based) - values are decimal fractions
+            'sl_atr_mult': '2.5',
+            'sl_min_pct': '0.10',     # 10% min SL distance
+            'sl_max_pct': '0.30',     # 30% max SL distance
+            'tp_atr_mult': '4.0',
+            'tp_min_pct': '0.15',     # 15% min TP distance
+            'tp_max_pct': '0.50',     # 50% max TP distance
+            'circuit_breaker_pct': '0.50',
             # Position Management (Phase 2)
             'max_active_pairs': '5',
             'test_mode': 'false',

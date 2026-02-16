@@ -2154,9 +2154,12 @@ class PairsManager:
         
         print(f"🔍 Immediate analysis complete. Checked {analyzed} pairs.")
 
-    def is_symbol_locked(self, symbol: str) -> bool:
+    def is_symbol_locked(self, symbol: str, exclude_pair=None) -> bool:
         """Check if symbol is already in an active position or being opened (in any pair)."""
         for pair_info in self.active_pairs.values():
+            # Skip the pair we're currently trying to open (prevents self-blocking)
+            if exclude_pair is not None and pair_info is exclude_pair:
+                continue
             # DC-3: Also check is_trading — pair may be in the process of opening
             # (position_status is now set AFTER order success, not tentatively in lock)
             if pair_info.position_status != 0 or pair_info.is_trading:
@@ -2164,10 +2167,13 @@ class PairsManager:
                     return True
         return False
 
-    def count_active_positions(self) -> int:
+    def count_active_positions(self, exclude_pair=None) -> int:
         """Count the number of currently open or being-opened pairs."""
         count = 0
         for pair_info in self.active_pairs.values():
+            # Skip the pair we're currently trying to open (prevents self-blocking)
+            if exclude_pair is not None and pair_info is exclude_pair:
+                continue
             # DC-3: Also count pairs being opened (is_trading=True)
             if pair_info.position_status != 0 or pair_info.is_trading:
                 count += 1
@@ -2190,8 +2196,13 @@ class PairsManager:
             print(f"⚠️ Failed to refresh exchange position count: {e}")
             return self._exchange_position_count
 
-    def can_open_new_position(self, s1: str, s2: str) -> bool:
-        """Check if we can open a new position for this pair."""
+    def can_open_new_position(self, s1: str, s2: str, exclude_pair=None) -> bool:
+        """Check if we can open a new position for this pair.
+        
+        Args:
+            exclude_pair: PairInfo to exclude from checks (prevents self-blocking
+                          when the pair being opened has is_trading=True already set).
+        """
         # Check if trading is enabled
         trade_mode = getattr(self.config, 'trade_mode', True)
         if trade_mode is not None and str(trade_mode).lower() in ('false', '0', 'no'):
@@ -2199,7 +2210,7 @@ class PairsManager:
         
         # Check max active pairs limit (local memory)
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
-        if self.count_active_positions() >= max_pairs:
+        if self.count_active_positions(exclude_pair=exclude_pair) >= max_pairs:
             return False
         
         # SAFETY: Also check exchange position cache (positions / 2 = pairs)
@@ -2210,7 +2221,7 @@ class PairsManager:
             return False
         
         # Check symbol lock - each symbol can only be in one active pair
-        if self.is_symbol_locked(s1) or self.is_symbol_locked(s2):
+        if self.is_symbol_locked(s1, exclude_pair=exclude_pair) or self.is_symbol_locked(s2, exclude_pair=exclude_pair):
             return False
         
         return True
@@ -2229,7 +2240,8 @@ class PairsManager:
         if direction != 0:
             async with self._trade_lock:
                 # CRITICAL: Re-check limit inside lock to prevent race condition
-                if not self.can_open_new_position(s1, s2):
+                # exclude_pair=pair_info: don't let the pair block itself (is_trading already True)
+                if not self.can_open_new_position(s1, s2, exclude_pair=pair_info):
                     print(f"🚫 Trade blocked by lock: {s1}-{s2} (limit reached or symbol locked)")
                     pair_info.is_trading = False
                     return
@@ -3123,10 +3135,18 @@ class PairsManager:
                         
                         # Validate all prices are positive before placing orders
                         if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
-                            print(f"⚠️ WARN: Invalid SL/TP prices (sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}). ATR may be missing.")
+                            warn_msg = (f"⚠️ CRITICAL: Invalid SL/TP prices for {s1}-{s2}! "
+                                       f"sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}. "
+                                       f"Force closing position.")
+                            print(warn_msg)
                             print(f"  Entry prices: {pair_info.entry_price1}, {pair_info.entry_price2}")
                             print(f"  ATR values: {atr1}, {atr2}")
-                            # Skip placing protection but don't force close - allow software stops
+                            reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                            await self._notify(warn_msg, reply_to)
+                            # Force close — can't leave positions unprotected
+                            pair_info.close_handled = True
+                            pair_info.is_trading = True
+                            await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                             return
                         
                         # Use algo orders
@@ -3569,55 +3589,68 @@ class PairsManager:
         Periodically checks for confirmed signals (held for N seconds).
         """
         confirm_sec = getattr(self.config, 'signal_confirm_sec', 10) or 10
+        last_status_log = 0
         
         while True:
             await asyncio.sleep(1)  # Check every second
             
-            for pair_info in list(self.active_pairs.values()):
-                if pair_info.position_status != 0 or pair_info.is_trading:
-                    continue
+            try:
+                # Periodic status log (every 60s) to show bot is alive
+                now = time.time()
+                if now - last_status_log >= 60:
+                    last_status_log = now
+                    idle_count = sum(1 for pi in self.active_pairs.values() if pi.position_status == 0 and not pi.is_trading)
+                    open_count = sum(1 for pi in self.active_pairs.values() if pi.position_status != 0)
+                    pending_count = sum(1 for pi in self.active_pairs.values() if pi.pending_signal is not None)
+                    print(f"📊 Signal monitor: {idle_count} idle pairs, {open_count} open positions, {pending_count} pending signals")
                 
-                if pair_info.pending_signal is not None and pair_info.pending_since is not None:
-                    elapsed = time.time() - pair_info.pending_since
+                for pair_info in list(self.active_pairs.values()):
+                    if pair_info.position_status != 0 or pair_info.is_trading:
+                        continue
                     
-                    if elapsed >= confirm_sec:
-                        # Re-check current Z-score
-                        price1 = self.last_prices.get(pair_info.symbol1)
-                        price2 = self.last_prices.get(pair_info.symbol2)
+                    if pair_info.pending_signal is not None and pair_info.pending_since is not None:
+                        elapsed = time.time() - pair_info.pending_since
                         
-                        if price1 and price2:
-                            current_z = self._calc_realtime_zscore(pair_info, price1, price2)
-                            z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
-                            z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
+                        if elapsed >= confirm_sec:
+                            # Re-check current Z-score
+                            price1 = self.last_prices.get(pair_info.symbol1)
+                            price2 = self.last_prices.get(pair_info.symbol2)
                             
-                            # Check signal still valid and in same direction
-                            # Also reject if Z-score exceeds entry window (spread may be broken)
-                            if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
-                                # Check can open
-                                if self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
-                                    # Check cooldown from failed leverage/trade
-                                    fail_until = getattr(pair_info, '_leverage_fail_until', 0)
-                                    if fail_until and time.time() < fail_until:
-                                        continue
-                                    
-                                    # Check cooldown after stop-loss close
-                                    close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
-                                    if close_cooldown and time.time() < close_cooldown:
-                                        remaining = int(close_cooldown - time.time())
-                                        print(f"⏸️ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
-                                        continue
-                                    
-                                    direction = 1 if current_z < 0 else -1
-                                    pair_info.entry_z_score = current_z
-                                    print(f"✅ Signal CONFIRMED for {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f}. Opening position...")
-                                    pair_info.is_trading = True
-                                    self.loop.create_task(self._execute_trade(pair_info, direction))
-                            elif abs(current_z) >= z_entry_max:
-                                print(f"⚠️ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
-                        
-                        # Reset pending after check
-                        pair_info.pending_signal = None
-                        pair_info.pending_since = None
+                            if price1 and price2:
+                                current_z = self._calc_realtime_zscore(pair_info, price1, price2)
+                                z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
+                                z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
+                                
+                                # Check signal still valid and in same direction
+                                # Also reject if Z-score exceeds entry window (spread may be broken)
+                                if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
+                                    # Check can open
+                                    if self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
+                                        # Check cooldown from failed leverage/trade
+                                        fail_until = getattr(pair_info, '_leverage_fail_until', 0)
+                                        if fail_until and time.time() < fail_until:
+                                            continue
+                                        
+                                        # Check cooldown after stop-loss close
+                                        close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
+                                        if close_cooldown and time.time() < close_cooldown:
+                                            remaining = int(close_cooldown - time.time())
+                                            print(f"⏸️ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
+                                            continue
+                                        
+                                        direction = 1 if current_z < 0 else -1
+                                        pair_info.entry_z_score = current_z
+                                        print(f"✅ Signal CONFIRMED for {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f}. Opening position...")
+                                        pair_info.is_trading = True
+                                        self.loop.create_task(self._execute_trade(pair_info, direction))
+                                elif abs(current_z) >= z_entry_max:
+                                    print(f"⚠️ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
+                            
+                            # Reset pending after confirmed check (timer expired)
+                            pair_info.pending_signal = None
+                            pair_info.pending_since = None
+            except Exception as e:
+                print(f"⚠️ Signal confirmation loop error (continuing): {e}")
     
     async def _subscribe_new_pair_realtime(self, symbol1: str, symbol2: str):
         """

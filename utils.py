@@ -289,6 +289,11 @@ def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) 
     sl_pct = max(min(atr_sl, sl_max_pct), sl_min_pct)
     tp_pct = max(min(atr_tp, tp_max_pct), tp_min_pct)
     
+    # SAFETY: Clamp to max 95% to prevent negative prices
+    # (e.g., SHORT TP = entry*(1-tp_pct) goes negative if tp_pct >= 1.0)
+    sl_pct = min(sl_pct, 0.95)
+    tp_pct = min(tp_pct, 0.95)
+    
     # Calculate prices based on side
     if side == 'LONG':
         sl_price = entry_price * (1 - sl_pct)
