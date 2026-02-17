@@ -156,9 +156,6 @@ async def main():
             window_size = 336  # Default as for 1h
         print(f"⚙️ Auto-calculated window_size: {window_size} (for {timeframe})")
     
-    # Single TF Mode: entry timeframe = main timeframe
-    # This ensures Z-score consistency and avoids conflicting signals
-    entry_timeframe = timeframe  # Changed from separate entry TF to single TF mode
     
     # 1. Load symbols (with error handling for bad filter data from Binance)
     print("Initial loading of market symbols...")
@@ -222,7 +219,6 @@ async def main():
         loop, 
         all_symbols, 
         timeframe=timeframe, 
-        entry_timeframe=entry_timeframe,  # NEW: faster TF for entry signals
         min_data_points=window_size,
         notify_callback=send_tg_notification,
         config_info=conf
@@ -237,8 +233,7 @@ async def main():
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
     
-    # 4. Connect to websockets (both timeframes)
-    loop.create_task(connect_ws(timeframe, entry_timeframe))
+    loop.create_task(connect_ws(timeframe))
     
     # Run Telegram bot
     await tg.run(session, client, pairs_manager)
@@ -291,7 +286,7 @@ async def load_symbols_loop():
 
 
 # Connect to websockets
-async def connect_ws(timeframe='1h', entry_timeframe=None):
+async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
     global pairs_manager
@@ -382,13 +377,7 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
     # MAIN TIMEFRAME: for discovery (cointegration tests)
     main_streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
     
-    # ENTRY TIMEFRAME: for faster entry signals (only if different from main)
-    if entry_timeframe and entry_timeframe != timeframe:
-        entry_streams = [f"{symbol.lower()}@kline_{entry_timeframe}" for symbol in target_symbols]
-        print(f"MTF Mode: Main TF={timeframe} (discovery), Entry TF={entry_timeframe} (signals)")
-    else:
-        entry_streams = []
-        print(f"Single TF Mode: {timeframe}")
+    print(f"Single TF Mode: {timeframe}")
 
     # Start websockets for MAIN timeframe
     chunk_size = 100
@@ -403,20 +392,6 @@ async def connect_ws(timeframe='1h', entry_timeframe=None):
             print(f"Error subscribing to main TF chunk {i+1}: {e}")
 
     print(f"Connected to main TF kline websockets ({len(websockets_list)} connections).")
-    
-    # Start websockets for ENTRY timeframe (if MTF mode)
-    if entry_streams:
-        entry_streams_list = [entry_streams[i:i + chunk_size] for i in range(0, len(entry_streams), chunk_size)]
-        entry_ws_count = 0
-        for i, stream_list in enumerate(entry_streams_list):
-            try:
-                ws = await client.websocket(stream_list, on_message=ws_msg_entry, on_error=ws_error)
-                websockets_list.append(ws)
-                entry_ws_count += 1
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                print(f"Error subscribing to entry TF chunk {i+1}: {e}")
-        print(f"Connected to entry TF kline websockets ({entry_ws_count} connections).")
 
     # Userdata websocket
     try:
@@ -516,17 +491,6 @@ async def ws_msg_main(ws, msg):
     if kline['x']:
         await pairs_manager.add_kline_main(kline)
 
-
-# Handle ENTRY timeframe kline messages (for faster signal detection)
-async def ws_msg_entry(ws, msg):
-    if 'data' not in msg:
-        return
-    
-    kline = msg['data']['k']
-    
-    # Only process on candle close (even for entry, we use closed 15m candles for stability)
-    if kline['x']:
-        await pairs_manager.add_kline_entry(kline)
 
 
 # Handle userdata messages

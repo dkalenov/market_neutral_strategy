@@ -103,12 +103,11 @@ class PairsManager:
     Manages symbol data, finds cointegrated pairs, and generates signals.
     Supports Multi-Timeframe (MTF) mode: main TF for discovery, entry TF for faster signals.
     """
-    def __init__(self, client, loop, all_symbols, timeframe='1h', entry_timeframe=None, min_data_points=200, notify_callback=None, config_info=None):
+    def __init__(self, client, loop, all_symbols, timeframe='1h', min_data_points=200, notify_callback=None, config_info=None):
         self.client = client
         self.loop = loop
         self.all_symbols = all_symbols
         self.timeframe = timeframe
-        self.entry_timeframe = entry_timeframe or timeframe  # Default to main TF if not specified
         self.min_data_points = min_data_points
         self.notify_callback = notify_callback
         self.config = config_info
@@ -117,10 +116,10 @@ class PairsManager:
         
         # Main TF data (for discovery + validation)
         self.all_data: dict[str, Data] = {}
-        # Entry TF data (for faster signal detection) - only used if MTF mode
-        self.entry_data: dict[str, Data] = {}
         
         self.active_pairs: dict[frozenset, PairInfo] = {}
+        # O(1) symbol → list[PairInfo] index (maintained by _register_pair/_unregister_pair)
+        self._symbol_to_pairs: dict[str, list[PairInfo]] = {}
         self.leverage_cache = {} # {symbol: leverage_int}
         self._discovery_task = None
         self._last_discovery_time = 0
@@ -265,6 +264,7 @@ class PairsManager:
                             info.current_trade_id = last_trade.id
                         
                         self.active_pairs[pair_set] = info
+                        self._register_pair(info)
                         restored_count += 1
                         print(f"  ✅ Restored: {p.symbol1}-{p.symbol2} (β:{info.beta_btc:.3f}, p:{info.last_pvalue:.4f})")
                     
@@ -514,6 +514,7 @@ class PairsManager:
                                         tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0
                                     )
                                     self.active_pairs[pair_set] = info
+                                    self._register_pair(info)
                                     tracked_symbols.add(db_pair.symbol1)
                                     tracked_symbols.add(db_pair.symbol2)
                                     print(f"      🔄 RECOVERED from DB: {db_pair.symbol1}-{db_pair.symbol2} (was missed during load)")
@@ -1069,7 +1070,8 @@ class PairsManager:
             print(f"⚠️ Cannot remove {s1}-{s2}: has open position or is trading")
             return
         
-        # Remove from active_pairs
+        # Remove from active_pairs and symbol index
+        self._unregister_pair(pair_info)
         del self.active_pairs[pair_set]
         
         # Remove markPrice subscription if symbols not used by other pairs
@@ -1410,13 +1412,15 @@ class PairsManager:
                 )
                 await db.add_pair(new_pair)
                 
-                self.active_pairs[pair_set] = PairInfo(
+                new_info = PairInfo(
                     symbol1=s1,
                     symbol2=s2,
                     hedge_ratio=1.0,
                     half_life=24.0,
                     db_id=new_pair.id
                 )
+                self.active_pairs[pair_set] = new_info
+                self._register_pair(new_info)
                 print(f"  ✅ Added test pair: {s1}-{s2}")
             except Exception as e:
                 print(f"  ⚠️ Error adding test pair {s1}-{s2}: {e}")
@@ -1499,19 +1503,6 @@ class PairsManager:
         print("🔍 Running initial Discovery...")
         await self._discover_new_pairs()
         
-        # Initialize entry_data for all symbols that have main TF data (for MTF mode)
-        if self.entry_timeframe != self.timeframe:
-            print(f"📊 Initializing entry TF ({self.entry_timeframe}) data for discovered pairs...")
-            symbols_to_init = set()
-            for pair_info in self.active_pairs.values():
-                symbols_to_init.add(pair_info.symbol1)
-                symbols_to_init.add(pair_info.symbol2)
-            
-            for sym in symbols_to_init:
-                if sym not in self.entry_data and sym in self.all_symbols:
-                    self.entry_data[sym] = Data(maxlen=100)
-                    await self._initialize_entry_history(sym)
-            print(f"📊 Entry TF data initialized for {len(symbols_to_init)} symbols.")
         
         # Force run analysis for test_mode
         test_mode = getattr(self.config, 'test_mode', False)
@@ -1551,107 +1542,6 @@ class PairsManager:
         if added:
             # Full analysis: discovery + signal check
             self.loop.create_task(self.run_analysis(symbol))
-
-    async def add_kline_entry(self, kline_data):
-        """
-        Processes kline from ENTRY timeframe (faster signal detection).
-        Only checks signals for ALREADY DISCOVERED pairs.
-        """
-        symbol = kline_data['s']
-        
-        # Store entry TF data for the symbol
-        if symbol not in self.entry_data:
-            self.entry_data[symbol] = Data(maxlen=100)  # Smaller buffer for entry TF
-            await self._initialize_entry_history(symbol)
-
-        added = self.entry_data[symbol].add_kline(
-            kline_data['t'],
-            kline_data['o'],
-            kline_data['h'],
-            kline_data['l'],
-            kline_data['c']
-        )
-
-        if added:
-            # Only check signals (no discovery) for active pairs containing this symbol
-            self.loop.create_task(self._check_entry_signals(symbol))
-
-    async def _initialize_entry_history(self, symbol):
-        """Loads historical data for entry timeframe."""
-        try:
-            klines = await self.client.klines(symbol, self.entry_timeframe, limit=100)
-            data = self.entry_data[symbol]
-            for k in klines:
-                data.add_kline(k[0], k[1], k[2], k[3], k[4])
-        except Exception as e:
-            if symbol in self.entry_data:
-                del self.entry_data[symbol]
-
-    async def _check_entry_signals(self, updated_symbol: str):
-        """
-        Checks entry signals using ENTRY timeframe data.
-        Uses main TF cointegration parameters but entry TF prices for faster signals.
-        """
-        for pair_set, pair_info in list(self.active_pairs.items()):
-            if pair_info.is_trading or pair_info.position_status != 0:
-                continue
-            
-            s1, s2 = pair_info.symbol1, pair_info.symbol2
-            if updated_symbol not in (s1, s2):
-                continue
-            
-            # Check if we have entry data for both symbols
-            if s1 not in self.entry_data or s2 not in self.entry_data:
-                continue
-            
-            data1 = self.entry_data[s1]
-            data2 = self.entry_data[s2]
-            
-            if len(data1.close) < 30 or len(data2.close) < 30:
-                continue
-            
-            # Use main TF hedge ratio but entry TF prices
-            log_prices1 = np.log(list(data1.close)[-50:])
-            log_prices2 = np.log(list(data2.close)[-50:])
-            
-            spread = log_prices1 - pair_info.hedge_ratio * log_prices2
-            z_score = utils.calculate_z_last(spread)
-            
-            if z_score is None:
-                continue
-            
-            pair_info.last_z_score = z_score
-            
-            z_entry = self.config.z_entry if self.config and self.config.z_entry else 1.9
-            z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
-            
-            # Check position limits
-            if not self.can_open_new_position(s1, s2):
-                continue
-            
-            # Skip if pair is in cooldown after SL
-            if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
-                continue
-            
-            # Skip if pair is waiting for next candle close before re-entry
-            if getattr(pair_info, '_wait_for_candle', False):
-                continue
-            
-            # Entry signals (within z_entry window: z_entry <= |z| < z_entry_max)
-            abs_z = abs(z_score)
-            if abs_z >= z_entry and abs_z < z_entry_max:
-                if z_score < 0:
-                    print(f"🚀 [ENTRY TF] LONG Signal on {s1}-{s2}. Z: {z_score:.2f} (window: {z_entry}-{z_entry_max}). Opening...")
-                    pair_info.entry_z_score = z_score  # Save Z-score at entry
-                    pair_info.is_trading = True
-                    self.loop.create_task(self._execute_trade(pair_info, 1))
-                else:
-                    print(f"🔥 [ENTRY TF] SHORT Signal on {s1}-{s2}. Z: {z_score:.2f} (window: {z_entry}-{z_entry_max}). Opening...")
-                    pair_info.entry_z_score = z_score  # Save Z-score at entry
-                    pair_info.is_trading = True
-                    self.loop.create_task(self._execute_trade(pair_info, -1))
-            elif abs_z >= z_entry_max:
-                print(f"⚠️ [ENTRY TF] {s1}-{s2}: Z={z_score:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry.")
 
     # Legacy method for backward compatibility (single TF mode)
     async def add_kline(self, kline_data):
@@ -1838,6 +1728,7 @@ class PairsManager:
                             print(f"⚠️ Failed to update DB content for broken pair {s1}-{s2}: {e}")
                     
                     if pair_set in self.active_pairs:
+                        self._unregister_pair(pair_info)
                         del self.active_pairs[pair_set]
                     continue
 
@@ -2173,6 +2064,7 @@ class PairsManager:
                     pair_info.beta_btc = beta_btc
                     pair_info.discovered_at = time.time()  # Track when pair was discovered
                     self.active_pairs[pair_set] = pair_info
+                    self._register_pair(pair_info)
                     new_pairs_count += 1
                     
                     # Subscribe to real-time markPrice for this new pair
@@ -3231,14 +3123,14 @@ class PairsManager:
                         # Find the bracket for our leverage level
                         bracket_data = brackets[0] if isinstance(brackets, list) else brackets
                         bracket_list = bracket_data.get('brackets', [])
-                        max_notional = None
+                        bracket_notional_cap = None
                         for b in bracket_list:
                             if b.get('initialLeverage', 0) >= leverage:
-                                max_notional = float(b.get('notionalCap', 0))
+                                bracket_notional_cap = float(b.get('notionalCap', 0))
                                 break
                         
-                        if max_notional and notional > max_notional:
-                            print(f"🚫 PRE-FLIGHT FAIL: {sym} notional ${notional:.2f} exceeds max ${max_notional:.2f} at {leverage}x leverage")
+                        if bracket_notional_cap and notional > bracket_notional_cap:
+                            print(f"🚫 PRE-FLIGHT FAIL: {sym} notional ${notional:.2f} exceeds max ${bracket_notional_cap:.2f} at {leverage}x leverage")
                             preflight_ok = False
                             break
                         
@@ -3575,12 +3467,25 @@ class PairsManager:
     # === REAL-TIME Z-SCORE MONITORING ===
     
     def _pairs_with_symbol(self, symbol: str) -> list:
-        """Returns all PairInfo objects containing the given symbol."""
-        result = []
-        for pair_set, pair_info in self.active_pairs.items():
-            if symbol in pair_set:
-                result.append(pair_info)
-        return result
+        """Returns all PairInfo objects containing the given symbol. O(1) via index."""
+        return list(self._symbol_to_pairs.get(symbol, []))
+
+    def _register_pair(self, pair_info: PairInfo):
+        """Add pair to _symbol_to_pairs index. Call after adding to active_pairs."""
+        for sym in (pair_info.symbol1, pair_info.symbol2):
+            self._symbol_to_pairs.setdefault(sym, []).append(pair_info)
+
+    def _unregister_pair(self, pair_info: PairInfo):
+        """Remove pair from _symbol_to_pairs index. Call before deleting from active_pairs."""
+        for sym in (pair_info.symbol1, pair_info.symbol2):
+            pairs_list = self._symbol_to_pairs.get(sym)
+            if pairs_list:
+                try:
+                    pairs_list.remove(pair_info)
+                except ValueError:
+                    pass
+                if not pairs_list:
+                    del self._symbol_to_pairs[sym]
     
     def _calc_realtime_zscore(self, pair_info: PairInfo, price1: float, price2: float) -> float:
         """
