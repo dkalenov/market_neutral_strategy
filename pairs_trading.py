@@ -157,6 +157,10 @@ class PairsManager:
         # Cached exchange position count (updated periodically and inside trade lock)
         self._exchange_position_count = 0
         self._exchange_positions_cache: dict[str, float] = {}  # {symbol: qty}
+        
+        # Cached unrealized PnL from exchange (updated every 15s from get_position_risk)
+        # Source of truth for all PnL decisions — NO manual calculations
+        self._exchange_pnl_cache: dict[str, float] = {}  # {symbol: unrealizedProfit}
 
     async def initialize(self):
         """
@@ -443,13 +447,23 @@ class PairsManager:
                 import asyncio
                 
                 # SAFETY: If active_pairs is empty but exchange has positions, 
-                # this is likely a DB load failure - do NOT close anything
+                # attempt emergency recovery from DB before giving up.
                 if len(self.active_pairs) == 0 and len(open_on_exchange) > 0:
-                    warn_msg = (f"⚠️ SAFETY: active_pairs is EMPTY but exchange has {len(open_on_exchange)} positions. "
-                                f"Possible DB load failure. NOT closing unknown positions.")
-                    print(warn_msg)
-                    await self._notify(f"⚠️ <b>SAFETY BLOCK</b>\n\n{warn_msg}")
-                    return
+                    print("⚠️ SAFETY: active_pairs is EMPTY but exchange has positions. Attempting emergency DB recovery...")
+                    try:
+                        await self._load_state_from_db()
+                    except Exception as e:
+                        print(f"⚠️ Emergency DB load failed: {e}")
+                    
+                    if len(self.active_pairs) == 0:
+                        warn_msg = (f"⚠️ <b>SAFETY BLOCK</b>: active_pairs is still EMPTY but exchange has "
+                                    f"{len(open_on_exchange)} positions.\n\n"
+                                    f"Bot will NOT auto-close these unknown positions to prevent data loss.\n"
+                                    f"Please check DB integrity or close positions manually.")
+                        print(warn_msg)
+                        await self._notify(warn_msg)
+                        # We don't return here anymore - we let the individual 'unknown' check below run
+                        # to see if it can recover them one by one.
                 
                 # SAFETY: Check DB directly before closing - maybe the pair exists but wasn't loaded
                 try:
@@ -800,6 +814,29 @@ class PairsManager:
             import traceback
             traceback.print_exc()
 
+    def _get_exchange_pair_pnl(self, pair_info: PairInfo, price1: float = 0, price2: float = 0) -> float:
+        """
+        Get unrealized PnL for a pair from EXCHANGE cache (updated every 15s).
+        This is the SINGLE SOURCE OF TRUTH for all PnL-based decisions.
+        Falls back to manual calc only if cache is empty (first 15s after startup).
+        """
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        pnl1 = self._exchange_pnl_cache.get(s1)
+        pnl2 = self._exchange_pnl_cache.get(s2)
+        
+        if pnl1 is not None and pnl2 is not None:
+            return pnl1 + pnl2
+        
+        # Fallback: manual calc (only during first 15s before cache is populated)
+        if price1 > 0 and price2 > 0 and pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
+            side1 = 1 if pair_info.position_status == 1 else -1
+            side2 = -side1
+            manual_pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
+            manual_pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
+            return manual_pnl1 + manual_pnl2
+        
+        return 0.0
+
     async def _cleanup_orphaned_algo_orders(self):
         """
         Clean up orphaned algo orders (STOP/TAKE_PROFIT).
@@ -810,11 +847,18 @@ class PairsManager:
         """
         try:
             # Get REAL positions from exchange (source of truth)
-            account = await self.client.account()
+            positions_risk = await self.client.get_position_risk()
             exchange_positions = set()
-            for pos in account.get('positions', []):
-                if float(pos.get('positionAmt', 0)) != 0:
-                    exchange_positions.add(pos['symbol'])
+            pnl_update = {}
+            for pos in positions_risk:
+                amt = float(pos.get('positionAmt', 0))
+                if amt != 0:
+                    sym = pos['symbol']
+                    exchange_positions.add(sym)
+                    # Cache unrealized PnL from exchange (source of truth for all PnL decisions)
+                    pnl_update[sym] = float(pos.get('unRealizedProfit', 0))
+            # Atomic update: replace old cache with fresh data
+            self._exchange_pnl_cache = pnl_update
             
             # Sync local state: clear pairs that don't have positions on exchange
             for pair_info in list(self.active_pairs.values()):
@@ -901,20 +945,39 @@ class PairsManager:
                     else:
                         side_dir = -1 if pair_info.position_status == 1 else 1  # s2: short if status=1
                     
-                    # Get current/close price from last_prices or use a recent trades lookup
-                    close_price = self.last_prices.get(symbol, 0)
-                    if close_price > 0 and entry_price > 0:
-                        leg_pnl = (close_price - entry_price) * qty * side_dir
+                    # Get actual PnL from recent trades (source of truth)
+                    try:
+                        # Wait briefly for trade to register
+                        await asyncio.sleep(0.5)
+                        now_ms = int(time.time() * 1000)
+                        start_ms = now_ms - 300_000  # Last 5 minutes
+                        recent_trades = await self.client.get_account_trades(symbol=symbol, startTime=start_ms, limit=20)
                         
-                        # Override order_type classification based on actual PnL
-                        if leg_pnl > 0:
-                            is_tp = True
-                            print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed TAKE PROFIT")
+                        if recent_trades:
+                            # Sum realized PnL of recent trades for this symbol
+                            leg_pnl = sum(float(t.get('realizedPnl', 0)) for t in recent_trades)
+                            
+                            # Override order_type classification based on actual PnL
+                            if leg_pnl > 0:
+                                is_tp = True
+                                print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed TAKE PROFIT")
+                            else:
+                                is_tp = False
+                                print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed STOP LOSS")
                         else:
-                            is_tp = False
-                            print(f"📊 PnL verification: {symbol} PnL={leg_pnl:+.2f} → confirmed STOP LOSS")
-                    else:
-                        print(f"📊 PnL verification skipped (close_price={close_price}, entry={entry_price})")
+                            # Fallback to manual calc if no trades found (rare)
+                            close_price = self.last_prices.get(symbol, 0)
+                            if close_price > 0 and entry_price > 0:
+                                leg_pnl = (close_price - entry_price) * qty * side_dir
+                                if leg_pnl > 0:
+                                    is_tp = True
+                                else:
+                                    is_tp = False
+                                print(f"⚠️ Exchange trades not found, manual PnL: {leg_pnl:.2f} ({'TP' if is_tp else 'SL'})")
+                            else:
+                                print(f"📊 PnL verification skipped (no trades & missing price data)")
+                    except Exception as e:
+                        print(f"⚠️ PnL verification error: {e}. Using order_type={order_type}")
                 except Exception as e:
                     print(f"⚠️ PnL verification error: {e}. Using order_type={order_type}")
                 
@@ -1027,14 +1090,21 @@ class PairsManager:
         """Check that both legs of each active pair are open."""
         try:
             account = await self.client.account()
+            pnl_update = {}
             pos_by_symbol = {}
             for pos in account['positions']:
                 amt = float(pos['positionAmt'])
                 if amt != 0:
-                    pos_by_symbol[pos['symbol']] = amt
-            
-            # Update exchange position cache while we have the data
+                    sym = pos['symbol']
+                    pos_by_symbol[sym] = amt
+                    # Populate PnL cache immediately on startup/sync
+                    # Handle both casing styles just in case
+                    pnl = float(pos.get('unrealizedProfit', 0) or pos.get('unRealizedProfit', 0))
+                    pnl_update[sym] = pnl
+                    
+            # Update exchange caches
             self._exchange_positions_cache = {s: abs(q) for s, q in pos_by_symbol.items()}
+            self._exchange_pnl_cache = pnl_update  # Immediate PnL source of truth
             self._exchange_position_count = len(pos_by_symbol)
             
             for pair_info in list(self.active_pairs.values()):
@@ -1591,13 +1661,18 @@ class PairsManager:
                         beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
                         
                         if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
-                            print(f"⚠️ {s1}-{s2} rejected: beta_btc={beta_btc:.3f} >= {beta_threshold} (not market-neutral)")
-                            flag = 0  # Mark as not cointegrated
+                            # Only reject/set flag=0 if the pair is IDLE (no open position)
+                            # For active trades, we let _check_realtime_exit handle beta drift
+                            if pair_info.position_status == 0:
+                                print(f"⚠️ {s1}-{s2} rejected: beta_btc={beta_btc:.3f} >= {beta_threshold} (not market-neutral)")
+                                flag = 0  # Mark as not cointegrated (only for idle pairs)
+                            else:
+                                # For trading pairs, just log warning - RT exit will handle PnL-based closure
+                                print(f"🛡️ {s1}-{s2} beta drift detected: |beta|={abs(beta_btc):.3f} (above limit {beta_threshold}). Handling via RT monitoring.")
                 
-                # Store beta for display
+                # Store beta for display (ALWAYS, even if rejected)
                 pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
                 pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
-
                 # Check if this is a test pair that should not be removed
                 is_protected_test_pair = False
                 test_mode = getattr(self.config, 'test_mode', False)
@@ -1692,25 +1767,21 @@ class PairsManager:
                     current_price1 = list(data1.close)[-1]
                     current_price2 = list(data2.close)[-1]
                     
-                    side1 = 1 if pair_info.position_status == 1 else -1
-                    side2 = -1 if pair_info.position_status == 1 else 1
-
-                    pnl1 = (current_price1 - pair_info.entry_price1) * pair_info.qty1 * side1
-                    pnl2 = (current_price2 - pair_info.entry_price2) * pair_info.qty2 * side2
-                    total_pnl = pnl1 + pnl2
+                    # Use EXCHANGE PnL (source of truth)
+                    total_pnl = self._get_exchange_pair_pnl(pair_info, current_price1, current_price2)
                     
                     notional = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
                     leverage = self.config.leverage if self.config and self.config.leverage else 20
                     margin = notional / leverage  # Actual deployed capital
-                    circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.50) or 0.50
+                    circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
                     
-                    if margin > 0:
-                        roi_margin = total_pnl / margin
-                        if roi_margin < -circuit_breaker_pct:
-                            roi_notional = total_pnl / notional if notional > 0 else 0
+                    if notional > 0:
+                        roi_notional = total_pnl / notional
+                        if roi_notional < -circuit_breaker_pct:
+                            roi_margin = total_pnl / margin if margin > 0 else 0
                             cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
-                                      f"Loss: {roi_margin*100:.2f}% of margin ({total_pnl:.2f} USDT)\n"
-                                      f"Notional: {roi_notional*100:.2f}% | Leverage: {leverage}x\n"
+                                      f"Loss: {roi_notional*100:.2f}% of notional ({total_pnl:.2f} USDT)\n"
+                                      f"Margin: {roi_margin*100:.2f}% | Leverage: {leverage}x\n"
                                       f"Force Closing...")
                             print(cb_msg)
                             reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
@@ -1731,14 +1802,8 @@ class PairsManager:
                         beta_alert_threshold = getattr(self.config, 'beta_alert_threshold', 0.15) or 0.15
                         
                         if abs(pair_info.beta_btc) >= beta_alert_threshold:
-                            # Calculate current PnL
-                            current_price1 = list(data1.close)[-1]
-                            current_price2 = list(data2.close)[-1]
-                            side1 = 1 if pair_info.position_status == 1 else -1
-                            side2 = -1 if pair_info.position_status == 1 else 1
-                            pnl1 = (current_price1 - pair_info.entry_price1) * pair_info.qty1 * side1
-                            pnl2 = (current_price2 - pair_info.entry_price2) * pair_info.qty2 * side2
-                            total_pnl = pnl1 + pnl2
+                            # Use EXCHANGE PnL (source of truth)
+                            total_pnl = self._get_exchange_pair_pnl(pair_info, current_price1, current_price2)
                             
                             if total_pnl > 0:
                                 # Positive PnL - auto close
@@ -2382,11 +2447,23 @@ class PairsManager:
                     if close_price2 == 0:
                         close_price2 = self.last_prices.get(s2, saved_entry2)
                     
-                    # Calculate PnL
-                    side1_dir = 1 if saved_status == 1 else -1
-                    side2_dir = -side1_dir
-                    pnl1 = (close_price1 - saved_entry1) * saved_qty1 * side1_dir
-                    pnl2 = (close_price2 - saved_entry2) * saved_qty2 * side2_dir
+                    # Calculate PnL using EXCHANGE data (source of truth)
+                    try:
+                        now_ms = int(time.time() * 1000)
+                        start_ms_pnl = now_ms - 300_000  # Last 5 minutes
+                        trades_pnl_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_pnl, limit=50)
+                        trades_pnl_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_pnl, limit=50)
+                        if trades_pnl_s1 or trades_pnl_s2:
+                            pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades_pnl_s1)
+                            pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades_pnl_s2)
+                        else:
+                            raise ValueError("No trades found")
+                    except Exception as pnl_err:
+                        print(f"⚠️ Exchange PnL fetch failed for HW close ({pnl_err}), using manual calc")
+                        side1_dir = 1 if saved_status == 1 else -1
+                        side2_dir = -side1_dir
+                        pnl1 = (close_price1 - saved_entry1) * saved_qty1 * side1_dir
+                        pnl2 = (close_price2 - saved_entry2) * saved_qty2 * side2_dir
                     total_pnl = pnl1 + pnl2
                     
                     # Update trade record in DB
@@ -2630,7 +2707,7 @@ class PairsManager:
                         except Exception as pnl_err:
                             print(f"⚠️ Exchange PnL fetch failed ({pnl_err}), using manual calc")
                             side1_dir = 1 if pair_info.position_status == 1 else -1
-                            side2_dir = -1 if pair_info.position_status == 1 else 1
+                            side2_dir = -side1_dir
                             pnl1 = (close_price1 - pair_info.entry_price1) * pair_info.qty1 * side1_dir
                             pnl2 = (close_price2 - pair_info.entry_price2) * pair_info.qty2 * side2_dir
                         total_pnl = pnl1 + pnl2
@@ -2828,6 +2905,24 @@ class PairsManager:
             except Exception as e:
                 print(f"⚠️ Hedge refresh error for {s1}-{s2}: {e}. Using existing hedge={hedge:.4f}")
 
+            # === STRICT BETA CHECK per user request: Enforce beta_threshold=0.11 ===
+            try:
+                beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
+                current_beta = getattr(pair_info, 'beta_btc', 0.0)
+                if not np.isnan(current_beta) and abs(current_beta) >= beta_threshold:
+                    warn_msg = f"⛔ BETA REJECT: {s1}-{s2} beta={current_beta:.3f} >= {beta_threshold}. Aborting entry."
+                    print(warn_msg)
+                    pair_info.position_status = 0
+                    pair_info.is_trading = False
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    # Notify TG to explain why signal was rejected
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await self._notify(warn_msg, reply_to)
+                    return
+            except Exception as e:
+                print(f"⚠️ Beta check error: {e}")
+
             capital = self.config.capital if self.config and self.config.capital else 1000.0
             max_notional = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1
 
@@ -2841,6 +2936,7 @@ class PairsManager:
         
             qty1_dollar = dollar1 * direction
             qty2_dollar = dollar2 * -direction
+
             qty1 = qty1_dollar / s1_price
             qty2 = qty2_dollar / s2_price
             side1 = 'BUY' if qty1 > 0 else 'SELL'
@@ -3473,25 +3569,21 @@ class PairsManager:
         
         # --- 2. Circuit Breaker (instant, every tick) ---
         if pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
-            side1 = 1 if pair_info.position_status == 1 else -1
-            side2 = -side1
-            
-            pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
-            pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
-            total_pnl = pnl1 + pnl2
+            # Use EXCHANGE PnL (source of truth) — no manual calculations
+            total_pnl = self._get_exchange_pair_pnl(pair_info, price1, price2)
             
             notional = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
             leverage = self.config.leverage if self.config and self.config.leverage else 20
             margin = notional / leverage  # Actual deployed capital
-            circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.50) or 0.50
+            circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
             
-            if margin > 0:
-                roi_margin = total_pnl / margin
-                if roi_margin < -circuit_breaker_pct:
-                    roi_notional = total_pnl / notional if notional > 0 else 0
+            if notional > 0:
+                roi_notional = total_pnl / notional
+                if roi_notional < -circuit_breaker_pct:
+                    roi_margin = total_pnl / margin if margin > 0 else 0
                     cb_msg = (f"🚨 <b>RT CIRCUIT BREAKER</b> on {s1}-{s2}!\n"
-                              f"Loss: {roi_margin*100:.2f}% of margin ({total_pnl:.2f} USDT)\n"
-                              f"Notional: {roi_notional*100:.2f}% | Leverage: {leverage}x\n"
+                              f"Loss: {roi_notional*100:.2f}% of notional ({total_pnl:.2f} USDT)\n"
+                              f"Margin: {roi_margin*100:.2f}% | Leverage: {leverage}x\n"
                               f"Force Closing...")
                     print(cb_msg)
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
@@ -3527,11 +3619,8 @@ class PairsManager:
                     pair_info._beta_critical_triggered = True
                     pair_info._beta_at_trigger = pair_info.beta_btc
                     
-                    side1 = 1 if pair_info.position_status == 1 else -1
-                    side2 = -side1
-                    pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
-                    pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
-                    total_pnl = pnl1 + pnl2
+                    # Use EXCHANGE PnL (source of truth)
+                    total_pnl = self._get_exchange_pair_pnl(pair_info, price1, price2)
                     
                     beta_msg = (f"🚨 <b>RT BETA CRITICAL</b> on {s1}-{s2}!\n"
                                 f"Beta: {pair_info.beta_btc:.3f} (critical: {beta_critical})\n"
@@ -3548,12 +3637,8 @@ class PairsManager:
                 # Reset beta critical flag (beta dropped below critical)
                 pair_info._beta_critical_triggered = False
                 
-                # Calculate PnL using real-time prices
-                side1 = 1 if pair_info.position_status == 1 else -1
-                side2 = -side1
-                pnl1 = (price1 - pair_info.entry_price1) * pair_info.qty1 * side1
-                pnl2 = (price2 - pair_info.entry_price2) * pair_info.qty2 * side2
-                total_pnl = pnl1 + pnl2
+                # Use EXCHANGE PnL (source of truth) — no manual calculations
+                total_pnl = self._get_exchange_pair_pnl(pair_info, price1, price2)
                 
                 if total_pnl > 0:
                     pair_info._beta_at_trigger = pair_info.beta_btc

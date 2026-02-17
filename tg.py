@@ -524,7 +524,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
     tp_atr = getattr(conf, 'tp_atr_mult', 4.0) or 4.0
     tp_min = getattr(conf, 'tp_min_pct', 0.15) or 0.15
     tp_max = getattr(conf, 'tp_max_pct', 0.50) or 0.50
-    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.50) or 0.50
+    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
     p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
     bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
     beta_crit = getattr(conf, 'beta_critical', 1.0) or 1.0
@@ -536,7 +536,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"TP ATR Mult: {tp_atr}", callback_data="set_tp_atr")],
         [InlineKeyboardButton(text=f"TP Min: {tp_min*100:.0f}%", callback_data="set_tp_min"),
          InlineKeyboardButton(text=f"TP Max: {tp_max*100:.0f}%", callback_data="set_tp_max")],
-        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}% margin", callback_data="set_circuit_breaker")],
+        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}% notional", callback_data="set_circuit_breaker")],
         [InlineKeyboardButton(text=f"P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
         [InlineKeyboardButton(text=f"⚠️ Beta Critical: {beta_crit}", callback_data="set_beta_critical")],
@@ -596,11 +596,12 @@ async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     lev = conf.leverage if conf.leverage else 20
     await answer(callback, 
-        f"Enter Circuit Breaker as % of <b>margin</b> (deployed capital).\n\n"
-        f"At {lev}x leverage:\n"
-        f"  50% margin = {50/lev:.1f}% of notional\n"
-        f"  30% margin = {30/lev:.1f}% of notional\n\n"
-        f"Enter as decimal (e.g., 0.50 for 50%):")
+        f"Enter Circuit Breaker as % of <b>notional</b> (total position size).\n\n"
+        f"Examples:\n"
+        f"  0.20 = 20% → close if pair loses 20% of position value\n"
+        f"  0.10 = 10% → more aggressive protection\n\n"
+        f"Leverage does NOT affect this threshold.\n"
+        f"Enter as decimal (e.g., 0.20 for 20%):")
 
 @dp.callback_query(F.data == "set_p_value")
 async def set_p_value_cb(callback: CallbackQuery, state: FSMContext):
@@ -969,9 +970,9 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
     if pairs_manager:
         # Get real positions from exchange (source of truth)
         try:
-            account = await pairs_manager.client.account()
+            positions = await pairs_manager.client.get_position_risk()
             exchange_positions = set()
-            for pos in account.get('positions', []):
+            for pos in positions:
                 if float(pos.get('positionAmt', 0)) != 0:
                     exchange_positions.add(pos['symbol'])
         except Exception as e:

@@ -98,7 +98,7 @@ class ConfigInfo:
     tp_atr_mult: float      # ATR multiplier for take-profit (default 4.0)
     tp_min_pct: float       # Minimum TP distance in % (default 0.15)
     tp_max_pct: float       # Maximum TP distance in % (default 0.50)
-    circuit_breaker_pct: float  # Max loss as % of margin before force-close (default 0.50)
+    circuit_breaker_pct: float  # Max loss as % of notional before force-close (default 0.20)
     p_value_threshold: float    # Max p-value for correlation validity (default 0.05)
     min_order_bump: float   # Max allowed order size increase ratio (default 1.5)
     # Position Management (Phase 2)

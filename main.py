@@ -550,8 +550,16 @@ async def ws_user_msg(ws, msg):
         for pos in positions:
             sym = pos.get('s')
             amt = float(pos.get('pa', 0))
+            up = float(pos.get('up', 0))  # unrealizedProfit from exchange
             if amt == 0:
                 closed_symbols.append(sym)
+                # Clear PnL cache for closed position
+                if pairs_manager:
+                    pairs_manager._exchange_pnl_cache.pop(sym, None)
+            else:
+                # Update PnL cache in real-time from WebSocket (instant, no API call)
+                if pairs_manager:
+                    pairs_manager._exchange_pnl_cache[sym] = up
         
         # Note: Detailed notifications will be sent per-pair below
         # Skip simple "Position Changes" message - too noisy
@@ -865,7 +873,7 @@ async def ws_user_msg(ws, msg):
                             recent_orders = []
                             for o in orders1 + orders2:
                                 if o.get('status') == 'FILLED' and o.get('updateTime', 0) > now_time - 300_000:
-                                    recent_orders.append(o)
+                                     recent_orders.append(o)
                             
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
@@ -940,6 +948,24 @@ async def ws_user_msg(ws, msg):
                     print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
                     import traceback
                     traceback.print_exc()
+
+        # PHASE 3: Fallback notifications for untracked position closes
+        # This handles the case where DB failed to load but exchange positions exist
+        for pos in positions:
+            symbol = pos.get('s')
+            position_amt = float(pos.get('pa', 0))
+            if position_amt == 0:
+                was_handled = any(
+                    symbol in [pinfo.symbol1, pinfo.symbol2]
+                    for _, pinfo, _, _, _ in pairs_to_process
+                )
+                if not was_handled:
+                    msg_txt = (f"⚡ <b>UNTRACKED POSITION CLOSED</b>\n\n"
+                               f"Symbol: <b>{symbol}</b>\n"
+                               f"Notice: This position was closed but was NOT tracked by the bot's active_pairs list.\n"
+                               f"Cause: Manual close or DB sync issue.")
+                    await send_tg_notification(msg_txt)
+    
     
     # Check for ORDER_TRADE_UPDATE (order filled/canceled)
     if msg.get('e') == 'ORDER_TRADE_UPDATE':
