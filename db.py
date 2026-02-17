@@ -49,6 +49,10 @@ class Pairs(Base):
     fee2 = Column(Float, default=0.0)           # Fees leg 2
     pnl1 = Column(Float, default=0.0)           # Realized PnL leg 1
     pnl2 = Column(Float, default=0.0)           # Realized PnL leg 2
+    # Market neutrality metrics (persisted for analysis & restart recovery)
+    beta_btc = Column(Float, default=0.0)       # Last beta to BTC
+    last_pvalue = Column(Float, default=0.0)    # Last cointegration p-value
+    entry_z_score = Column(Float, default=0.0)  # Z-score at trade entry
     
     
 # Table for trade execution records
@@ -67,6 +71,15 @@ class Trades(Base):
     close_price_1 = Column(Float)
     close_price_2 = Column(Float)
     pnl = Column(Float, default=0)
+    # Extended trade metadata (for post-trade analysis)
+    hedge_ratio = Column(Float, default=0.0)    # Hedge ratio at time of trade
+    beta_btc = Column(Float, default=0.0)       # Beta to BTC at entry
+    pvalue = Column(Float, default=0.0)         # P-value at entry
+    entry_z = Column(Float, default=0.0)        # Z-score at entry
+    close_z = Column(Float, default=0.0)        # Z-score at close
+    fee1 = Column(Float, default=0.0)           # Fees on leg 1
+    fee2 = Column(Float, default=0.0)           # Fees on leg 2
+    close_reason = Column(String, default='')   # Why trade was closed
     
 
 # Helper class for configuration data
@@ -182,6 +195,19 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl2 FLOAT DEFAULT 0.0;",
+        # Pairs — market neutrality metrics (persisted for analysis & restart recovery)
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS last_pvalue FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_z_score FLOAT DEFAULT 0.0;",
+        # Trades — extended metadata for post-trade analysis
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hedge_ratio FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pvalue FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_z FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_z FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
     ]

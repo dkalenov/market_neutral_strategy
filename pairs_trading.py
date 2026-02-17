@@ -95,6 +95,8 @@ class PairInfo:
     last_close_reason: str = ''    # Reason for last close (for debugging)
     # Cooldown after stop-loss to prevent immediate re-entry
     _close_cooldown_until: float = 0.0  # Unix timestamp: skip entry signals until this time
+    # Wait-for-candle: after ANY close, block re-entry until next candle closes
+    _wait_for_candle: bool = False  # True = pair just closed, wait for next candle before re-entry
 
 class PairsManager:
     """
@@ -253,6 +255,10 @@ class PairsManager:
                             db_id=p.id,
                             tg_message_id=getattr(p, 'tg_message_id', 0) or 0
                         )
+                        # Restore market neutrality metrics from DB (survive restart)
+                        info.beta_btc = getattr(p, 'beta_btc', 0.0) or 0.0
+                        info.last_pvalue = getattr(p, 'last_pvalue', 0.0) or 0.0
+                        info.entry_z_score = getattr(p, 'entry_z_score', 0.0) or 0.0
                         
                         last_trade = await db.get_last_open_trade_for_pair(p.id)
                         if last_trade:
@@ -260,7 +266,7 @@ class PairsManager:
                         
                         self.active_pairs[pair_set] = info
                         restored_count += 1
-                        print(f"  ✅ Restored: {p.symbol1}-{p.symbol2}")
+                        print(f"  ✅ Restored: {p.symbol1}-{p.symbol2} (β:{info.beta_btc:.3f}, p:{info.last_pvalue:.4f})")
                     
                     elif s1_open != s2_open:
                         # ORPHAN: One leg closed externally, need to close remaining leg
@@ -1243,7 +1249,84 @@ class PairsManager:
                         pair_info.qty2 = 0
                         pair_info.is_trading = False
                         
-                        # Update DB
+                        # Calculate Z-score for notification
+                        close_zscore = 0.0
+                        try:
+                            p1 = self.last_prices.get(s1, 0)
+                            p2 = self.last_prices.get(s2, 0)
+                            import math
+                            if p1 > 0 and p2 > 0:
+                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
+                                if math.isnan(close_zscore):
+                                    close_zscore = 0.0
+                        except Exception:
+                            pass
+                        
+                        # Fallback: recalculate from historical data if realtime failed
+                        if close_zscore == 0.0 and s1 in self.all_data and s2 in self.all_data:
+                            try:
+                                _d1 = self.all_data[s1]
+                                _d2 = self.all_data[s2]
+                                if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
+                                    _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
+                                    _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
+                                    _spread = _lp1 - pair_info.hedge_ratio * _lp2
+                                    _mean = np.mean(_spread)
+                                    _std = np.std(_spread)
+                                    if _std > 0:
+                                        close_zscore = float((_spread[-1] - _mean) / _std)
+                            except Exception:
+                                pass
+                        
+                        if close_zscore == 0.0:
+                            close_zscore = pair_info.last_z_score or 0
+                        close_beta = getattr(pair_info, 'beta_btc', 0) or 0
+                        close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                        
+                        # Recalculate beta & p-value fresh if they're 0 (stale after restart)
+                        if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                            try:
+                                _d1 = self.all_data[s1]
+                                _d2 = self.all_data[s2]
+                                if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
+                                    _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
+                                    _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
+                                    _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
+                                    if close_pval == 0 and not np.isnan(_pval):
+                                        close_pval = float(_pval)
+                                    if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                        _btc = self.all_data['BTCUSDT']
+                                        if len(_btc.close) >= self.min_data_points:
+                                            _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
+                                            _sr = np.diff(_lp1) - pair_info.hedge_ratio * np.diff(_lp2)
+                                            _br = np.diff(_lbtc)
+                                            _beta = utils.calculate_pair_beta(_sr, _br)
+                                            if not np.isnan(_beta):
+                                                close_beta = float(_beta)
+                            except Exception as e:
+                                print(f"⚠️ Fresh beta/pval calc error at desync close: {e}")
+                        
+                        close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
+                        hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
+                        
+                        # Update trade record if available
+                        if pair_info.current_trade_id:
+                            try:
+                                await db.update_trade_fields(
+                                    pair_info.current_trade_id,
+                                    status='CLOSED',
+                                    close_time=int(time.time() * 1000),
+                                    pnl=total_pnl,
+                                    close_z=close_zscore,
+                                    fee1=fee1,
+                                    fee2=fee2,
+                                    close_reason='desync',
+                                )
+                            except Exception:
+                                pass
+                            pair_info.current_trade_id = None
+                        
+                        # Save beta/pvalue to DB for analysis
                         if pair_info.db_id:
                             await db.update_pair({
                                 'id': pair_info.db_id,
@@ -1256,26 +1339,10 @@ class PairsManager:
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
                                 'fee1': fee1,
-                                'fee2': fee2
+                                'fee2': fee2,
+                                'beta_btc': close_beta,
+                                'last_pvalue': close_pval,
                             })
-                        
-                        # Calculate Z-score for notification
-                        try:
-                            p1 = self.last_prices.get(s1, 0)
-                            p2 = self.last_prices.get(s2, 0)
-                            import math
-                            if p1 > 0 and p2 > 0:
-                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
-                                if math.isnan(close_zscore):
-                                    close_zscore = pair_info.last_z_score or 0
-                            else:
-                                close_zscore = pair_info.last_z_score or 0
-                        except Exception:
-                            close_zscore = pair_info.last_z_score or 0
-                        close_beta = getattr(pair_info, 'beta_btc', 0) or 0
-                        close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
-                        close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
-                        hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                         
                         # Send detailed notification with CAUSE
                         done_msg = (f"⚡ <b>Pair Closed (Desync):</b> {s1}/{s2}\n"
@@ -1289,6 +1356,10 @@ class PairsManager:
                         print(done_msg.replace('<b>', '').replace('</b>', ''))
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(done_msg, reply_to)
+                        
+                        # WAIT FOR CANDLE: Block re-entry until next candle close
+                        pair_info._wait_for_candle = True
+                        print(f"⏸️ {s1}-{s2}: Re-entry blocked until next candle close (reason: desync)")
                         
                     except Exception as e:
                         print(f"⚠️ Desync close error for {s1}-{s2}: {e}")
@@ -1562,6 +1633,10 @@ class PairsManager:
             if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
                 continue
             
+            # Skip if pair is waiting for next candle close before re-entry
+            if getattr(pair_info, '_wait_for_candle', False):
+                continue
+            
             # Entry signals (within z_entry window: z_entry <= |z| < z_entry_max)
             abs_z = abs(z_score)
             if abs_z >= z_entry and abs_z < z_entry_max:
@@ -1686,6 +1761,16 @@ class PairsManager:
                 # Store beta for display (ALWAYS, even if rejected)
                 pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
                 pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
+                # Persist to DB for restart recovery & analysis
+                if pair_info.db_id and pair_info.position_status != 0:
+                    try:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'beta_btc': pair_info.beta_btc,
+                            'last_pvalue': pair_info.last_pvalue
+                        })
+                    except Exception as _db_e:
+                        print(f"⚠️ DB beta/pval save failed: {_db_e}")
                 # Check if this is a test pair that should not be removed
                 is_protected_test_pair = False
                 test_mode = getattr(self.config, 'test_mode', False)
@@ -1850,6 +1935,13 @@ class PairsManager:
                 
                 # Signal logic
                 if pair_info.position_status == 0:
+                    # CANDLE CLOSE: Reset _wait_for_candle flag
+                    # This is the ONLY place where the flag is reset — a new candle has closed,
+                    # so the pair is now eligible for re-entry with fresh parameters.
+                    if getattr(pair_info, '_wait_for_candle', False):
+                        pair_info._wait_for_candle = False
+                        print(f"✅ {s1}-{s2}: New candle closed, pair eligible for re-entry")
+                    
                     # Check position limits before opening
                     if not self.can_open_new_position(s1, s2):
                         continue
@@ -2223,6 +2315,10 @@ class PairsManager:
             if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
                 continue
             
+            # Skip pairs waiting for next candle close before re-entry
+            if getattr(pair_info, '_wait_for_candle', False):
+                continue
+            
             s1, s2 = pair_info.symbol1, pair_info.symbol2
             if s1 in self.all_data and s2 in self.all_data:
                 await self._check_signals_for_active_pairs(s1)
@@ -2482,6 +2578,14 @@ class PairsManager:
                     total_pnl = pnl1 + pnl2
                     
                     # Update trade record in DB
+                    # Calculate fees from recent trades
+                    _hw_fee1, _hw_fee2 = 0.0, 0.0
+                    try:
+                        _hw_fee1 = sum(float(t.get('commission', 0)) for t in trades_pnl_s1)
+                        _hw_fee2 = sum(float(t.get('commission', 0)) for t in trades_pnl_s2)
+                    except Exception:
+                        pass
+                    
                     if saved_trade_id:
                         try:
                             await db.update_trade_fields(
@@ -2491,6 +2595,10 @@ class PairsManager:
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=total_pnl,
+                                close_z=close_zscore,
+                                fee1=_hw_fee1,
+                                fee2=_hw_fee2,
+                                close_reason=close_reason or 'unknown',
                             )
                         except Exception as e:
                             print(f"⚠️ Trade record update failed: {e}")
@@ -2526,6 +2634,29 @@ class PairsManager:
                     else:
                         pair_info._beta_at_trigger = None  # Reset after use
                     close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                    
+                    # Recalculate beta & p-value fresh if they're 0 (stale after restart)
+                    if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                        try:
+                            _d1 = self.all_data[s1]
+                            _d2 = self.all_data[s2]
+                            if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
+                                _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
+                                _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
+                                _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
+                                if close_pval == 0 and not np.isnan(_pval):
+                                    close_pval = float(_pval)
+                                if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                    _btc = self.all_data['BTCUSDT']
+                                    if len(_btc.close) >= self.min_data_points:
+                                        _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
+                                        _sr = np.diff(_lp1) - pair_info.hedge_ratio * np.diff(_lp2)
+                                        _br = np.diff(_lbtc)
+                                        _beta = utils.calculate_pair_beta(_sr, _br)
+                                        if not np.isnan(_beta):
+                                            close_beta = float(_beta)
+                        except Exception as e:
+                            print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
                     close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
                     
                     full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
@@ -2551,14 +2682,11 @@ class PairsManager:
                     self._exchange_positions_cache.pop(s2, None)
                     self._exchange_position_count = len(self._exchange_positions_cache)
                     
-                    # COOLDOWN after SL
-                    COOLDOWN_REASONS = ('hardware_sl', 'z_sl', 'circuit', 'broken_coint', 'beta_drift', 'beta_critical', 'btc_shock')
-                    if close_reason in COOLDOWN_REASONS:
-                        cooldown_seconds = 300
-                        pair_info._close_cooldown_until = time.time() + cooldown_seconds
-                        print(f"⏸️ Cooldown set for {s1}-{s2}: {cooldown_seconds}s after {close_reason}")
+                    # WAIT FOR CANDLE: After ANY close, block re-entry until next candle closes
+                    pair_info._wait_for_candle = True
+                    print(f"⏸️ {s1}-{s2}: Re-entry blocked until next candle close (reason: {close_reason})")
                     
-                    # Update DB (includes close_pnl)
+                    # Update DB (includes close_pnl + market neutrality metrics)
                     if pair_info.db_id:
                         await db.update_pair({
                             'id': pair_info.db_id,
@@ -2569,7 +2697,13 @@ class PairsManager:
                             'entry_price2': 0,
                             'close_time': int(time.time()),
                             'close_pnl': total_pnl,
-                            'close_reason': close_reason or 'unknown'
+                            'close_reason': close_reason or 'unknown',
+                            'pnl1': pnl1,
+                            'pnl2': pnl2,
+                            'fee1': _hw_fee1,
+                            'fee2': _hw_fee2,
+                            'beta_btc': close_beta,
+                            'last_pvalue': close_pval,
                         })
                     
                     # Trigger re-analysis for freed slot
@@ -2730,6 +2864,14 @@ class PairsManager:
                         pnl_emoji = "🟢" if total_pnl > 0 else "🔴"
 
 
+                        # Calculate fees from recent trades (BEFORE trade record update)
+                        _norm_fee1, _norm_fee2 = 0.0, 0.0
+                        try:
+                            _norm_fee1 = sum(float(t.get('commission', 0)) for t in trades_s1) if trades_s1 else 0.0
+                            _norm_fee2 = sum(float(t.get('commission', 0)) for t in trades_s2) if trades_s2 else 0.0
+                        except Exception:
+                            pass
+
                         if pair_info.current_trade_id:
                             await db.update_trade_fields(
                                 pair_info.current_trade_id,
@@ -2738,6 +2880,10 @@ class PairsManager:
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=total_pnl,
+                                close_z=close_zscore if close_zscore else 0.0,
+                                fee1=_norm_fee1,
+                                fee2=_norm_fee2,
+                                close_reason=close_reason or 'unknown',
                             )
                     
                         pair_info.current_trade_id = None
@@ -2816,6 +2962,29 @@ class PairsManager:
                         # Build enhanced close message
                         cleanup_msg = "\n".join(cleanup_status) if cleanup_status else "  ℹ️ No cleanup needed"
                         close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+                        
+                        # Recalculate beta & p-value fresh if they're 0 (stale after restart)
+                        if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                            try:
+                                _d1 = self.all_data[s1]
+                                _d2 = self.all_data[s2]
+                                if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
+                                    _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
+                                    _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
+                                    _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
+                                    if close_pval == 0 and not np.isnan(_pval):
+                                        close_pval = float(_pval)
+                                    if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                        _btc = self.all_data['BTCUSDT']
+                                        if len(_btc.close) >= self.min_data_points:
+                                            _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
+                                            _sr = np.diff(_lp1) - pair_info.hedge_ratio * np.diff(_lp2)
+                                            _br = np.diff(_lbtc)
+                                            _beta = utils.calculate_pair_beta(_sr, _br)
+                                            if not np.isnan(_beta):
+                                                close_beta = float(_beta)
+                            except Exception as e:
+                                print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
                         close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
                         full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
                         full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
@@ -2829,7 +2998,7 @@ class PairsManager:
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(full_msg, reply_to)
                         
-                        # Update DB with close details
+                        # Update DB with close details + market neutrality metrics
                         if pair_info.db_id:
                             await db.update_pair({
                                 'id': pair_info.db_id,
@@ -2840,7 +3009,13 @@ class PairsManager:
                                 'entry_price2': 0,
                                 'close_time': int(time.time()),
                                 'close_pnl': total_pnl,
-                                'close_reason': close_reason or 'unknown'
+                                'close_reason': close_reason or 'unknown',
+                                'pnl1': pnl1,
+                                'pnl2': pnl2,
+                                'fee1': _norm_fee1,
+                                'fee2': _norm_fee2,
+                                'beta_btc': close_beta,
+                                'last_pvalue': close_pval,
                             })
 
                         
@@ -2849,13 +3024,10 @@ class PairsManager:
                         if close_reason in ('z_tp', 'hardware_tp'):
                             self._add_to_best_pairs(s1, s2)
                         
-                        # COOLDOWN: After stop-loss or forced close, prevent immediate re-entry
-                        # This prevents the exact same pair from re-opening right after SL
-                        COOLDOWN_REASONS = ('hardware_sl', 'z_sl', 'circuit', 'broken_coint', 'beta_drift', 'beta_critical', 'btc_shock')
-                        if close_reason in COOLDOWN_REASONS:
-                            cooldown_seconds = 300  # 5 minutes
-                            pair_info._close_cooldown_until = time.time() + cooldown_seconds
-                            print(f"⏸️ Cooldown set for {s1}-{s2}: {cooldown_seconds}s after {close_reason}")
+                        # WAIT FOR CANDLE: After ANY close, block re-entry until next candle closes
+                        # The pair can only re-enter when _check_signals_for_active_pairs resets the flag
+                        pair_info._wait_for_candle = True
+                        print(f"⏸️ {s1}-{s2}: Re-entry blocked until next candle close (reason: {close_reason})")
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -3356,7 +3528,7 @@ class PairsManager:
                     # === END HARDWARE SL/TP ===
                 
                     if pair_info.db_id:
-                        # Await DB update for safety
+                        # Await DB update for safety (includes market neutrality metrics)
                         try:
                             await db.update_pair({
                                 'id': pair_info.db_id,
@@ -3364,7 +3536,11 @@ class PairsManager:
                                 'qty1': pair_info.qty1,
                                 'qty2': pair_info.qty2,
                                 'entry_price1': pair_info.entry_price1,
-                                'entry_price2': pair_info.entry_price2
+                                'entry_price2': pair_info.entry_price2,
+                                'beta_btc': pair_info.beta_btc,
+                                'last_pvalue': pair_info.last_pvalue,
+                                'entry_z_score': pair_info.entry_z_score,
+                                'open_time': int(time.time()),
                             })
                         except Exception as dbe:
                             print(f"⚠️ DB Update failed: {dbe}")
@@ -3379,7 +3555,11 @@ class PairsManager:
                             entry_price_2=pair_info.entry_price2,
                             qty1=pair_info.qty1,
                             qty2=pair_info.qty2,
-                            pnl=0.0
+                            pnl=0.0,
+                            hedge_ratio=pair_info.hedge_ratio,
+                            beta_btc=pair_info.beta_btc,
+                            pvalue=pair_info.last_pvalue,
+                            entry_z=pair_info.entry_z_score,
                         )
                         pair_info.current_trade_id = await db.add_trade(trade)
                     except Exception as e:
@@ -3485,6 +3665,10 @@ class PairsManager:
             
             # Skip entry if pair is in cooldown after SL
             if getattr(pair_info, '_close_cooldown_until', 0) > time.time():
+                continue
+            
+            # Skip if pair is waiting for next candle close before re-entry
+            if getattr(pair_info, '_wait_for_candle', False):
                 continue
             
             # Check if signal (between z_entry and z_entry_max)
@@ -3755,6 +3939,10 @@ class PairsManager:
                                         if close_cooldown and time.time() < close_cooldown:
                                             remaining = int(close_cooldown - time.time())
                                             print(f"⏸️ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
+                                            continue
+                                        
+                                        # Check if pair is waiting for next candle close
+                                        if getattr(pair_info, '_wait_for_candle', False):
                                             continue
                                         
                                         direction = 1 if current_z < 0 else -1

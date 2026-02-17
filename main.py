@@ -745,6 +745,7 @@ async def ws_user_msg(ws, msg):
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
                     pair_info.is_trading = False
+                    pair_info._wait_for_candle = True  # Block re-entry until next candle
                     
                     # Update DB
                     if pair_info.db_id:
@@ -840,6 +841,7 @@ async def ws_user_msg(ws, msg):
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
                     pair_info.is_trading = False
+                    pair_info._wait_for_candle = True  # Block re-entry until next candle
                     
                     stored_reason = getattr(pair_info, 'last_close_reason', '')
                     
@@ -951,14 +953,17 @@ async def ws_user_msg(ws, msg):
 
         # PHASE 3: Fallback notifications for untracked position closes
         # This handles the case where DB failed to load but exchange positions exist
+        # Build set of ALL symbols handled in Phase 2 (both the manually closed + bot-closed orphan)
+        handled_symbols = set()
+        for _, pinfo, sym, other_sym, _ in pairs_to_process:
+            handled_symbols.add(sym)
+            handled_symbols.add(other_sym)
+        
         for pos in positions:
             symbol = pos.get('s')
             position_amt = float(pos.get('pa', 0))
             if position_amt == 0:
-                was_handled = any(
-                    symbol in [pinfo.symbol1, pinfo.symbol2]
-                    for _, pinfo, _, _, _ in pairs_to_process
-                )
+                was_handled = symbol in handled_symbols
                 if not was_handled:
                     msg_txt = (f"⚡ <b>UNTRACKED POSITION CLOSED</b>\n\n"
                                f"Symbol: <b>{symbol}</b>\n"
