@@ -118,6 +118,9 @@ class ConfigInfo:
     beta_critical: float    # Force-close if |beta| > this, regardless of PnL (default 1.0)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
     trade_mode: bool        # If True, allow opening new positions (default True)
+    # Hedge Ratio Bounds (market neutrality)
+    hedge_min: float        # Minimum |hedge_ratio| for pair acceptance (default 0.3)
+    hedge_max: float        # Maximum |hedge_ratio| for pair acceptance (default 3.0)
     # Idle Pair Management
     max_idle_pairs: int     # Maximum idle pairs without positions (default 150)
     idle_timeout_hours: float  # Remove idle pairs older than X hours (default 48)
@@ -242,6 +245,9 @@ async def load_config():
             'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
+            # Hedge Ratio Bounds (market neutrality)
+            'hedge_min': '0.3',              # Min |hedge| — below this positions are too unbalanced
+            'hedge_max': '3.0',              # Max |hedge| — above this positions are too unbalanced
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '48',      # Remove idle pairs older than X hours

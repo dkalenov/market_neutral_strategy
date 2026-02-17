@@ -336,11 +336,14 @@ async def strategy_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
     hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
+    hedge_min = getattr(conf, 'hedge_min', 0.3) or 0.3
+    hedge_max = getattr(conf, 'hedge_max', 3.0) or 3.0
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Set Timeframe", callback_data="set_timeframe")],
         [InlineKeyboardButton(text="Set Window Size", callback_data="set_window")],
         [InlineKeyboardButton(text=f"⏱️ Half-Life: {hl_min}-{hl_max} days", callback_data="set_half_life")],
+        [InlineKeyboardButton(text=f"⚖️ Hedge Bounds: {hedge_min}-{hedge_max}", callback_data="set_hedge_bounds")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Choose parameter to change:", reply_markup=keyboard)
@@ -371,6 +374,23 @@ async def set_half_life(callback: CallbackQuery, state: FSMContext):
         f"Enter new range as <code>min-max</code> (e.g., 2-5):\n\n"
         f"• Min: fastest mean-reversion (2+ recommended)\n"
         f"• Max: slowest before capital locked (5-7 typical)")
+
+@dp.callback_query(F.data == "set_hedge_bounds")
+async def set_hedge_bounds(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    hedge_min = getattr(conf, 'hedge_min', 0.3) or 0.3
+    hedge_max = getattr(conf, 'hedge_max', 3.0) or 3.0
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="hedge_bounds")
+    await answer(callback, 
+        f"⚖️ <b>Hedge Ratio Bounds</b>\n\n"
+        f"Current: {hedge_min}-{hedge_max}\n\n"
+        f"Enter new range as <code>min-max</code> (e.g., 0.3-3.0):\n\n"
+        f"• |hedge| < min → positions too unbalanced\n"
+        f"  (e.g. hedge=0.06 → $5 vs $92)\n"
+        f"• |hedge| > max → same problem in reverse\n"
+        f"• Ideal: hedge ≈ 1.0 (≈50/50 split)\n\n"
+        f"⚠️ Applied to new discoveries and entries only")
 
 
 @dp.callback_query(F.data == "risk_settings")
@@ -744,6 +764,20 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(hl_min_days=min_days, hl_max_days=max_days)
             await answer(message, f"⏱️ Half-Life: <b>{min_days}-{max_days} days</b>")
+        
+        elif waiting_for == "hedge_bounds":
+            # Parse "min-max" format
+            parts = value.replace(' ', '').split('-')
+            if len(parts) != 2:
+                await answer(message, "Error: use format <code>min-max</code> (e.g., 0.3-3.0)")
+                return
+            h_min = float(parts[0])
+            h_max = float(parts[1])
+            if h_min < 0.05 or h_max < h_min or h_max > 10.0:
+                await answer(message, "Error: min ≥0.05, max ≥ min, max ≤10.0")
+                return
+            await db.config_update(hedge_min=h_min, hedge_max=h_max)
+            await answer(message, f"⚖️ Hedge Bounds: <b>{h_min}-{h_max}</b>")
         
         elif waiting_for == "max_symbols":
             val = int(value)

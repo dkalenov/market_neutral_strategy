@@ -1670,6 +1670,19 @@ class PairsManager:
                                 # For trading pairs, just log warning - RT exit will handle PnL-based closure
                                 print(f"🛡️ {s1}-{s2} beta drift detected: |beta|={abs(beta_btc):.3f} (above limit {beta_threshold}). Handling via RT monitoring.")
                 
+                # === HEDGE RATIO BOUNDS CHECK ===
+                # Reject pairs with |hedge| outside configured bounds (too unbalanced positions)
+                if flag == 1:
+                    hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
+                    hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
+                    abs_hedge = abs(hedge) if not np.isnan(hedge) else 0.0
+                    if abs_hedge < hedge_min or abs_hedge > hedge_max:
+                        if pair_info.position_status == 0:
+                            print(f"⚠️ {s1}-{s2} rejected: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}] (positions would be unbalanced)")
+                            flag = 0
+                        else:
+                            print(f"⚠️ {s1}-{s2} hedge drift: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}]")
+                
                 # Store beta for display (ALWAYS, even if rejected)
                 pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
                 pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
@@ -1974,7 +1987,9 @@ class PairsManager:
                 self.min_data_points,
                 self.config.timeframe,  # Pass timeframe for half-life limits
                 getattr(self.config, 'hl_min_days', 2.0) or 2.0,
-                getattr(self.config, 'hl_max_days', 5.0) or 5.0
+                getattr(self.config, 'hl_max_days', 5.0) or 5.0,
+                getattr(self.config, 'hedge_min', 0.3) or 0.3,
+                getattr(self.config, 'hedge_max', 3.0) or 3.0,
             )
             tasks.append(task)
         
@@ -2049,7 +2064,7 @@ class PairsManager:
                     elif test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
                         print(f"🧪 TEST MODE: {s1}-{s2} |beta|={abs(beta_btc):.3f} >= {beta_threshold} - ALLOWED for testing")
                     
-                    print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}")
+                    print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}, Hedge: {hedge:.4f}")
                     
                     # Final duplicate check before adding (race condition protection)
                     if pair_set in self.active_pairs:
@@ -2922,6 +2937,25 @@ class PairsManager:
                     return
             except Exception as e:
                 print(f"⚠️ Beta check error: {e}")
+
+            # === HEDGE RATIO BOUNDS CHECK ===
+            # Prevent opening wildly unbalanced positions (e.g. $5 vs $92)
+            try:
+                hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
+                hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
+                abs_hedge = abs(hedge) if not np.isnan(hedge) else 0.0
+                if abs_hedge < hedge_min or abs_hedge > hedge_max:
+                    warn_msg = f"⛔ HEDGE REJECT: {s1}-{s2} |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}]. Positions would be unbalanced. Aborting entry."
+                    print(warn_msg)
+                    pair_info.position_status = 0
+                    pair_info.is_trading = False
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    await self._notify(warn_msg, reply_to)
+                    return
+            except Exception as e:
+                print(f"⚠️ Hedge bounds check error: {e}")
 
             capital = self.config.capital if self.config and self.config.capital else 1000.0
             max_notional = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1

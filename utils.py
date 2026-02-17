@@ -128,7 +128,7 @@ def calculate_pair_beta(pair_r, market_r):
         return np.nan
     return float(cov / var_m)
 
-def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h', hl_min_days=2.0, hl_max_days=5.0):
+def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h', hl_min_days=2.0, hl_max_days=5.0, hedge_min=0.3, hedge_max=3.0):
     """
     Worker function for parallel processing.
     pairs_chunk: list of tuples (s1, s2)
@@ -137,6 +137,8 @@ def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h',
     timeframe: str (for half-life limits)
     hl_min_days: float (configurable min half-life in days)
     hl_max_days: float (configurable max half-life in days)
+    hedge_min: float (minimum |hedge_ratio| for market neutrality, default 0.3)
+    hedge_max: float (maximum |hedge_ratio| for market neutrality, default 3.0)
     """
     min_hl, max_hl = get_half_life_limits(timeframe, hl_min_days, hl_max_days)
     results = []
@@ -161,6 +163,12 @@ def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h',
             
             # Filter by timeframe-specific half-life limits
             if flag == 1 and min_hl <= hl <= max_hl:
+                # Filter by hedge ratio bounds (market neutrality)
+                # |hedge| too small (e.g. 0.06) → positions wildly unbalanced ($5 vs $92)
+                # |hedge| too large (e.g. 5.0) → same problem in reverse
+                abs_hedge = abs(hedge)
+                if abs_hedge < hedge_min or abs_hedge > hedge_max:
+                    continue
                 results.append((s1, s2, hedge, hl, pval))
         except Exception:
             continue
