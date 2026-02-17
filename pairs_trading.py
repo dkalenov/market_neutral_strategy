@@ -2764,6 +2764,21 @@ class PairsManager:
                         except Exception:
                             pass
 
+                        # Calculate real-time Z-score BEFORE DB update (was causing UnboundLocalError)
+                        close_zscore = 0.0
+                        try:
+                            p1 = self.last_prices.get(s1, 0)
+                            p2 = self.last_prices.get(s2, 0)
+                            if p1 > 0 and p2 > 0:
+                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
+                                import math
+                                if math.isnan(close_zscore):
+                                    close_zscore = pair_info.last_z_score or 0
+                            else:
+                                close_zscore = pair_info.last_z_score or 0
+                        except Exception:
+                            close_zscore = pair_info.last_z_score or 0
+
                         if pair_info.current_trade_id:
                             await db.update_trade_fields(
                                 pair_info.current_trade_id,
@@ -2824,20 +2839,6 @@ class PairsManager:
                                 
                         except Exception as e:
                             cleanup_status.append(f"  ❌ Failed: {str(e)[:30]}")
-                        
-                        # Calculate real-time Z-score for close message
-                        try:
-                            p1 = self.last_prices.get(s1, 0)
-                            p2 = self.last_prices.get(s2, 0)
-                            if p1 > 0 and p2 > 0:
-                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
-                                import math
-                                if math.isnan(close_zscore):
-                                    close_zscore = pair_info.last_z_score or 0
-                            else:
-                                close_zscore = pair_info.last_z_score or 0
-                        except Exception:
-                            close_zscore = pair_info.last_z_score or 0
                         
                         # Use beta_at_trigger if available (set by beta_drift/beta_critical close)
                         # This prevents confusing TG messages showing current (already-changed) beta
@@ -2927,6 +2928,25 @@ class PairsManager:
                         
                 except Exception as e:
                     print(f"FATAL ERROR closing position for {s1}-{s2}: {e}")
+                    # Ensure state cleanup even on error — position IS closed on exchange
+                    try:
+                        pair_info.position_status = 0
+                        pair_info.qty1 = 0
+                        pair_info.qty2 = 0
+                        pair_info.entry_price1 = 0
+                        pair_info.entry_price2 = 0
+                        pair_info.close_handled = True
+                        pair_info.last_close_reason = close_reason or 'unknown'
+                        pair_info.current_trade_id = None
+                        pair_info._wait_for_candle = True
+                        self._exchange_positions_cache.pop(s1, None)
+                        self._exchange_positions_cache.pop(s2, None)
+                        self._exchange_position_count = len(self._exchange_positions_cache)
+                        # Send error notification to TG
+                        err_msg = f"⚠️ Close error {s1}-{s2}: {e}\nPosition closed on exchange but notification failed."
+                        await self._notify(err_msg)
+                    except Exception:
+                        pass
                 return
 
             hedge = pair_info.hedge_ratio
