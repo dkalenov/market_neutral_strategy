@@ -698,10 +698,21 @@ class PairsManager:
                         s1_orders = [o for o in all_algo_orders if o.get('symbol') == s1]
                         s2_orders = [o for o in all_algo_orders if o.get('symbol') == s2]
                         
-                        has_sl1 = any(o.get('orderType') == 'STOP' for o in s1_orders)
-                        has_sl2 = any(o.get('orderType') == 'STOP' for o in s2_orders)
-                        has_tp1 = any(o.get('orderType') == 'TAKE_PROFIT' for o in s1_orders)
-                        has_tp2 = any(o.get('orderType') == 'TAKE_PROFIT' for o in s2_orders)
+                        def _algo_type(order: dict) -> str:
+                            return str(order.get('orderType') or order.get('type') or order.get('o') or '').upper()
+                        
+                        def _is_sl(order: dict) -> bool:
+                            t = _algo_type(order)
+                            return t in ('STOP', 'STOP_MARKET')
+                        
+                        def _is_tp(order: dict) -> bool:
+                            t = _algo_type(order)
+                            return t in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET')
+                        
+                        has_sl1 = any(_is_sl(o) for o in s1_orders)
+                        has_sl2 = any(_is_sl(o) for o in s2_orders)
+                        has_tp1 = any(_is_tp(o) for o in s1_orders)
+                        has_tp2 = any(_is_tp(o) for o in s2_orders)
                         
                         missing = []
                         if not has_sl1: missing.append(f"{s1} SL")
@@ -903,9 +914,9 @@ class PairsManager:
             # Group orders by symbol
             orders_by_symbol = {}
             for order in algo_orders:
-                order_type = order.get('orderType') or order.get('type', '')
+                order_type = str(order.get('orderType') or order.get('type') or order.get('o') or '').upper()
                 status = order.get('algoStatus') or order.get('status', '')
-                if order_type in ['STOP', 'TAKE_PROFIT'] and status == 'NEW':
+                if order_type in ['STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET'] and status == 'NEW':
                     sym = order['symbol']
                     if sym not in orders_by_symbol:
                         orders_by_symbol[sym] = []
@@ -1182,9 +1193,11 @@ class PairsManager:
                             # Check algo orders
                             try:
                                 algo_orders = await self.client.get_algo_orders()
+                                if isinstance(algo_orders, dict) and 'orders' in algo_orders:
+                                    algo_orders = algo_orders.get('orders', [])
                                 triggered_algos = [a for a in algo_orders 
                                                    if a.get('symbol') == closed_leg 
-                                                   and a.get('algoStatus') in ('TRIGGERED', 'FINISHED')]
+                                                    and a.get('algoStatus') in ('TRIGGERED', 'FINISHED')]
                                 if triggered_algos:
                                     algo_type = triggered_algos[0].get('orderType', 'ALGO')
                                     desync_reason = f'Algo {algo_type} triggered on {closed_leg}'

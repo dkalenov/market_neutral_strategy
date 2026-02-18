@@ -1,10 +1,12 @@
-import asyncio
+﻿import asyncio
 import configparser
 import binance
 import db
 import os
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,6 +17,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 # Initialize bot and dispatcher
 bot: Bot = None  # Will be initialized in run()
 dp = Dispatcher()
+close_ops_lock = asyncio.Lock()
 
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -62,12 +65,30 @@ async def init_bot():
     tg_admins = [int(admin_id) for admin_id in tg_admins_str.split(',') if admin_id.strip()]
     
     # Initialize bot
+    tg_session = None
     try:
-        bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'))
+        # Keep aiogram session init максимально совместимым между версиями.
+        # Some builds reject kwargs like `connector`/custom timeout signature.
+        try:
+            tg_session = AiohttpSession()
+            bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'), session=tg_session)
+        except TypeError:
+            # Fallback to default bot session construction.
+            if tg_session:
+                try:
+                    await tg_session.close()
+                except Exception:
+                    pass
+            bot = Bot(token=tg_token, default=DefaultBotProperties(parse_mode='HTML'))
         print(f"TG: Bot initialized. Token: {tg_token[:10]}...")
         print(f"TG: Authorized admins: {tg_admins}")
         return True
     except Exception as e:
+        if tg_session:
+            try:
+                await tg_session.close()
+            except Exception:
+                pass
         print(f"TG: Bot initialization failed: {e}")
         return False
 
@@ -100,13 +121,21 @@ async def run(_session, _client: binance.Futures, _pairs_manager):
     await send_startup_message()
     
     print("TG: Starting polling...")
+    retry_delay = 2
     try:
-        # Start polling
-        await dp.start_polling(bot)
-    except Exception as e:
-        print(f"TG: Polling failed with an error: {e}")
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except TelegramNetworkError as e:
+                print(f"TG: Network error in polling: {e}. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30, retry_delay * 2)
+            except Exception as e:
+                print(f"TG: Polling failed with an error: {e}")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30, retry_delay * 2)
     finally:
-        # Close session
         print("TG: Closing bot session...")
         try:
             await bot.session.close()
@@ -132,9 +161,61 @@ class States(StatesGroup):
 # Helper function to answer messages or callbacks
 async def answer(message: Message | CallbackQuery, text, reply_markup=None):
     if isinstance(message, CallbackQuery):
-        await message.answer()
+        try:
+            await message.answer()
+        except Exception:
+            pass
         message = message.message
-    await message.answer(text, reply_markup=reply_markup)
+    try:
+        await message.answer(text, reply_markup=reply_markup)
+    except Exception as e:
+        print(f"TG: answer failed: {e}")
+
+
+async def safe_callback_answer(callback: CallbackQuery, text: str = None, show_alert: bool = False):
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest:
+        # Callback could be too old/already answered.
+        pass
+    except Exception as e:
+        print(f"TG: callback answer failed: {e}")
+
+
+async def route_menu_button(message: Message, state: FSMContext) -> bool:
+    """
+    Return True if message was a menu button and has been routed.
+    """
+    txt = (message.text or "").strip()
+    txt_lower = txt.lower()
+
+    route = None
+    if "statistics" in txt_lower:
+        route = "statistics"
+    elif "settings" in txt_lower:
+        route = "settings"
+    elif "blacklist" in txt_lower:
+        route = "blacklist"
+    elif "close positions" in txt_lower:
+        route = "close_positions"
+    elif "main menu" in txt_lower:
+        route = "main_menu"
+
+    if route is None:
+        return False
+
+    await state.clear()
+    if route == "statistics":
+        await open_trades(message, state)
+    elif route == "settings":
+        await settings(message, state)
+    elif route == "blacklist":
+        await blacklist_menu(message, state)
+    elif route == "close_positions":
+        await close_positions_menu(message, state)
+    else:
+        await start(message, state)
+    return True
 
 
 # Main menu
@@ -146,7 +227,7 @@ async def start(message: Message, state: FSMContext):
     # Create keyboard
     keyboard = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Statistics"), KeyboardButton(text="Settings")],
-        [KeyboardButton(text="Blacklist"), KeyboardButton(text="🔴 Close Positions")],
+        [KeyboardButton(text="Blacklist"), KeyboardButton(text="\U0001F534 Close Positions")],
         [KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     # Send message
@@ -161,7 +242,7 @@ async def start_callback(callback: CallbackQuery, state: FSMContext):
     # Create keyboard
     keyboard = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="Statistics"), KeyboardButton(text="Settings")],
-        [KeyboardButton(text="Blacklist"), KeyboardButton(text="🔴 Close Positions")],
+        [KeyboardButton(text="Blacklist"), KeyboardButton(text="\U0001F534 Close Positions")],
         [KeyboardButton(text="Main Menu")]
     ], resize_keyboard=True)
     await callback.message.answer("Main Menu", reply_markup=keyboard)
@@ -647,6 +728,9 @@ async def set_beta_critical_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(States.hardware_sltp))
 async def process_hardware_sltp_settings(message: Message, state: FSMContext):
+    if await route_menu_button(message, state):
+        return
+
     data = await state.get_data()
     waiting_for = data.get("waiting_for")
     value = message.text.strip()
@@ -678,6 +762,9 @@ async def process_hardware_sltp_settings(message: Message, state: FSMContext):
 # Handle settings input
 @dp.message(States.settings)
 async def process_strategy_settings(message: Message, state: FSMContext):
+    if await route_menu_button(message, state):
+        return
+
     data = await state.get_data()
     waiting_for = data.get("waiting_for")
     
@@ -818,11 +905,14 @@ async def process_strategy_settings(message: Message, state: FSMContext):
 async def change_keys(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.change_keys)
     await state.update_data({})
-    await callback.answer()
+    await safe_callback_answer(callback)
     await callback.message.answer("Enter API KEY (or 'skip' to skip):")
 
 @dp.message(States.change_keys)
 async def change_keys_value(message: Message, state: FSMContext):
+    if await route_menu_button(message, state):
+        return
+
     data = await state.get_data()
     
     if 'api_key' not in data:
@@ -886,7 +976,7 @@ async def restart(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Yes", callback_data=f"restart_yes")],
         [InlineKeyboardButton(text="No", callback_data="settings")]
     ])
-    await callback.answer()
+    await safe_callback_answer(callback)
     await callback.message.answer(f"Are you sure you want to restart the bot?", reply_markup=keyboard)
 
 @dp.callback_query(States.restart, F.data == "restart_yes")
@@ -923,21 +1013,19 @@ async def blacklist_menu(event: Message | CallbackQuery, state: FSMContext):
     ])
     
     if isinstance(event, CallbackQuery):
-        await event.answer()
+        await safe_callback_answer(event)
         try:
             await event.message.edit_text(text, reply_markup=keyboard, parse_mode='HTML')
-        except:
+        except Exception:
             await event.message.answer(text, reply_markup=keyboard, parse_mode='HTML')
     else:
         await event.answer(text, reply_markup=keyboard, parse_mode='HTML')
 
+
 @dp.message(StateFilter(States.blacklist))
 async def process_blacklist_update(message: Message, state: FSMContext):
-    # Skip processing for menu buttons - let other handlers deal with them
-    menu_buttons = ["Statistics", "Settings", "Blacklist", "Main Menu", "🔴 Close Positions"]
-    if message.text in menu_buttons:
-        await state.clear()  # Exit blacklist state
-        await answer(message, "No changes made.")
+    # Allow direct navigation from blacklist state
+    if await route_menu_button(message, state):
         return
     
     if message.text.lower() == 'clear':
@@ -953,13 +1041,11 @@ async def process_blacklist_update(message: Message, state: FSMContext):
 
         for s in inputs:
             if s.startswith('-'):
-                # Remove
                 clean_s = s[1:]
                 if clean_s in existing:
                     existing.remove(clean_s)
                     to_remove.append(clean_s)
             else:
-                # Add
                 if s not in existing:
                     existing.add(s)
                     to_add.append(s)
@@ -982,13 +1068,15 @@ async def process_blacklist_update(message: Message, state: FSMContext):
 @dp.callback_query(StateFilter(States.blacklist), F.data == "bl_clear")
 async def bl_clear_cb(callback: CallbackQuery, state: FSMContext):
     await db.config_update(blacklist="")
-    await callback.answer("List cleared")
+    await safe_callback_answer(callback, "List cleared")
     await blacklist_menu(callback, state)
 
 
 # --- Close Positions Menu ---
 
 @dp.message(F.text == "🔴 Close Positions")
+@dp.message(F.text == "\U0001F534 Close Positions")
+@dp.message(F.text == "Close Positions")
 @dp.callback_query(F.data == "close_positions")
 async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext):
     """Show list of active pairs with open positions - verified against exchange."""
@@ -996,7 +1084,7 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
     
     # Show loading message first (API call can be slow)
     if isinstance(event, CallbackQuery):
-        await event.answer("⏳ Loading positions...")
+        await safe_callback_answer(event, "Loading positions...")
     
     keyboard = []
     has_positions = False
@@ -1004,7 +1092,7 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
     if pairs_manager:
         # Get real positions from exchange (source of truth)
         try:
-            positions = await pairs_manager.client.get_position_risk()
+            positions = await asyncio.wait_for(pairs_manager.client.get_position_risk(), timeout=10)
             exchange_positions = set()
             for pos in positions:
                 if float(pos.get('positionAmt', 0)) != 0:
@@ -1044,7 +1132,7 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
         text += "No open positions on exchange."
     
     if isinstance(event, CallbackQuery):
-        await event.answer()
+        await safe_callback_answer(event)
         await event.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     else:
         await event.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -1075,19 +1163,22 @@ async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Position not found or already closed", show_alert=True)
         return
     
-    await callback.answer(f"Closing {s1}/{s2}...")
-    await callback.message.answer(f"⏳ Closing position {s1}/{s2}...")
-    
-    try:
-        pair_info.close_handled = True
-        pair_info.is_trading = True
-        await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
-        await callback.message.answer(f"✅ Position {s1}/{s2} closed successfully!")
-    except Exception as e:
-        await callback.message.answer(f"❌ Error closing {s1}/{s2}: {e}")
-    
-    # Return to close menu
-    await close_positions_menu(callback, state)
+    await safe_callback_answer(callback, f"Closing {s1}/{s2}...")
+    await callback.message.answer(f"Closing position {s1}/{s2} in background...")
+
+    chat_id = callback.message.chat.id
+
+    async def _close_one_task():
+        async with close_ops_lock:
+            try:
+                pair_info.close_handled = True
+                pair_info.is_trading = True
+                await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
+                await bot.send_message(chat_id, f"Position {s1}/{s2} closed successfully.")
+            except Exception as e:
+                await bot.send_message(chat_id, f"Error closing {s1}/{s2}: {e}")
+
+    asyncio.create_task(_close_one_task())
 
 
 @dp.callback_query(F.data == "close_all_confirm")
@@ -1097,7 +1188,7 @@ async def close_all_confirm_handler(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="✅ Yes, Close All", callback_data="close_all_yes")],
         [InlineKeyboardButton(text="❌ Cancel", callback_data="close_positions")]
     ])
-    await callback.answer()
+    await safe_callback_answer(callback)
     await callback.message.answer(
         "⚠️ <b>Are you sure you want to close ALL positions?</b>\n\n"
         "This will immediately close all active pair trades.",
@@ -1112,33 +1203,34 @@ async def close_all_yes_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Pairs manager not available", show_alert=True)
         return
     
-    await callback.answer("Closing all positions...")
-    await callback.message.answer("⏳ Closing all positions...")
-    
-    closed = 0
-    failed = 0
-    
-    pairs_to_close = [
-        pi for pi in pairs_manager.active_pairs.values() 
-        if pi.position_status != 0
-    ]
-    
-    for pair_info in pairs_to_close:
-        try:
-            pair_info.close_handled = True
-            pair_info.is_trading = True
-            await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
-            closed += 1
-        except Exception as e:
-            print(f"Error closing {pair_info.symbol1}-{pair_info.symbol2}: {e}")
-            failed += 1
-    
-    result_msg = f"✅ Closed {closed} positions."
-    if failed > 0:
-        result_msg += f"\n⚠️ Failed to close {failed} positions."
-    
-    await callback.message.answer(result_msg)
-    await close_positions_menu(callback, state)
+    await safe_callback_answer(callback, "Closing all positions...")
+    await callback.message.answer("Closing all positions in background...")
+
+    chat_id = callback.message.chat.id
+
+    async def _close_all_task():
+        async with close_ops_lock:
+            closed = 0
+            failed = 0
+            pairs_to_close = [
+                pi for pi in pairs_manager.active_pairs.values()
+                if pi.position_status != 0
+            ]
+            for pair_info in pairs_to_close:
+                try:
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
+                    await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
+                    closed += 1
+                except Exception as e:
+                    print(f"Error closing {pair_info.symbol1}-{pair_info.symbol2}: {e}")
+                    failed += 1
+            result_msg = f"Closed {closed} positions."
+            if failed > 0:
+                result_msg += f"\nFailed to close {failed} positions."
+            await bot.send_message(chat_id, result_msg)
+
+    asyncio.create_task(_close_all_task())
 
 
 async def send_startup_message():
@@ -1150,3 +1242,9 @@ async def send_startup_message():
             await bot.send_message(admin_id, "Bot started successfully!")
         except Exception as e:
             print(f"Could not send startup message to admin {admin_id}: {e}")
+
+
+
+
+
+
