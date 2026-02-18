@@ -792,6 +792,20 @@ async def ws_user_msg(ws, msg):
                             'fee1': fee1,
                             'fee2': fee2
                         })
+                    if pair_info.current_trade_id:
+                        try:
+                            await db.close_trade_record(
+                                pair_info.current_trade_id,
+                                status='CLOSED_EXTERNAL',
+                                close_reason=stored_reason if stored_reason else 'external',
+                                pnl=net_pnl,
+                                fee1=fee1,
+                                fee2=fee2,
+                                close_z=zscore if zscore else 0.0,
+                            )
+                        except Exception as trade_err:
+                            print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
+                        pair_info.current_trade_id = None
                 except Exception as e:
                     print(f"⚠️ Cleanup error: {e}")
                     import traceback
@@ -927,6 +941,20 @@ async def ws_user_msg(ws, msg):
                             'fee1': fee1,
                             'fee2': fee2
                         })
+                    if pair_info.current_trade_id:
+                        try:
+                            await db.close_trade_record(
+                                pair_info.current_trade_id,
+                                status='CLOSED_EXTERNAL',
+                                close_reason=stored_reason if stored_reason else 'external',
+                                pnl=net_pnl,
+                                fee1=fee1,
+                                fee2=fee2,
+                                close_z=pair_info.last_z_score if pair_info.last_z_score else 0.0,
+                            )
+                        except Exception as trade_err:
+                            print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
+                        pair_info.current_trade_id = None
                     
                     close_type = '❓ Unknown'
                     close_hint = ''
