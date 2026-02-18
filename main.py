@@ -464,6 +464,8 @@ async def connect_ws(timeframe='1h'):
         for pair_info in pairs_manager.active_pairs.values():
             active_symbols.add(pair_info.symbol1)
             active_symbols.add(pair_info.symbol2)
+        # Always subscribe BTCUSDT for Market Shock Protector logic.
+        active_symbols.add('BTCUSDT')
         
         # Define markPrice handler FIRST (before any subscription)
         async def ws_mark_price(ws, msg):
@@ -478,34 +480,46 @@ async def connect_ws(timeframe='1h'):
         
         # Track already subscribed symbols in pairs_manager
         pairs_manager._subscribed_mark_symbols = set(active_symbols)
+        mark_subscribe_lock = asyncio.Lock()
+        dynamic_mark_symbols: set[str] = set()
+        dynamic_mark_wss: list[binance.futures.WebsocketAsync] = []
         
         # Create callback for dynamic subscription (used when new pairs are discovered)
         async def subscribe_new_marks(symbols):
-            """Subscribe to markPrice streams for new symbols dynamically."""
-            if not symbols:
-                return
-            streams = [f"{s.lower()}@markPrice@1s" for s in symbols]
-            try:
-                ws = await client.websocket(streams, on_message=ws_mark_price, on_error=ws_error)
-                websockets_list.append(ws)
-            except Exception as e:
-                print(f"⚠️ Failed to subscribe markPrice for {symbols}: {e}")
+            """Rebuild dynamic markPrice subscriptions without leaking websocket connections."""
+            async with mark_subscribe_lock:
+                nonlocal dynamic_mark_symbols
+                desired_symbols = set(symbols or [])
+                if desired_symbols == dynamic_mark_symbols:
+                    return
+                dynamic_mark_symbols = desired_symbols
+                streams = [f"{s.lower()}@markPrice@1s" for s in sorted(desired_symbols)]
+                chunks = [streams[i:i + chunk_size] for i in range(0, len(streams), chunk_size)]
+                old_wss = list(dynamic_mark_wss)
+                dynamic_mark_wss.clear()
+                try:
+                    for ws in old_wss:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        try:
+                            websockets_list.remove(ws)
+                        except ValueError:
+                            pass
+                    for marks in chunks:
+                        ws = await client.websocket(marks, on_message=ws_mark_price, on_error=ws_error)
+                        dynamic_mark_wss.append(ws)
+                        websockets_list.append(ws)
+                except Exception as e:
+                    print(f"⚠️ Failed to rebuild markPrice streams for {symbols}: {e}")
         
         # Set the callback on pairs_manager so it can subscribe new pairs
         pairs_manager._subscribe_mark_callback = subscribe_new_marks
         
         # Subscribe to initial symbols
         if active_symbols:
-            mark_streams = [f"{sym.lower()}@markPrice@1s" for sym in active_symbols]
-            mark_chunks = [mark_streams[i:i + chunk_size] for i in range(0, len(mark_streams), chunk_size)]
-            
-            for marks in mark_chunks:
-                try:
-                    ws = await client.websocket(marks, on_message=ws_mark_price, on_error=ws_error)
-                    websockets_list.append(ws)
-                except Exception as e:
-                    print(f"Error subscribing to markPrice: {e}")
-            
+            await subscribe_new_marks(sorted(active_symbols))
             print(f"Connected to markPrice websocket ({len(active_symbols)} initial symbols).")
         else:
             print("ℹ️ No active pairs at startup - markPrice will be subscribed dynamically.")
@@ -677,6 +691,8 @@ async def ws_user_msg(ws, msg):
                     pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
                     fee1 = sum(float(t.get('commission', 0)) for t in trades1)
                     fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                    close_price1 = float(trades1[-1].get('price', 0)) if trades1 else 0.0
+                    close_price2 = float(trades2[-1].get('price', 0)) if trades2 else 0.0
                     total_pnl = pnl1 + pnl2
                     total_fees = fee1 + fee2
                     net_pnl = total_pnl
@@ -802,6 +818,8 @@ async def ws_user_msg(ws, msg):
                                 fee1=fee1,
                                 fee2=fee2,
                                 close_z=zscore if zscore else 0.0,
+                                close_price_1=close_price1 if close_price1 > 0 else None,
+                                close_price_2=close_price2 if close_price2 > 0 else None,
                             )
                         except Exception as trade_err:
                             print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
@@ -912,6 +930,8 @@ async def ws_user_msg(ws, msg):
                     pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
                     fee1 = sum(float(t.get('commission', 0)) for t in trades1)
                     fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                    close_price1 = float(trades1[-1].get('price', 0)) if trades1 else 0.0
+                    close_price2 = float(trades2[-1].get('price', 0)) if trades2 else 0.0
                     total_pnl = pnl1 + pnl2
                     total_fees = fee1 + fee2
                     net_pnl = total_pnl
@@ -951,6 +971,8 @@ async def ws_user_msg(ws, msg):
                                 fee1=fee1,
                                 fee2=fee2,
                                 close_z=pair_info.last_z_score if pair_info.last_z_score else 0.0,
+                                close_price_1=close_price1 if close_price1 > 0 else None,
+                                close_price_2=close_price2 if close_price2 > 0 else None,
                             )
                         except Exception as trade_err:
                             print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
@@ -1143,9 +1165,11 @@ async def ws_user_msg(ws, msg):
                         except Exception as e:
                             print(f"⚠️ TG notify error: {e}")
                         
-                        # Trigger immediate leg sync check for this pair
+                        # Try restoring protection immediately (1 retry), then fallback to leg sync.
                         try:
-                            await pairs_manager._check_leg_synchronization()
+                            restored = await pairs_manager.restore_protection_for_symbol(symbol, max_attempts=2)
+                            if not restored:
+                                await pairs_manager._check_leg_synchronization()
                         except Exception as e:
                             print(f"⚠️ Leg sync error after cancel: {e}")
                         break

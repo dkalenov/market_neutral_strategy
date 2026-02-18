@@ -375,6 +375,16 @@ class PairsManager:
                             'entry_price1': 0,
                             'entry_price2': 0
                         })
+                        try:
+                            open_trade = await db.get_last_open_trade_for_pair(p.id)
+                            if open_trade:
+                                await db.close_trade_record(
+                                    open_trade.id,
+                                    status='CLOSED_ORPHAN',
+                                    close_reason='orphan_restart',
+                                )
+                        except Exception as trade_close_err:
+                            print(f"  ⚠️ Could not close stale OPEN trade for orphan {p.symbol1}-{p.symbol2}: {trade_close_err}")
                         closed_count += 1
                     
                     else:
@@ -388,6 +398,16 @@ class PairsManager:
                             'entry_price1': 0,
                             'entry_price2': 0
                         })
+                        try:
+                            open_trade = await db.get_last_open_trade_for_pair(p.id)
+                            if open_trade:
+                                await db.close_trade_record(
+                                    open_trade.id,
+                                    status='CLOSED_EXTERNAL',
+                                    close_reason='external',
+                                )
+                        except Exception as trade_close_err:
+                            print(f"  ⚠️ Could not close stale OPEN trade for stale pair {p.symbol1}-{p.symbol2}: {trade_close_err}")
                         closed_count += 1
             
             print(f"  Restored {restored_count} pairs, marked {closed_count} stale pairs as CLOSED")
@@ -501,6 +521,7 @@ class PairsManager:
                     qty = pos_data['qty']
                     side = pos_data['side']
                     unrealized_pnl = pos_data['unrealized_pnl']
+                    recovered_from_db = False
                     
                     print(f"      Unknown: {symbol} ({side} {qty}) PnL: {unrealized_pnl:.2f}")
                     
@@ -537,7 +558,10 @@ class PairsManager:
                                         f"Was missed during DB load but found on exchange + DB.\n"
                                         f"Restored to active trading."
                                     )
-                                continue  # Skip closing - recovered
+                                recovered_from_db = True
+                                break
+                    if recovered_from_db:
+                        continue  # Skip closing - symbol is no longer unknown
                     
                     # Only close if truly unknown (not found in DB either)
                     pnl_emoji = "🔴" if unrealized_pnl < 0 else "🟢"
@@ -724,10 +748,38 @@ class PairsManager:
                             print(f"  ⚠️ MISSING PROTECTION for {s1}-{s2}: {', '.join(missing)}")
                             await self._notify(f"⚠️ <b>MISSING PROTECTION:</b> {s1}-{s2}\n"
                                                f"Missing: {', '.join(missing)}\n\n"
-                                               f"Bot will attempt to restore SL/TP...")
-                            
-                            # TODO: Implement SL/TP restoration
-                            # For now, just notify - restoration requires recalculating ATR
+                                               f"Bot will attempt to restore SL/TP (max 2 attempts)...")
+                            restored = await self._restore_pair_protection(pair_info, max_attempts=2)
+                            if restored:
+                                await self._notify(f"✅ <b>Protection Restored:</b> {s1}-{s2}")
+                            else:
+                                await self._notify(
+                                    f"🚨 <b>Protection restore FAILED:</b> {s1}-{s2}\n"
+                                    f"After 2 attempts bot will close this pair and remove it from active rotation."
+                                )
+                                close_ok = False
+                                try:
+                                    if pair_info.position_status != 0:
+                                        pair_info.close_handled = True
+                                        pair_info.is_trading = True
+                                        await self._execute_trade(pair_info, 0, close_reason='stale_symbols')
+                                    close_ok = pair_info.position_status == 0
+                                except Exception as close_err:
+                                    print(f"⚠️ Protection failure close error for {s1}-{s2}: {close_err}")
+                                if close_ok:
+                                    if pair_info.db_id:
+                                        await db.archive_pair(pair_info.db_id, reason='protection_restore_failed')
+                                    if pair_set in self.active_pairs:
+                                        self._unregister_pair(pair_info)
+                                        del self.active_pairs[pair_set]
+                                    self._cleanup_unused_subscription(s1)
+                                    self._cleanup_unused_subscription(s2)
+                                    await self._notify(f"🗑️ <b>Pair Removed:</b> {s1}-{s2} (protection failure)")
+                                else:
+                                    await self._notify(
+                                        f"🚨 <b>PAIR NOT REMOVED</b>: {s1}-{s2}\n"
+                                        f"Reason: could not safely confirm full close on exchange."
+                                    )
                 else:
                     # DB says position is CLOSED
                     if s1_open or s2_open:
@@ -797,16 +849,14 @@ class PairsManager:
                     
                     # Close any open trade records
                     if pair_info.current_trade_id:
-                        trade_update = {
-                            'status': 'CLOSED_EXTERNAL',
-                            'close_time': int(time.time() * 1000),
-                            'close_reason': 'external'
-                        }
-                        if pnl_loaded:
-                            trade_update['pnl'] = total_pnl
-                            trade_update['fee1'] = fee1
-                            trade_update['fee2'] = fee2
-                        await db.update_trade_fields(pair_info.current_trade_id, **trade_update)
+                        await db.close_trade_record(
+                            pair_info.current_trade_id,
+                            status='CLOSED_EXTERNAL',
+                            close_reason='external',
+                            pnl=total_pnl if pnl_loaded else None,
+                            fee1=fee1 if pnl_loaded else None,
+                            fee2=fee2 if pnl_loaded else None,
+                        )
                         pair_info.current_trade_id = None
 
                     externally_closed_pairs.append({
@@ -870,10 +920,10 @@ class PairsManager:
                     
                     # Close trade record
                     if pair_info.current_trade_id:
-                        await db.update_trade_fields(
+                        await db.close_trade_record(
                             pair_info.current_trade_id,
                             status='CLOSED_ORPHAN',
-                            close_time=int(time.time() * 1000)
+                            close_reason='orphan_restart',
                         )
                         pair_info.current_trade_id = None
                     
@@ -1019,6 +1069,137 @@ class PairsManager:
                 
         except Exception as e:
             print(f"⚠️ Error cleaning up orphaned orders: {e}")
+
+    async def _restore_pair_protection(self, pair_info: PairInfo, max_attempts: int = 2) -> bool:
+        """
+        Rebuild full SL/TP protection for an already-open pair.
+        max_attempts includes one retry (e.g. 2 = try + retry once).
+        """
+        if pair_info.position_status == 0:
+            return True
+
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        s1_info = self.all_symbols.get(s1)
+        s2_info = self.all_symbols.get(s2)
+        if not s1_info or not s2_info:
+            print(f"⚠️ Cannot restore protection: missing symbol metadata for {s1}-{s2}")
+            return False
+
+        # Build ATR with fallback to config min percentages (atr=0 fallback in utils).
+        data1 = self.all_data.get(s1)
+        data2 = self.all_data.get(s2)
+        atr1 = 0.0
+        atr2 = 0.0
+        try:
+            if data1 and len(data1.close) > 1:
+                atr1 = utils.calculate_atr(list(data1.high), list(data1.low), list(data1.close))
+            if data2 and len(data2.close) > 1:
+                atr2 = utils.calculate_atr(list(data2.high), list(data2.low), list(data2.close))
+        except Exception as atr_err:
+            print(f"⚠️ ATR calc error while restoring protection for {s1}-{s2}: {atr_err}")
+
+        direction = pair_info.position_status
+        leg1_side = 'LONG' if direction == 1 else 'SHORT'
+        leg2_side = 'SHORT' if direction == 1 else 'LONG'
+        close_side1 = 'SELL' if direction == 1 else 'BUY'
+        close_side2 = 'BUY' if direction == 1 else 'SELL'
+
+        sl1, tp1, _, _ = utils.calculate_hardware_stops(pair_info.entry_price1, leg1_side, atr1, self.config)
+        sl2, tp2, _, _ = utils.calculate_hardware_stops(pair_info.entry_price2, leg2_side, atr2, self.config)
+        sl1 = round(sl1, s1_info.tick_size)
+        sl2 = round(sl2, s2_info.tick_size)
+        tp1 = round(tp1, s1_info.tick_size)
+        tp2 = round(tp2, s2_info.tick_size)
+
+        if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
+            print(f"⚠️ Invalid restore prices for {s1}-{s2}: sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}")
+            return False
+
+        pair_key = frozenset([s1, s2])
+        for attempt in range(1, max_attempts + 1):
+            try:
+                print(f"🛡️ Restore protection attempt {attempt}/{max_attempts} for {s1}-{s2}")
+
+                # Cancel any stale regular stop orders.
+                await asyncio.gather(
+                    self.client.cancel_open_orders(symbol=s1),
+                    self.client.cancel_open_orders(symbol=s2),
+                    return_exceptions=True
+                )
+
+                # Cancel stale algo orders for both symbols.
+                try:
+                    algo_orders = await self.client.get_algo_orders()
+                    if isinstance(algo_orders, dict) and 'orders' in algo_orders:
+                        algo_orders = algo_orders.get('orders', [])
+                    for o in (algo_orders or []):
+                        sym = o.get('symbol')
+                        if sym not in (s1, s2):
+                            continue
+                        status = o.get('algoStatus') or o.get('status', '')
+                        if status != 'NEW':
+                            continue
+                        o_type = str(o.get('orderType') or o.get('type') or o.get('o') or '').upper()
+                        if o_type in ('STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
+                            aid = o.get('algoId')
+                            if aid is not None:
+                                await self.client.cancel_algo_order(algoId=aid)
+                except Exception as clean_err:
+                    print(f"⚠️ Cleanup before protection restore failed for {s1}-{s2}: {clean_err}")
+
+                # Place full 4 protection orders.
+                tasks = [
+                    self.client.new_algo_order(symbol=s1, side=close_side1, type='STOP_MARKET',
+                                               triggerPrice=sl1, quantity=pair_info.qty1, reduceOnly='true'),
+                    self.client.new_algo_order(symbol=s2, side=close_side2, type='STOP_MARKET',
+                                               triggerPrice=sl2, quantity=pair_info.qty2, reduceOnly='true'),
+                    self.client.new_algo_order(symbol=s1, side=close_side1, type='TAKE_PROFIT_MARKET',
+                                               triggerPrice=tp1, quantity=pair_info.qty1, reduceOnly='true'),
+                    self.client.new_algo_order(symbol=s2, side=close_side2, type='TAKE_PROFIT_MARKET',
+                                               triggerPrice=tp2, quantity=pair_info.qty2, reduceOnly='true'),
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                ok_ids = []
+                for r in results:
+                    if isinstance(r, Exception):
+                        raise r
+                    if isinstance(r, dict) and 'algoId' in r:
+                        ok_ids.append(str(r['algoId']))
+
+                if len(ok_ids) != 4:
+                    raise RuntimeError(f"Expected 4 algo orders, got {len(ok_ids)}")
+
+                # Replace local algo mapping for this pair.
+                to_remove = [aid for aid, info in self.algo_orders.items() if info.get('pair_key') == pair_key]
+                for aid in to_remove:
+                    self.algo_orders.pop(aid, None)
+                self.algo_orders[ok_ids[0]] = {'pair_key': pair_key, 'symbol': s1, 'type': 'STOP'}
+                self.algo_orders[ok_ids[1]] = {'pair_key': pair_key, 'symbol': s2, 'type': 'STOP'}
+                self.algo_orders[ok_ids[2]] = {'pair_key': pair_key, 'symbol': s1, 'type': 'TAKE_PROFIT'}
+                self.algo_orders[ok_ids[3]] = {'pair_key': pair_key, 'symbol': s2, 'type': 'TAKE_PROFIT'}
+
+                print(f"✅ Protection restored for {s1}-{s2}")
+                return True
+            except Exception as restore_err:
+                print(f"⚠️ Protection restore attempt {attempt} failed for {s1}-{s2}: {restore_err}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(1)
+
+        return False
+
+    async def restore_protection_for_symbol(self, symbol: str, max_attempts: int = 2) -> bool:
+        """
+        Public helper for runtime repair after SL/TP cancel events.
+        Returns True if protection was restored for at least one open pair containing symbol.
+        """
+        restored_any = False
+        for pair_info in list(self._pairs_with_symbol(symbol)):
+            if pair_info.position_status == 0 or pair_info.is_trading:
+                continue
+            ok = await self._restore_pair_protection(pair_info, max_attempts=max_attempts)
+            restored_any = restored_any or ok
+        return restored_any
 
     async def handle_sl_tp_triggered(self, symbol: str, order_type: str = 'STOP'):
         """
@@ -1174,7 +1355,7 @@ class PairsManager:
         
         # Delete from DB
         if pair_info.db_id:
-            await db.delete_pair(pair_info.db_id)
+            await db.archive_pair(pair_info.db_id, reason=f"idle_{reason}")
         
         print(f"  🗑️ Removed idle pair {s1}-{s2} (reason: {reason})")
     
@@ -1186,7 +1367,15 @@ class PairsManager:
                 return  # Still in use
         
         # Not used anymore - remove from tracked subscriptions
-        self._subscribed_mark_symbols.discard(symbol)
+        if symbol in self._subscribed_mark_symbols:
+            self._subscribed_mark_symbols.discard(symbol)
+            # Trigger websocket resync so removed symbols are truly unsubscribed.
+            # Callback is async; run in background to avoid blocking cleanup path.
+            if self._subscribe_mark_callback:
+                try:
+                    self.loop.create_task(self._subscribe_mark_callback(list(self._subscribed_mark_symbols)))
+                except Exception:
+                    pass
 
     async def _check_leg_synchronization(self):
         """Check that both legs of each active pair are open."""
@@ -1270,18 +1459,14 @@ class PairsManager:
                         await db.update_pair(pair_update)
 
                     if pair_info.current_trade_id:
-                        trade_update = {
-                            'status': 'CLOSED_EXTERNAL',
-                            'close_time': int(time.time() * 1000),
-                            'close_reason': 'external',
-                        }
-                        if pnl_loaded:
-                            trade_update.update({
-                                'pnl': total_pnl,
-                                'fee1': fee1,
-                                'fee2': fee2,
-                            })
-                        await db.update_trade_fields(pair_info.current_trade_id, **trade_update)
+                        await db.close_trade_record(
+                            pair_info.current_trade_id,
+                            status='CLOSED_EXTERNAL',
+                            close_reason='external',
+                            pnl=total_pnl if pnl_loaded else None,
+                            fee1=fee1 if pnl_loaded else None,
+                            fee2=fee2 if pnl_loaded else None,
+                        )
                         pair_info.current_trade_id = None
 
                     externally_closed_now.append({
@@ -1468,15 +1653,14 @@ class PairsManager:
                         # Update trade record if available
                         if pair_info.current_trade_id:
                             try:
-                                await db.update_trade_fields(
+                                await db.close_trade_record(
                                     pair_info.current_trade_id,
                                     status='CLOSED',
-                                    close_time=int(time.time() * 1000),
+                                    close_reason='desync',
                                     pnl=total_pnl,
                                     close_z=close_zscore,
                                     fee1=fee1,
                                     fee2=fee2,
-                                    close_reason='desync',
                                 )
                             except Exception:
                                 pass
@@ -1912,7 +2096,7 @@ class PairsManager:
                         # CRITICAL: Await this to prevent pool exhaustion (was create_task)
                         try:
                             await db.add_pair_history(history_item)
-                            await db.delete_pair(pair_info.db_id)
+                            await db.archive_pair(pair_info.db_id, reason='broken_coint')
                         except Exception as e:
                             print(f"⚠️ Failed to update DB content for broken pair {s1}-{s2}: {e}")
                     
@@ -2194,18 +2378,6 @@ class PairsManager:
                     )
                     await db.add_pair(new_pair)
                     
-                    history_item = db.PairHistory(
-                        symbol1=s1, 
-                        symbol2=s2, 
-                        event_type='FOUND',
-                        timestamp=int(time.time() * 1000),
-                        hedge_ratio=hedge,
-                        half_life=hl,
-                        reason='Discovery'
-                    )
-                    # CRITICAL: Await this to prevent flooding DB pool with 13k+ tasks
-                    await db.add_pair_history(history_item)
-                    
                     # === BETA CHECK BEFORE ADDING TO ACTIVE PAIRS ===
                     # Calculate beta to BTC to ensure pair is market-neutral
                     beta_btc = 0.0
@@ -2232,6 +2404,19 @@ class PairsManager:
                     
                     if not test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
                         print(f"⚠️ {s1}-{s2} REJECTED at discovery: |beta|={abs(beta_btc):.3f} >= {beta_threshold}")
+                        try:
+                            reject_history = db.PairHistory(
+                                symbol1=s1,
+                                symbol2=s2,
+                                event_type='BETA_REJECTED',
+                                timestamp=int(time.time() * 1000),
+                                hedge_ratio=hedge,
+                                half_life=hl,
+                                reason=f'|beta|={abs(beta_btc):.3f} >= {beta_threshold}'
+                            )
+                            await db.add_pair_history(reject_history)
+                        except Exception:
+                            pass
                         # Remove from DB since we just added it
                         try:
                             await db.delete_pair(new_pair.id)
@@ -2242,6 +2427,19 @@ class PairsManager:
                         print(f"🧪 TEST MODE: {s1}-{s2} |beta|={abs(beta_btc):.3f} >= {beta_threshold} - ALLOWED for testing")
                     
                     print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}, Hedge: {hedge:.4f}")
+                    try:
+                        history_item = db.PairHistory(
+                            symbol1=s1,
+                            symbol2=s2,
+                            event_type='FOUND',
+                            timestamp=int(time.time() * 1000),
+                            hedge_ratio=hedge,
+                            half_life=hl,
+                            reason='Discovery'
+                        )
+                        await db.add_pair_history(history_item)
+                    except Exception as hist_err:
+                        print(f"⚠️ Could not write PairHistory FOUND for {s1}-{s2}: {hist_err}")
                     
                     pair_info = PairInfo(
                         symbol1=s1, 
@@ -2712,17 +2910,16 @@ class PairsManager:
                     
                     if saved_trade_id:
                         try:
-                            await db.update_trade_fields(
+                            await db.close_trade_record(
                                 saved_trade_id,
                                 status='CLOSED',
-                                close_time=int(time.time() * 1000),
+                                close_reason=close_reason or 'unknown',
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=total_pnl,
                                 close_z=close_zscore,
                                 fee1=_hw_fee1,
                                 fee2=_hw_fee2,
-                                close_reason=close_reason or 'unknown',
                             )
                         except Exception as e:
                             print(f"⚠️ Trade record update failed: {e}")
@@ -3010,17 +3207,16 @@ class PairsManager:
                             close_zscore = pair_info.last_z_score or 0
 
                         if pair_info.current_trade_id:
-                            await db.update_trade_fields(
+                            await db.close_trade_record(
                                 pair_info.current_trade_id,
                                 status='CLOSED',
-                                close_time=int(time.time() * 1000),
+                                close_reason=close_reason or 'unknown',
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=total_pnl,
                                 close_z=close_zscore if close_zscore else 0.0,
                                 fee1=_norm_fee1,
                                 fee2=_norm_fee2,
-                                close_reason=close_reason or 'unknown',
                             )
                     
                         pair_info.current_trade_id = None
@@ -3238,6 +3434,17 @@ class PairsManager:
             try:
                 beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
                 current_beta = getattr(pair_info, 'beta_btc', 0.0)
+                # Recalculate beta right before entry to avoid stale neutrality check.
+                if 'BTCUSDT' in self.all_data:
+                    btc_data = self.all_data.get('BTCUSDT')
+                    if btc_data and len(btc_data.close) >= self.min_data_points:
+                        log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
+                        spread_returns = np.diff(log_prices1) - hedge * np.diff(log_prices2)
+                        btc_returns = np.diff(log_btc)
+                        fresh_beta = utils.calculate_pair_beta(spread_returns, btc_returns)
+                        if not np.isnan(fresh_beta):
+                            current_beta = float(fresh_beta)
+                            pair_info.beta_btc = current_beta
                 if not np.isnan(current_beta) and abs(current_beta) >= beta_threshold:
                     warn_msg = f"⛔ BETA REJECT: {s1}-{s2} beta={current_beta:.3f} >= {beta_threshold}. Aborting entry."
                     print(warn_msg)

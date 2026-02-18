@@ -1,3 +1,4 @@
+import time
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -53,6 +54,7 @@ class Pairs(Base):
     beta_btc = Column(Float, default=0.0)       # Last beta to BTC
     last_pvalue = Column(Float, default=0.0)    # Last cointegration p-value
     entry_z_score = Column(Float, default=0.0)  # Z-score at trade entry
+    is_archived = Column(Boolean, default=False)  # Soft-delete marker for historical integrity
     
     
 # Table for trade execution records
@@ -199,6 +201,7 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS last_pvalue FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_z_score FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;",
         # Trades — extended metadata for post-trade analysis
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hedge_ratio FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
@@ -210,6 +213,14 @@ async def run_migrations(engine):
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
+        # Performance indexes (safe, idempotent)
+        "CREATE INDEX IF NOT EXISTS idx_pairs_is_archived ON pairs (is_archived);",
+        "CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);",
+        "CREATE INDEX IF NOT EXISTS idx_trades_pair_id ON trades (pair_id);",
+        # Prevent duplicate ACTIVE pairs regardless of symbol order.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pairs_unique_active "
+        "ON pairs (LEAST(symbol1, symbol2), GREATEST(symbol1, symbol2)) "
+        "WHERE is_archived = FALSE;",
     ]
     
     async with engine.begin() as conn:
@@ -319,9 +330,12 @@ async def config_update(**kwargs):
         await s.commit()
 
 
-async def get_all_pairs():
+async def get_all_pairs(include_archived: bool = False):
     async with Session() as s:
-        pairs = await s.execute(select(Pairs))
+        stmt = select(Pairs)
+        if not include_archived:
+            stmt = stmt.where(Pairs.is_archived.is_(False))
+        pairs = await s.execute(stmt)
         return pairs.scalars().all()
 
 
@@ -360,6 +374,24 @@ async def delete_pair(pair_id):
         await s.commit()
 
 
+async def archive_pair(pair_id: int, reason: str = ''):
+    """Soft-delete pair row to preserve trade history references."""
+    values = {
+        'is_archived': True,
+        'position_status': 0,
+        'qty1': 0.0,
+        'qty2': 0.0,
+        'entry_price1': 0.0,
+        'entry_price2': 0.0,
+        'close_time': int(time.time()),
+    }
+    if reason:
+        values['close_reason'] = reason
+    async with Session() as s:
+        await s.execute(update(Pairs).where(Pairs.id == pair_id).values(**values))
+        await s.commit()
+
+
 async def get_open_trades():
     async with Session() as s:
         trades = await s.execute(select(Trades).where(Trades.status == 'OPEN'))
@@ -390,3 +422,37 @@ async def update_trade(trade):
     async with Session() as s:
         s.add(trade)
         await s.commit()
+
+
+async def close_trade_record(
+    trade_id: int,
+    *,
+    status: str = 'CLOSED',
+    close_reason: str = 'unknown',
+    close_time_ms: int | None = None,
+    pnl: float | None = None,
+    fee1: float | None = None,
+    fee2: float | None = None,
+    close_z: float | None = None,
+    close_price_1: float | None = None,
+    close_price_2: float | None = None,
+):
+    """Unified safe closer for Trades rows."""
+    data = {
+        'status': status,
+        'close_time': close_time_ms if close_time_ms is not None else int(time.time() * 1000),
+        'close_reason': close_reason,
+    }
+    if pnl is not None:
+        data['pnl'] = pnl
+    if fee1 is not None:
+        data['fee1'] = fee1
+    if fee2 is not None:
+        data['fee2'] = fee2
+    if close_z is not None:
+        data['close_z'] = close_z
+    if close_price_1 is not None:
+        data['close_price_1'] = close_price_1
+    if close_price_2 is not None:
+        data['close_price_2'] = close_price_2
+    await update_trade_fields(trade_id, **data)
