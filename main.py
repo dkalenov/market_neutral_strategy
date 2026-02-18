@@ -23,6 +23,8 @@ pairs_manager: pairs_trading.PairsManager
 # TG notification globals
 tg_channel_global = ''
 tg_admins_global = ''
+# Anti-spam cache for noisy untracked-close websocket events
+untracked_close_alerts: dict[str, float] = {}
 
 async def send_tg_notification(message, reply_to_message_id=None, reply_markup=None):
     """Send notification to TG channel or admins. Returns message_id for reply threading."""
@@ -508,6 +510,14 @@ async def ws_user_msg(ws, msg):
     if event_type == 'ACCOUNT_UPDATE':
         positions = msg.get('a', {}).get('P', [])
         print(f"📡 ACCOUNT_UPDATE: {len(positions)} positions in update")
+
+        # Snapshot of known-open symbols BEFORE applying this update.
+        # Used to avoid false "UNTRACKED POSITION CLOSED" alerts for symbols that
+        # were never tracked as open by the bot.
+        known_open_before = set()
+        if pairs_manager:
+            known_open_before.update((pairs_manager._exchange_positions_cache or {}).keys())
+            known_open_before.update((pairs_manager._exchange_pnl_cache or {}).keys())
         
         # Notify about ALL position changes immediately
         closed_symbols = []
@@ -520,10 +530,12 @@ async def ws_user_msg(ws, msg):
                 # Clear PnL cache for closed position
                 if pairs_manager:
                     pairs_manager._exchange_pnl_cache.pop(sym, None)
+                    pairs_manager._exchange_positions_cache.pop(sym, None)
             else:
                 # Update PnL cache in real-time from WebSocket (instant, no API call)
                 if pairs_manager:
                     pairs_manager._exchange_pnl_cache[sym] = up
+                    pairs_manager._exchange_positions_cache[sym] = abs(amt)
         
         # Note: Detailed notifications will be sent per-pair below
         # Skip simple "Position Changes" message - too noisy
@@ -931,6 +943,18 @@ async def ws_user_msg(ws, msg):
             if position_amt == 0:
                 was_handled = symbol in handled_symbols
                 if not was_handled:
+                    # Only alert if this symbol was known as open before the update.
+                    # Prevents false alerts from noisy ACCOUNT_UPDATE payloads.
+                    if symbol not in known_open_before:
+                        continue
+
+                    # Anti-spam: suppress duplicate alerts for same symbol within 10 minutes.
+                    now_ts = time_mod.time()
+                    last_ts = untracked_close_alerts.get(symbol, 0)
+                    if now_ts - last_ts < 600:
+                        continue
+                    untracked_close_alerts[symbol] = now_ts
+
                     msg_txt = (f"⚡ <b>UNTRACKED POSITION CLOSED</b>\n\n"
                                f"Symbol: <b>{symbol}</b>\n"
                                f"Notice: This position was closed but was NOT tracked by the bot's active_pairs list.\n"
