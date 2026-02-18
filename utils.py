@@ -211,23 +211,39 @@ def calculate_qty(dollar1, dollar2, price1, price2, capital=CAPITAL, max_notiona
 
 # Helper to calculate precision from step size
 def get_precision(step_size):
-    """Converts a step_size like 0.001 to precision like 3."""
-    if step_size == 0 or step_size >= 1:
+    """
+    Convert quantity step metadata to decimal precision.
+    Supports both:
+    - raw step values (e.g. 0.001 -> 3)
+    - precision digits from local Symbol parser (e.g. 3 -> 3)
+    """
+    if step_size is None:
         return 0
-    return int(round(-math.log10(step_size), 0))
+    try:
+        step = float(step_size)
+    except Exception:
+        return 0
+
+    if step < 0:
+        return 0
+
+    # Local parser stores *_size as precision digits (int-like >= 0).
+    if step >= 1 and abs(step - int(step)) < 1e-9:
+        return int(step)
+
+    if step == 0:
+        return 0
+
+    return int(round(-math.log10(step), 0))
 
 # функция для округления вверх до шага (step_size)
 def round_up(num, step_size=1.0):
-    if step_size < 1e-9 or step_size >= 1:
-        return math.ceil(num)
     precision = get_precision(step_size)
     multiplier = 10 ** precision
     return math.ceil(num * multiplier) / multiplier
 
 # функция для округления вниз до шага (step_size)
 def round_down(num, step_size=1.0):
-    if step_size < 1e-9 or step_size >= 1:
-        return math.floor(num)
     precision = get_precision(step_size)
     multiplier = 10 ** precision
     return math.floor(num * multiplier) / multiplier

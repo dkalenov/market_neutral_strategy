@@ -956,8 +956,7 @@ class PairsManager:
                     try:
                         # Wait briefly for trade to register
                         await asyncio.sleep(0.5)
-                        now_ms = int(time.time() * 1000)
-                        start_ms = now_ms - 300_000  # Last 5 minutes
+                        start_ms = self._trade_window_start_ms(pair_info)
                         recent_trades = await self.client.get_account_trades(symbol=symbol, startTime=start_ms, limit=20)
                         
                         if recent_trades:
@@ -1224,8 +1223,7 @@ class PairsManager:
                         await asyncio.sleep(1)
                         
                         # Fetch actual PnL from recent trades
-                        now_ms = int(time.time() * 1000)
-                        start_ms = now_ms - 300_000  # Last 5 minutes
+                        start_ms = self._trade_window_start_ms(pair_info)
                         
                         trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
                         trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
@@ -1989,6 +1987,12 @@ class PairsManager:
             for res in batch_results:
                 s1, s2, hedge, hl, pval = res
                 try:
+                    pair_set = frozenset([s1, s2])
+                    # Final duplicate check before touching DB (race condition protection)
+                    if pair_set in self.active_pairs:
+                        print(f"  ⚠️ Skipping duplicate (race condition): {s1}-{s2}")
+                        continue
+
                     new_pair = db.Pairs(
                         symbol1=s1, 
                         symbol2=s2, 
@@ -2009,8 +2013,6 @@ class PairsManager:
                     )
                     # CRITICAL: Await this to prevent flooding DB pool with 13k+ tasks
                     await db.add_pair_history(history_item)
-                    
-                    pair_set = frozenset([s1, s2])
                     
                     # === BETA CHECK BEFORE ADDING TO ACTIVE PAIRS ===
                     # Calculate beta to BTC to ensure pair is market-neutral
@@ -2048,11 +2050,6 @@ class PairsManager:
                         print(f"🧪 TEST MODE: {s1}-{s2} |beta|={abs(beta_btc):.3f} >= {beta_threshold} - ALLOWED for testing")
                     
                     print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}, Hedge: {hedge:.4f}")
-                    
-                    # Final duplicate check before adding (race condition protection)
-                    if pair_set in self.active_pairs:
-                        print(f"  ⚠️ Skipping duplicate (race condition): {s1}-{s2}")
-                        continue
                     
                     pair_info = PairInfo(
                         symbol1=s1, 
@@ -2132,6 +2129,18 @@ class PairsManager:
             hours = int(hl_hours)
             mins = int((hl_hours - hours) * 60)
             return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+
+    def _trade_window_start_ms(self, pair_info: PairInfo, default_lookback_sec: int = 300, buffer_sec: int = 120) -> int:
+        """
+        Build safer startTime for userTrades queries.
+        Prefer pair open_time to avoid mixing unrelated fills.
+        """
+        now_ms = int(time.time() * 1000)
+        open_time = int(getattr(pair_info, 'open_time', 0) or 0)
+        if open_time > 0:
+            start_sec = max(0, open_time - buffer_sec)
+            return start_sec * 1000
+        return now_ms - (default_lookback_sec * 1000)
 
     async def _set_leverage(self, symbol, leverage):
         """Sets leverage for the symbol if not already set. Returns True on success."""
@@ -2431,8 +2440,7 @@ class PairsManager:
                     close_price2 = 0.0
                     try:
                         await asyncio.sleep(0.5)  # Brief delay for trade data availability
-                        now_ms = int(time.time() * 1000)
-                        start_ms = now_ms - 300_000  # Last 5 minutes
+                        start_ms = self._trade_window_start_ms(pair_info)
                         
                         trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
                         trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
@@ -2452,8 +2460,7 @@ class PairsManager:
                     
                     # Calculate PnL using EXCHANGE data (source of truth)
                     try:
-                        now_ms = int(time.time() * 1000)
-                        start_ms_pnl = now_ms - 300_000  # Last 5 minutes
+                        start_ms_pnl = self._trade_window_start_ms(pair_info)
                         trades_pnl_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_pnl, limit=50)
                         trades_pnl_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_pnl, limit=50)
                         if trades_pnl_s1 or trades_pnl_s2:
@@ -2468,6 +2475,19 @@ class PairsManager:
                         pnl1 = (close_price1 - saved_entry1) * saved_qty1 * side1_dir
                         pnl2 = (close_price2 - saved_entry2) * saved_qty2 * side2_dir
                     total_pnl = pnl1 + pnl2
+
+                    # Calculate close z-score BEFORE DB update.
+                    close_zscore = pair_info.last_z_score or 0
+                    try:
+                        p1 = self.last_prices.get(s1, 0)
+                        p2 = self.last_prices.get(s2, 0)
+                        if p1 > 0 and p2 > 0:
+                            close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
+                            import math
+                            if math.isnan(close_zscore):
+                                close_zscore = pair_info.last_z_score or 0
+                    except Exception:
+                        close_zscore = pair_info.last_z_score or 0
                     
                     # Update trade record in DB
                     # Calculate fees from recent trades
@@ -2714,8 +2734,7 @@ class PairsManager:
                         for sym in [s1, s2]:
                             if sym not in close_prices:
                                 try:
-                                    now_ms = int(time.time() * 1000)
-                                    start_ms = now_ms - 300_000  # Last 5 minutes
+                                    start_ms = self._trade_window_start_ms(pair_info)
                                     trades = await self.client.get_account_trades(symbol=sym, startTime=start_ms, limit=50)
                                     if trades:
                                         # Last trade price is the close price
@@ -2736,8 +2755,7 @@ class PairsManager:
                         pnl2 = 0.0
                         try:
                             await asyncio.sleep(0.5)  # Brief delay for trade data availability
-                            now_ms_pnl = int(time.time() * 1000)
-                            start_ms_pnl = now_ms_pnl - 300_000
+                            start_ms_pnl = self._trade_window_start_ms(pair_info)
                             trades_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_pnl, limit=50)
                             trades_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_pnl, limit=50)
                             if trades_s1 or trades_s2:

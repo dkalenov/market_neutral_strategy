@@ -172,7 +172,7 @@ async def main():
                 skip = False
                 for f in s_data.get('filters', []):
                     for k, v in f.items():
-                        if k in ('stepSize', 'tickSize', 'minQty') and v == '0' or v == '0.0':
+                        if k in ('stepSize', 'tickSize', 'minQty') and (v == '0' or v == '0.0'):
                             skip = True
                             break
                 if skip:
@@ -185,7 +185,7 @@ async def main():
     
     # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
     max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
-    blacklist = set((conf.blacklist or '').split(','))
+    blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
     
     try:
         print(f"📈 Filtering top {max_symbols} symbols by 24h volume...")
@@ -252,7 +252,7 @@ async def load_symbols_loop():
             # Apply volume filter + blacklist (same as initial load in main())
             conf = await db.load_config()
             max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
-            blacklist = set((conf.blacklist or '').split(','))
+            blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
             
             try:
                 tickers = await client.ticker_24hr_price_change()
@@ -602,7 +602,8 @@ async def ws_user_msg(ws, msg):
                     
                     # Fetch actual PnL from recent trades
                     now_ms = int(time_mod.time() * 1000)
-                    start_ms = now_ms - 300_000  # Last 5 minutes
+                    open_time = int(getattr(pair_info, 'open_time', 0) or 0)
+                    start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
                     trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
                     trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
@@ -782,7 +783,8 @@ async def ws_user_msg(ws, msg):
                     await asyncio.sleep(1)
                     
                     now_ms = int(time_mod.time() * 1000)
-                    start_ms = now_ms - 300_000
+                    open_time = int(getattr(pair_info, 'open_time', 0) or 0)
+                    start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
                     trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
                     trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
