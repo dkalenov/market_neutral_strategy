@@ -9,6 +9,7 @@ import builtins
 import csv
 import gzip
 import shutil
+from collections import deque
 import aiohttp
 from urllib.parse import urlsplit, parse_qs
 from dotenv import load_dotenv
@@ -38,6 +39,15 @@ recently_handled_close_symbols: dict[str, float] = {}
 _pair_history_last_alert_key: str = ''
 _orig_print = builtins.print
 _pair_history_last_backup_key: str = ''
+_main_timeframe_global: str = '1h'
+
+# WS health/watchdog state
+_ws_last_main_msg_ts: float = 0.0
+_ws_last_mark_msg_ts: float = 0.0
+_ws_last_user_msg_ts: float = 0.0
+_ws_error_ts: deque = deque(maxlen=512)
+_ws_recover_lock: asyncio.Lock | None = None
+_ws_last_recover_ts: float = 0.0
 
 
 def _configure_console_encoding():
@@ -159,6 +169,8 @@ async def main():
     global client
     global pairs_manager
     global all_symbols
+    global _main_timeframe_global
+    global _ws_recover_lock
     
     # Load environment variables from .env file
     _configure_console_encoding()
@@ -214,6 +226,9 @@ async def main():
     
     # Default values
     timeframe = conf.timeframe if conf.timeframe else '1h'
+    _main_timeframe_global = timeframe
+    if _ws_recover_lock is None:
+        _ws_recover_lock = asyncio.Lock()
     
     # Robust window_size logic:
     # 1. Check if user provided a valid override
@@ -349,6 +364,7 @@ async def main():
     loop.create_task(load_symbols_loop())
     loop.create_task(pair_history_retention_notice_loop())
     loop.create_task(sync_exchange_time_loop())
+    loop.create_task(ws_health_watchdog_loop())
     
     loop.create_task(connect_ws(timeframe))
     
@@ -430,6 +446,116 @@ async def sync_exchange_time_loop():
             break
         except Exception as e:
             print(f"⚠️ Time sync loop error: {e}")
+
+
+def _timeframe_to_seconds(tf: str) -> int:
+    tf = (tf or '1h').strip().lower()
+    if tf.endswith('m'):
+        try:
+            return max(60, int(tf[:-1]) * 60)
+        except Exception:
+            return 3600
+    if tf.endswith('h'):
+        try:
+            return max(3600, int(tf[:-1]) * 3600)
+        except Exception:
+            return 3600
+    if tf.endswith('d'):
+        try:
+            return max(86400, int(tf[:-1]) * 86400)
+        except Exception:
+            return 86400
+    return 3600
+
+
+async def _recover_ws_stack(reason: str):
+    global _ws_last_recover_ts
+    global _ws_last_main_msg_ts
+    global _ws_last_mark_msg_ts
+    global _ws_last_user_msg_ts
+    global _ws_error_ts
+    now = time_mod.time()
+    # Anti-flap: don't restart too often.
+    if now - _ws_last_recover_ts < 120:
+        return
+    if _ws_recover_lock is None:
+        return
+    async with _ws_recover_lock:
+        now = time_mod.time()
+        if now - _ws_last_recover_ts < 120:
+            return
+        _ws_last_recover_ts = now
+        print(f"🛠️ WS watchdog recovery started: {reason}")
+        try:
+            await send_tg_notification(
+                f"⚠️ <b>WS Watchdog</b>: reconnect storm/stale stream detected.\n"
+                f"Reason: <code>{reason}</code>\n"
+                f"Action: restarting WS stack automatically."
+            )
+        except Exception:
+            pass
+        try:
+            await disconnect_ws()
+            await asyncio.sleep(2)
+            await connect_ws(_main_timeframe_global)
+            now2 = time_mod.time()
+            _ws_last_main_msg_ts = now2
+            _ws_last_mark_msg_ts = now2
+            _ws_last_user_msg_ts = now2
+            _ws_error_ts.clear()
+            await send_tg_notification("✅ <b>WS Watchdog</b>: WS stack restarted successfully.")
+        except Exception as e:
+            print(f"❌ WS watchdog recovery failed: {e}")
+            try:
+                await send_tg_notification(f"🚨 <b>WS Watchdog restart failed</b>: <code>{e}</code>")
+            except Exception:
+                pass
+
+
+async def ws_health_watchdog_loop():
+    """Autonomous WS health monitor with self-healing restart."""
+    global _ws_last_main_msg_ts
+    global _ws_last_mark_msg_ts
+    global _ws_last_user_msg_ts
+    while True:
+        try:
+            await asyncio.sleep(30)
+            now = time_mod.time()
+
+            # During startup, prime timestamps to avoid false positives.
+            if _ws_last_main_msg_ts <= 0:
+                _ws_last_main_msg_ts = now
+            if _ws_last_mark_msg_ts <= 0:
+                _ws_last_mark_msg_ts = now
+            if _ws_last_user_msg_ts <= 0:
+                _ws_last_user_msg_ts = now
+
+            # Reconnect storm detector.
+            recent_errors = [t for t in _ws_error_ts if now - t <= 180]
+            if len(recent_errors) >= 12:
+                await _recover_ws_stack(f"reconnect_storm:{len(recent_errors)}/180s")
+                continue
+
+            # Stale markPrice detector (critical for realtime entries/exits).
+            # Only check when symbols are actually subscribed.
+            mark_subscribed = 0
+            if pairs_manager:
+                mark_subscribed = len(getattr(pairs_manager, '_subscribed_mark_symbols', set()) or set())
+            if mark_subscribed > 0 and (now - _ws_last_mark_msg_ts) > 180:
+                await _recover_ws_stack(f"markprice_stale:{int(now - _ws_last_mark_msg_ts)}s")
+                continue
+
+            # Main kline detector.
+            tf_sec = _timeframe_to_seconds(_main_timeframe_global)
+            # Kline stream usually updates intra-candle, but allow a wide threshold.
+            max_main_silence = min(max(300, tf_sec // 2), 1800)
+            if (now - _ws_last_main_msg_ts) > max_main_silence:
+                await _recover_ws_stack(f"main_kline_stale:{int(now - _ws_last_main_msg_ts)}s")
+                continue
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️ WS watchdog loop error: {e}")
 
 
 def _to_bool(value) -> bool:
@@ -578,8 +704,15 @@ async def connect_ws(timeframe='1h'):
     global websockets_list
     global userdata_ws
     global pairs_manager
+    global _ws_last_main_msg_ts
+    global _ws_last_mark_msg_ts
+    global _ws_last_user_msg_ts
 
     print("Connecting to websockets...")
+    now_ts = time_mod.time()
+    _ws_last_main_msg_ts = now_ts
+    _ws_last_mark_msg_ts = now_ts
+    _ws_last_user_msg_ts = now_ts
 
     # COLLECT ALL USDT PAIRS FOR SCANNER
     target_symbols = []
@@ -701,12 +834,14 @@ async def connect_ws(timeframe='1h'):
         # Define markPrice handler FIRST (before any subscription)
         async def ws_mark_price(ws, msg):
             """Handle markPrice updates for real-time Z-score."""
+            global _ws_last_mark_msg_ts
             if 'data' not in msg:
                 return
             data = msg['data']
             symbol = data.get('s')
             price = float(data.get('p', 0))
             if symbol and price > 0 and pairs_manager:
+                _ws_last_mark_msg_ts = time_mod.time()
                 await pairs_manager.on_ticker_update(symbol, price)
         
         # Track already subscribed symbols in pairs_manager
@@ -789,12 +924,16 @@ async def disconnect_ws():
             await userdata_ws.close()
     except:
         pass
+    websockets_list.clear()
+    userdata_ws = None
 
 
 # Handle websocket errors
 async def ws_error(ws, error):
+    global _ws_error_ts
     # Network hiccups are expected; avoid noisy full tracebacks on every reconnect.
     if isinstance(error, (asyncio.TimeoutError, TimeoutError, aiohttp.ClientError, ConnectionError)):
+        _ws_error_ts.append(time_mod.time())
         err_txt = str(error)
         if 'wss://' in err_txt and 'streams=' in err_txt:
             try:
@@ -812,14 +951,21 @@ async def ws_error(ws, error):
             err_txt = err_txt[:240] + '...'
         print(f"WS reconnect: {type(error).__name__}: {err_txt}")
         return
+    # Aiohttp WS error payload may arrive as plain text-like object.
+    err_txt = str(error)
+    if 'No PONG received' in err_txt:
+        _ws_error_ts.append(time_mod.time())
+        print(f"WS reconnect: ServerTimeoutError: {err_txt}")
+        return
     print(f"WS ERROR: {error}")
-    traceback.print_exc()
 
 
 # Handle MAIN timeframe kline messages (for discovery + validation)
 async def ws_msg_main(ws, msg):
+    global _ws_last_main_msg_ts
     if 'data' not in msg:
         return
+    _ws_last_main_msg_ts = time_mod.time()
     
     kline = msg['data']['k']
     
@@ -833,6 +979,8 @@ async def ws_msg_main(ws, msg):
 async def ws_user_msg(ws, msg):
     """Handle userdata messages including order updates and position changes."""
     global pairs_manager
+    global _ws_last_user_msg_ts
+    _ws_last_user_msg_ts = time_mod.time()
     
     event_type = msg.get('e')
     

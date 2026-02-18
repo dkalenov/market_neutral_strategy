@@ -238,6 +238,8 @@ async def run_migrations(engine):
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pairs_unique_active "
         "ON pairs (LEAST(symbol1, symbol2), GREATEST(symbol1, symbol2)) "
         "WHERE is_archived = FALSE;",
+        # Cleanup deprecated config keys
+        "DELETE FROM config WHERE key = 'test_pairs';",
     ]
     
     async with engine.begin() as conn:
@@ -339,9 +341,6 @@ async def load_config():
                 pass
         # Load all configuration from DB
         async with Session() as session:
-            # Remove deprecated key that is no longer used by strategy logic.
-            await session.execute(delete(Config).where(Config.key == 'test_pairs'))
-            await session.commit()
             result = (await session.execute(select(Config))).scalars().all()
             data = {row.key: row.value for row in result}
             return ConfigInfo(data)
