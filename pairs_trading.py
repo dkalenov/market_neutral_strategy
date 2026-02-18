@@ -738,36 +738,81 @@ class PairsManager:
                             pairs_to_fix.append((pair_info, 'open_db', open_on_exchange.get(s1), open_on_exchange.get(s2)))
             
             # Apply fixes
+            externally_closed_pairs = []
             for fix in pairs_to_fix:
                 pair_info = fix[0]
                 action = fix[1]
                 
                 if action == 'close_db':
+                    s1 = pair_info.symbol1
+                    s2 = pair_info.symbol2
+                    pnl1 = 0.0
+                    pnl2 = 0.0
+                    total_pnl = 0.0
+                    fee1 = 0.0
+                    fee2 = 0.0
+                    pnl_loaded = False
+                    try:
+                        start_ms = self._trade_window_start_ms(pair_info, default_lookback_sec=3600, buffer_sec=180)
+                        trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=100)
+                        trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=100)
+                        pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                        pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                        fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                        fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                        total_pnl = pnl1 + pnl2
+                        pnl_loaded = (len(trades1) + len(trades2)) > 0
+                    except Exception as pnl_err:
+                        print(f"  ⚠️ Could not fetch external-close PnL for {s1}-{s2}: {pnl_err}")
+
                     # Mark as closed in DB
                     pair_info.position_status = 0
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
                     pair_info.entry_price1 = 0
                     pair_info.entry_price2 = 0
+                    pair_info.is_trading = False
+                    pair_info._wait_for_candle = True
                     
                     if pair_info.db_id:
-                        await db.update_pair({
+                        pair_update = {
                             'id': pair_info.db_id,
                             'position_status': 0,
                             'qty1': 0,
                             'qty2': 0,
                             'entry_price1': 0,
-                            'entry_price2': 0
-                        })
+                            'entry_price2': 0,
+                            'close_time': int(time.time()),
+                            'close_reason': 'external'
+                        }
+                        if pnl_loaded:
+                            pair_update.update({
+                                'close_pnl': total_pnl,
+                                'pnl1': pnl1,
+                                'pnl2': pnl2,
+                                'fee1': fee1,
+                                'fee2': fee2
+                            })
+                        await db.update_pair(pair_update)
                     
                     # Close any open trade records
                     if pair_info.current_trade_id:
-                        await db.update_trade_fields(
-                            pair_info.current_trade_id,
-                            status='CLOSED_MANUAL',
-                            close_time=int(time.time() * 1000)
-                        )
+                        trade_update = {
+                            'status': 'CLOSED_EXTERNAL',
+                            'close_time': int(time.time() * 1000),
+                            'close_reason': 'external'
+                        }
+                        if pnl_loaded:
+                            trade_update['pnl'] = total_pnl
+                            trade_update['fee1'] = fee1
+                            trade_update['fee2'] = fee2
+                        await db.update_trade_fields(pair_info.current_trade_id, **trade_update)
                         pair_info.current_trade_id = None
+
+                    externally_closed_pairs.append({
+                        'pair': f"{s1}-{s2}",
+                        'pnl': total_pnl if pnl_loaded else None
+                    })
                     
                     print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as CLOSED in DB")
                 
@@ -833,6 +878,31 @@ class PairsManager:
                         pair_info.current_trade_id = None
                     
                     print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan closed with PnL={total_pnl:.2f}")
+
+            if externally_closed_pairs:
+                known = [x for x in externally_closed_pairs if x['pnl'] is not None]
+                unknown_count = len(externally_closed_pairs) - len(known)
+                total_external_pnl = sum(x['pnl'] for x in known)
+                total_emoji = "🟢" if total_external_pnl >= 0 else "🔴"
+
+                lines = [f"⚡ <b>External Close Detected</b>",
+                         f"Pairs closed on exchange: <b>{len(externally_closed_pairs)}</b>"]
+                if known:
+                    lines.append(f"💰 Total Realized PnL: {total_emoji} <b>{total_external_pnl:+.2f} USDT</b>")
+                if unknown_count:
+                    lines.append(f"ℹ️ PnL unavailable for {unknown_count} pair(s).")
+
+                preview = externally_closed_pairs[:12]
+                for item in preview:
+                    if item['pnl'] is None:
+                        lines.append(f"• {item['pair']}: n/a")
+                    else:
+                        e = "🟢" if item['pnl'] >= 0 else "🔴"
+                        lines.append(f"• {item['pair']}: {e} {item['pnl']:+.2f} USDT")
+                if len(externally_closed_pairs) > len(preview):
+                    lines.append(f"... and {len(externally_closed_pairs) - len(preview)} more")
+
+                await self._notify("\n".join(lines))
             
             active_count = self.count_active_positions()
             print(f"🔄 Reconciliation complete. Active pairs in DB: {active_count}")
@@ -901,6 +971,7 @@ class PairsManager:
                         print(f"🧹 Syncing stale pair: {pair_info.symbol1}-{pair_info.symbol2}")
                         pair_info.position_status = 0
                         pair_info.is_trading = False
+                        pair_info._wait_for_candle = True
             
             # Get all algo orders (using fixed endpoint /fapi/v1/openAlgoOrders)
             algo_orders = await self.client.get_algo_orders()
@@ -1138,6 +1209,7 @@ class PairsManager:
             self._exchange_pnl_cache = pnl_update  # Immediate PnL source of truth
             self._exchange_position_count = len(pos_by_symbol)
             
+            externally_closed_now = []
             for pair_info in list(self.active_pairs.values()):
                 if pair_info.position_status == 0 or pair_info.is_trading:
                     continue
@@ -1145,6 +1217,79 @@ class PairsManager:
                     
                 leg1_open = pair_info.symbol1 in pos_by_symbol
                 leg2_open = pair_info.symbol2 in pos_by_symbol
+
+                if not leg1_open and not leg2_open:
+                    s1, s2 = pair_info.symbol1, pair_info.symbol2
+                    pnl1 = 0.0
+                    pnl2 = 0.0
+                    total_pnl = 0.0
+                    fee1 = 0.0
+                    fee2 = 0.0
+                    pnl_loaded = False
+                    try:
+                        start_ms = self._trade_window_start_ms(pair_info, default_lookback_sec=3600, buffer_sec=180)
+                        trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=100)
+                        trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=100)
+                        pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
+                        pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                        fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                        fee2 = sum(float(t.get('commission', 0)) for t in trades2)
+                        total_pnl = pnl1 + pnl2
+                        pnl_loaded = (len(trades1) + len(trades2)) > 0
+                    except Exception as pnl_err:
+                        print(f"⚠️ Could not fetch external-close PnL for {s1}-{s2}: {pnl_err}")
+
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+                    pair_info.is_trading = False
+                    pair_info._wait_for_candle = True
+                    pair_info.close_handled = True
+
+                    if pair_info.db_id:
+                        pair_update = {
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0,
+                            'close_time': int(time.time()),
+                            'close_reason': 'external'
+                        }
+                        if pnl_loaded:
+                            pair_update.update({
+                                'close_pnl': total_pnl,
+                                'pnl1': pnl1,
+                                'pnl2': pnl2,
+                                'fee1': fee1,
+                                'fee2': fee2,
+                            })
+                        await db.update_pair(pair_update)
+
+                    if pair_info.current_trade_id:
+                        trade_update = {
+                            'status': 'CLOSED_EXTERNAL',
+                            'close_time': int(time.time() * 1000),
+                            'close_reason': 'external',
+                        }
+                        if pnl_loaded:
+                            trade_update.update({
+                                'pnl': total_pnl,
+                                'fee1': fee1,
+                                'fee2': fee2,
+                            })
+                        await db.update_trade_fields(pair_info.current_trade_id, **trade_update)
+                        pair_info.current_trade_id = None
+
+                    externally_closed_now.append({
+                        'pair': f"{s1}-{s2}",
+                        'pnl': total_pnl if pnl_loaded else None
+                    })
+                    print(f"⚡ External close detected: {s1}-{s2}")
+                    continue
                 
                 if leg1_open != leg2_open:
                     # One leg closed unexpectedly - need to close the other and report PnL
@@ -1377,6 +1522,32 @@ class PairsManager:
                         import traceback
                         traceback.print_exc()
                         pair_info.is_trading = False
+            if externally_closed_now:
+                known = [x for x in externally_closed_now if x['pnl'] is not None]
+                unknown_count = len(externally_closed_now) - len(known)
+                total_external_pnl = sum(x['pnl'] for x in known)
+                total_emoji = "🟢" if total_external_pnl >= 0 else "🔴"
+
+                lines = [
+                    "⚡ <b>Positions Closed Externally</b>",
+                    f"Pairs: <b>{len(externally_closed_now)}</b>"
+                ]
+                if known:
+                    lines.append(f"💰 Total Realized PnL: {total_emoji} <b>{total_external_pnl:+.2f} USDT</b>")
+                if unknown_count:
+                    lines.append(f"ℹ️ PnL unavailable for {unknown_count} pair(s).")
+
+                for item in externally_closed_now[:12]:
+                    if item['pnl'] is None:
+                        lines.append(f"• {item['pair']}: n/a")
+                    else:
+                        e = "🟢" if item['pnl'] >= 0 else "🔴"
+                        lines.append(f"• {item['pair']}: {e} {item['pnl']:+.2f} USDT")
+                if len(externally_closed_now) > 12:
+                    lines.append(f"... and {len(externally_closed_now) - 12} more")
+
+                await self._notify("\n".join(lines))
+
         except Exception as e:
             print(f"⚠️ Leg sync error: {e}")
 

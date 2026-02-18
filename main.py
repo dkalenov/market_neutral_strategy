@@ -25,6 +25,9 @@ tg_channel_global = ''
 tg_admins_global = ''
 # Anti-spam cache for noisy untracked-close websocket events
 untracked_close_alerts: dict[str, float] = {}
+# Short-lived suppression for symbols that were just handled by pair close logic.
+# Prevents false "UNTRACKED POSITION CLOSED" on the next ACCOUNT_UPDATE tick.
+recently_handled_close_symbols: dict[str, float] = {}
 
 async def send_tg_notification(message, reply_to_message_id=None, reply_markup=None):
     """Send notification to TG channel or admins. Returns message_id for reply threading."""
@@ -560,8 +563,15 @@ async def ws_user_msg(ws, msg):
     
     # Check for ACCOUNT_UPDATE (position changes - including manual closes)
     if event_type == 'ACCOUNT_UPDATE':
+        global recently_handled_close_symbols
         positions = msg.get('a', {}).get('P', [])
         print(f"📡 ACCOUNT_UPDATE: {len(positions)} positions in update")
+
+        # Cleanup stale suppression entries.
+        now_ts_global = time_mod.time()
+        recently_handled_close_symbols = {
+            s: ts for s, ts in recently_handled_close_symbols.items() if now_ts_global - ts < 180
+        }
 
         # Snapshot of known-open symbols BEFORE applying this update.
         # Used to avoid false "UNTRACKED POSITION CLOSED" alerts for symbols that
@@ -636,6 +646,9 @@ async def ws_user_msg(ws, msg):
                                      'btc_shock', 'desync', 'orphan_restart', 'stale_symbols')
                 if getattr(pair_info, 'close_handled', False) and stored_reason in bot_close_reasons:
                     print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping external notification")
+                    now_mark = time_mod.time()
+                    recently_handled_close_symbols[s1] = now_mark
+                    recently_handled_close_symbols[s2] = now_mark
                     pair_info.close_handled = False  # Reset for next trade
                     pair_info.is_trading = False
                     continue
@@ -753,6 +766,9 @@ async def ws_user_msg(ws, msg):
                     
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await send_tg_notification(done_msg, reply_to)
+                    now_mark = time_mod.time()
+                    recently_handled_close_symbols[s1] = now_mark
+                    recently_handled_close_symbols[s2] = now_mark
                     
                     # Update memory state
                     pair_info.position_status = 0
@@ -787,6 +803,9 @@ async def ws_user_msg(ws, msg):
                         'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
                         'btc_shock', 'desync', 'orphan_restart', 'stale_symbols'):
                     print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping single-leg handler")
+                    now_mark = time_mod.time()
+                    recently_handled_close_symbols[s1] = now_mark
+                    recently_handled_close_symbols[s2] = now_mark
                     pair_info.is_trading = False
                     continue
                 
@@ -794,33 +813,52 @@ async def ws_user_msg(ws, msg):
                 print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol} IMMEDIATELY...")
                 pair_info.last_close_reason = 'manual_partial'
                 try:
-                    # PRIORITY: Close the other leg FIRST using stored qty (no API query needed)
-                    # Determine qty and direction from pair_info
-                    is_other_s1 = (other_symbol == pair_info.symbol1)
-                    other_qty = pair_info.qty1 if is_other_s1 else pair_info.qty2
-                    
-                    if other_qty and other_qty > 0:
-                        # Determine side: if pair_info.position_status=1, s1 is LONG, s2 is SHORT
-                        # if position_status=-1, s1 is SHORT, s2 is LONG
-                        if is_other_s1:
-                            is_long = pair_info.position_status == 1
-                        else:
-                            is_long = pair_info.position_status == -1
-                        close_side = 'SELL' if is_long else 'BUY'
-                        
-                        await client.new_order(symbol=other_symbol, side=close_side, type='MARKET',
-                                              quantity=other_qty, reduceOnly='true')
-                        print(f"✅ Closed remaining leg {other_symbol} (qty={other_qty}, side={close_side})")
+                    close_exec_note = ""
+
+                    # Query exchange first: stored qty can be stale during rapid external closes.
+                    positions_data = await client.get_position_risk(symbol=other_symbol)
+                    other_pos = positions_data[0] if positions_data else {}
+                    other_amt = float(other_pos.get('positionAmt', 0))
+
+                    if other_amt != 0:
+                        close_side = 'SELL' if other_amt > 0 else 'BUY'
+                        try:
+                            await client.new_order(
+                                symbol=other_symbol,
+                                side=close_side,
+                                type='MARKET',
+                                quantity=abs(other_amt),
+                                reduceOnly='true'
+                            )
+                            print(f"✅ Closed remaining leg {other_symbol} (qty={abs(other_amt)}, side={close_side}, reduceOnly=true)")
+                        except Exception as close_err:
+                            err_txt = str(close_err)
+                            if "-2022" in err_txt or "ReduceOnly Order is rejected" in err_txt:
+                                # Typical race: leg may already be zero. Re-check before fallback.
+                                verify_data = await client.get_position_risk(symbol=other_symbol)
+                                verify_pos = verify_data[0] if verify_data else {}
+                                verify_amt = float(verify_pos.get('positionAmt', 0))
+                                if verify_amt == 0:
+                                    pair_info.last_close_reason = 'external'
+                                    close_exec_note = "ℹ️ Remaining leg was already closed on exchange."
+                                    print(f"ℹ️ {other_symbol} already closed after reduceOnly reject (-2022).")
+                                else:
+                                    verify_side = 'SELL' if verify_amt > 0 else 'BUY'
+                                    await client.new_order(
+                                        symbol=other_symbol,
+                                        side=verify_side,
+                                        type='MARKET',
+                                        quantity=abs(verify_amt)
+                                    )
+                                    close_exec_note = "ℹ️ reduceOnly rejected, closed with fallback MARKET order."
+                                    print(f"⚠️ reduceOnly rejected for {other_symbol}; fallback MARKET close succeeded.")
+                            else:
+                                close_exec_note = f"⚠️ Could not close remaining leg: {close_err}"
+                                print(f"⚠️ Failed to close remaining leg {other_symbol}: {close_err}")
                     else:
-                        # Fallback: query exchange if stored qty is missing
-                        positions_data = await client.get_position_risk(symbol=other_symbol)
-                        other_pos = positions_data[0] if positions_data else {}
-                        other_amt = float(other_pos.get('positionAmt', 0))
-                        if other_amt != 0:
-                            close_side = 'SELL' if other_amt > 0 else 'BUY'
-                            await client.new_order(symbol=other_symbol, side=close_side, type='MARKET',
-                                                  quantity=abs(other_amt), reduceOnly='true')
-                            print(f"✅ Closed remaining leg {other_symbol} (fallback, qty={abs(other_amt)})")
+                        pair_info.last_close_reason = 'external'
+                        close_exec_note = "ℹ️ Remaining leg was already closed on exchange."
+                        print(f"ℹ️ Remaining leg {other_symbol} already at zero position.")
                     
                     # THEN cancel remaining algo/SL/TP orders (non-critical, can be slower)
                     try:
@@ -831,6 +869,21 @@ async def ws_user_msg(ws, msg):
                     
                     await asyncio.sleep(1)
                     
+                    # Verify remaining leg really closed before finalizing pair state.
+                    verify_data = await client.get_position_risk(symbol=other_symbol)
+                    verify_pos = verify_data[0] if verify_data else {}
+                    remaining_amt = float(verify_pos.get('positionAmt', 0))
+                    if remaining_amt != 0:
+                        warn_msg = (f"🚨 <b>External close handling incomplete</b>\n\n"
+                                    f"Pair: {s1}/{s2}\n"
+                                    f"Closed leg: {symbol}\n"
+                                    f"Remaining leg still OPEN: {other_symbol}\n"
+                                    f"Qty: <b>{abs(remaining_amt):.8f}</b>\n\n"
+                                    f"Please close {other_symbol} manually.")
+                        await send_tg_notification(warn_msg, pair_info.tg_message_id if pair_info.tg_message_id else None)
+                        pair_info.is_trading = False
+                        continue
+
                     now_ms = int(time_mod.time() * 1000)
                     open_time = int(getattr(pair_info, 'open_time', 0) or 0)
                     start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
@@ -877,6 +930,8 @@ async def ws_user_msg(ws, msg):
                     
                     close_type = '❓ Unknown'
                     close_hint = ''
+                    if close_exec_note:
+                        close_hint = f"\n{close_exec_note}"
                     
                     if stored_reason and stored_reason in CLOSE_REASONS:
                         close_type = CLOSE_REASONS[stored_reason]
@@ -915,12 +970,12 @@ async def ws_user_msg(ws, msg):
                                 print(f"📋 Detected from orders: {o_type} -> {close_type}")
                             else:
                                 close_type = '⚡ External Close'
-                                close_hint = ' (no matching orders)'
+                                close_hint += ' (no matching orders)'
                                 print(f"⚠️ No recent orders found for {s1}/{s2}")
                         except Exception as e:
                             print(f"⚠️ Could not query orders: {e}")
                             close_type = '⚡ External Close'
-                            close_hint = ' (query failed)'
+                            close_hint += ' (query failed)'
                     
                     pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
                     try:
@@ -960,6 +1015,9 @@ async def ws_user_msg(ws, msg):
                                 f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await send_tg_notification(done_msg, reply_to)
+                    now_mark = time_mod.time()
+                    recently_handled_close_symbols[s1] = now_mark
+                    recently_handled_close_symbols[s2] = now_mark
                     
                 except Exception as e:
                     print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
@@ -980,6 +1038,16 @@ async def ws_user_msg(ws, msg):
             if position_amt == 0:
                 was_handled = symbol in handled_symbols
                 if not was_handled:
+                    # If symbol belongs to any known pair (even already closed in this cycle),
+                    # it's not truly "untracked" and should not trigger fallback alert.
+                    if pairs_manager and any(symbol in (pi.symbol1, pi.symbol2) for pi in pairs_manager.active_pairs.values()):
+                        continue
+
+                    # Skip if symbol was just handled by pair-close logic in the last 3 minutes.
+                    last_handled = recently_handled_close_symbols.get(symbol, 0)
+                    if time_mod.time() - last_handled < 180:
+                        continue
+
                     # Only alert if this symbol was known as open before the update.
                     # Prevents false alerts from noisy ACCOUNT_UPDATE payloads.
                     if symbol not in known_open_before:
