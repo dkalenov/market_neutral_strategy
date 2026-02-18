@@ -1,5 +1,9 @@
 import time
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON, text
+import os
+import csv
+import gzip
+import shutil
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON, text, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -119,7 +123,6 @@ class ConfigInfo:
     # Position Management (Phase 2)
     max_active_pairs: int   # Maximum concurrent open pairs (default 5)
     test_mode: bool         # Force trades without signals on testnet (default False)
-    test_pairs: str         # Comma-separated pairs for test mode (default 'BTCUSDT-ETHUSDT,BTCUSDT-BNBUSDT,BNBUSDT-ETHUSDT')
     priority_pairs_file: str # Path to JSON file with priority pairs (default 'market_neutral/best_pairs.json')
     # Symbol Filtering
     max_symbols: int        # Top N symbols by 24h volume (default 150)
@@ -139,6 +142,20 @@ class ConfigInfo:
     # Idle Pair Management
     max_idle_pairs: int     # Maximum idle pairs without positions (default 150)
     idle_timeout_hours: float  # Remove idle pairs older than X hours (default 48)
+    # Pair history retention monitoring (alerts only by default)
+    pair_history_retention_days: int        # Retention horizon in days (default 365)
+    pair_history_warn_days: int             # Warn when records are within this many days to retention (default 14)
+    pair_history_cleanup_enabled: bool      # Future switch for cleanup job (default False)
+    pair_history_check_interval_hours: int  # How often to check and alert (default 6)
+    # Pair history backup (2-file rotation: current + prev)
+    pair_history_backup_enabled: bool       # Enable periodic backup snapshots (default False)
+    pair_history_backup_interval_hours: int # Backup check interval (default 24)
+    pair_history_backup_dir: str            # Backup dir path (default 'market_neutral/backups')
+    # Full DB backup (manual/triggered)
+    db_backup_dir: str                      # Full DB backup dir path (default 'market_neutral/backups/db')
+    db_backup_max_copies: int               # Rotating backup copies (default 2)
+    # Realtime markPrice load control
+    markprice_max_symbols: int              # Max symbols in markPrice realtime subscription (default 120)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -269,7 +286,6 @@ async def load_config():
             # Position Management (Phase 2)
             'max_active_pairs': '5',
             'test_mode': 'false',
-            'test_pairs': '',  # Empty by default - bot handles regular pairs fine
             'priority_pairs_file': 'best_pairs.json',
             # Symbol Filtering
             'max_symbols': '150',
@@ -288,6 +304,17 @@ async def load_config():
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
+            # Pair history retention monitoring (alerts only; no auto-delete in this build)
+            'pair_history_retention_days': '365',
+            'pair_history_warn_days': '14',
+            'pair_history_cleanup_enabled': 'false',
+            'pair_history_check_interval_hours': '6',
+            'pair_history_backup_enabled': 'false',
+            'pair_history_backup_interval_hours': '24',
+            'pair_history_backup_dir': 'market_neutral/backups',
+            'db_backup_dir': 'market_neutral/backups/db',
+            'db_backup_max_copies': '2',
+            'markprice_max_symbols': '120',
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty
@@ -312,6 +339,9 @@ async def load_config():
                 pass
         # Load all configuration from DB
         async with Session() as session:
+            # Remove deprecated key that is no longer used by strategy logic.
+            await session.execute(delete(Config).where(Config.key == 'test_pairs'))
+            await session.commit()
             result = (await session.execute(select(Config))).scalars().all()
             data = {row.key: row.value for row in result}
             return ConfigInfo(data)
@@ -456,3 +486,152 @@ async def close_trade_record(
     if close_price_2 is not None:
         data['close_price_2'] = close_price_2
     await update_trade_fields(trade_id, **data)
+
+
+async def count_pair_history_older_than_days(days: int) -> int:
+    """Count pair_history rows older than N days."""
+    days = max(1, int(days))
+    cutoff_ms = int((time.time() - days * 86400) * 1000)
+    async with Session() as s:
+        result = await s.execute(
+            select(func.count()).select_from(PairHistory).where(PairHistory.timestamp < cutoff_ms)
+        )
+        return int(result.scalar() or 0)
+
+
+async def count_pair_history_age_between_days(min_days: int, max_days: int) -> int:
+    """
+    Count pair_history rows with age in [min_days, max_days).
+    Useful for "warning window" alerts before retention boundary.
+    """
+    min_days = max(0, int(min_days))
+    max_days = max(min_days + 1, int(max_days))
+    now = time.time()
+    newer_than_ms = int((now - min_days * 86400) * 1000)
+    older_than_ms = int((now - max_days * 86400) * 1000)
+    async with Session() as s:
+        result = await s.execute(
+            select(func.count())
+            .select_from(PairHistory)
+            .where(PairHistory.timestamp < newer_than_ms)
+            .where(PairHistory.timestamp >= older_than_ms)
+        )
+        return int(result.scalar() or 0)
+
+
+async def fetch_pair_history_batch_before_ts(cutoff_ms: int, last_id: int = 0, limit: int = 5000):
+    """
+    Fetch pair_history rows in ascending id batches where timestamp < cutoff_ms.
+    Returns list[PairHistory].
+    """
+    cutoff_ms = int(cutoff_ms)
+    last_id = int(last_id or 0)
+    limit = max(1, int(limit))
+    async with Session() as s:
+        result = await s.execute(
+            select(PairHistory)
+            .where(PairHistory.timestamp < cutoff_ms)
+            .where(PairHistory.id > last_id)
+            .order_by(PairHistory.id.asc())
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+
+def _resolve_backup_dir(path_value: str) -> str:
+    path_value = (path_value or '').strip() or 'market_neutral/backups/db'
+    if os.path.isabs(path_value):
+        return path_value
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(script_dir)
+    return os.path.join(root_dir, path_value)
+
+
+async def _dump_table_csv_gz(table_name: str, model, target_dir: str, batch_size: int = 5000) -> int:
+    columns = [c.name for c in model.__table__.columns]
+    out_path = os.path.join(target_dir, f"{table_name}.csv.gz")
+    written = 0
+
+    with gzip.open(out_path, mode='wt', encoding='utf-8', newline='') as gz:
+        writer = csv.writer(gz)
+        writer.writerow(columns)
+
+        has_int_id = hasattr(model, 'id')
+        if has_int_id:
+            last_id = 0
+            while True:
+                async with Session() as s:
+                    result = await s.execute(
+                        select(model)
+                        .where(getattr(model, 'id') > last_id)
+                        .order_by(getattr(model, 'id').asc())
+                        .limit(batch_size)
+                    )
+                    rows = result.scalars().all()
+                if not rows:
+                    break
+                for row in rows:
+                    writer.writerow([getattr(row, col) for col in columns])
+                    written += 1
+                    last_id = getattr(row, 'id')
+                if len(rows) < batch_size:
+                    break
+        else:
+            async with Session() as s:
+                result = await s.execute(select(model))
+                rows = result.scalars().all()
+            for row in rows:
+                writer.writerow([getattr(row, col) for col in columns])
+                written += 1
+
+    return written
+
+
+async def backup_all_tables_rotating(backup_dir: str, max_copies: int = 2) -> dict:
+    """
+    Full DB backup for bot tables with simple rotation.
+    Creates:
+      - db_backup_current/<table>.csv.gz
+      - db_backup_prev/<table>.csv.gz   (if max_copies >= 2)
+    """
+    backup_root = _resolve_backup_dir(backup_dir)
+    os.makedirs(backup_root, exist_ok=True)
+
+    new_dir = os.path.join(backup_root, 'db_backup_new')
+    current_dir = os.path.join(backup_root, 'db_backup_current')
+    prev_dir = os.path.join(backup_root, 'db_backup_prev')
+
+    if os.path.exists(new_dir):
+        shutil.rmtree(new_dir, ignore_errors=True)
+    os.makedirs(new_dir, exist_ok=True)
+
+    table_map = {
+        'config': Config,
+        'pair_history': PairHistory,
+        'pairs': Pairs,
+        'trades': Trades,
+    }
+
+    counts = {}
+    for table_name, model in table_map.items():
+        counts[table_name] = await _dump_table_csv_gz(table_name, model, new_dir, batch_size=5000)
+
+    if max_copies >= 2:
+        if os.path.exists(prev_dir):
+            shutil.rmtree(prev_dir, ignore_errors=True)
+        if os.path.exists(current_dir):
+            shutil.move(current_dir, prev_dir)
+    else:
+        if os.path.exists(current_dir):
+            shutil.rmtree(current_dir, ignore_errors=True)
+
+    shutil.move(new_dir, current_dir)
+
+    total_rows = sum(counts.values())
+    return {
+        'backup_root': backup_root,
+        'current_dir': current_dir,
+        'prev_dir': prev_dir if max_copies >= 2 and os.path.exists(prev_dir) else '',
+        'counts': counts,
+        'total_rows': total_rows,
+    }

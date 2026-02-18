@@ -18,6 +18,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 bot: Bot = None  # Will be initialized in run()
 dp = Dispatcher()
 close_ops_lock = asyncio.Lock()
+backup_ops_lock = asyncio.Lock()
 
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -375,6 +376,9 @@ async def settings(message: Message, state: FSMContext):
         [InlineKeyboardButton(text=f"🔄 Trading: {'ON ✅' if trade_mode else 'OFF ❌'}", callback_data="toggle_trade_mode")],
         [InlineKeyboardButton(text="Strategy Settings", callback_data="strategy_settings")],
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
+        [InlineKeyboardButton(text="💾 Backup DB Now", callback_data="backup_db_now")],
+        [InlineKeyboardButton(text="📁 Show Backup Path", callback_data="show_backup_path")],
+        [InlineKeyboardButton(text="✏️ Set Backup Path", callback_data="set_backup_path")],
         [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
         [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
@@ -889,6 +893,14 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(idle_timeout_hours=val)
             await answer(message, f"⏰ Idle Timeout: <b>{val}h</b>")
+
+        elif waiting_for == "db_backup_dir":
+            path_val = value.strip()
+            if len(path_val) < 3:
+                await answer(message, "Path is too short.")
+                return
+            await db.config_update(db_backup_dir=path_val)
+            await answer(message, f"💾 Backup path set to:\n<code>{path_val}</code>")
             
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 
@@ -985,6 +997,79 @@ async def restart_yes(callback: CallbackQuery | Message, state: FSMContext):
         await answer(callback, 'Restarting...')
     finally:
         os._exit(0)
+
+
+@dp.callback_query(F.data == "backup_db_now")
+async def backup_db_now(callback: CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback, "Starting DB backup...")
+    await callback.message.answer("💾 Starting full DB backup in background...")
+    chat_id = callback.message.chat.id
+
+    async def _backup_task():
+        async with backup_ops_lock:
+            try:
+                conf = await db.load_config()
+                backup_dir = getattr(conf, 'db_backup_dir', 'market_neutral/backups/db') or 'market_neutral/backups/db'
+                max_copies = int(getattr(conf, 'db_backup_max_copies', 2) or 2)
+                max_copies = max(1, min(max_copies, 2))
+
+                result = await db.backup_all_tables_rotating(
+                    backup_dir=backup_dir,
+                    max_copies=max_copies,
+                )
+                counts = result.get('counts', {})
+                msg = (
+                    "✅ <b>DB Backup Completed</b>\n\n"
+                    f"Total rows: <b>{result.get('total_rows', 0)}</b>\n"
+                    f"config: <b>{counts.get('config', 0)}</b>\n"
+                    f"pair_history: <b>{counts.get('pair_history', 0)}</b>\n"
+                    f"pairs: <b>{counts.get('pairs', 0)}</b>\n"
+                    f"trades: <b>{counts.get('trades', 0)}</b>\n\n"
+                    f"Current: <code>{result.get('current_dir', '')}</code>\n"
+                    f"Prev: <code>{result.get('prev_dir', '') or 'not available yet'}</code>"
+                )
+                await bot.send_message(chat_id, msg)
+            except Exception as e:
+                await bot.send_message(chat_id, f"❌ DB backup failed: {e}")
+
+    asyncio.create_task(_backup_task())
+
+
+@dp.callback_query(F.data == "show_backup_path")
+async def show_backup_path(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    raw_path = getattr(conf, 'db_backup_dir', 'market_neutral/backups/db') or 'market_neutral/backups/db'
+    if os.path.isabs(raw_path):
+        abs_path = raw_path
+    else:
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.dirname(root_dir)
+        abs_path = os.path.abspath(os.path.join(root_dir, raw_path))
+
+    max_copies = int(getattr(conf, 'db_backup_max_copies', 2) or 2)
+    msg = (
+        "📁 <b>Backup Path</b>\n\n"
+        f"Configured: <code>{raw_path}</code>\n"
+        f"Resolved: <code>{abs_path}</code>\n"
+        f"Copies: <b>{max_copies}</b> (rotation current/prev)\n\n"
+        "Tip: for Google Drive mount, set mounted folder path here."
+    )
+    await safe_callback_answer(callback)
+    await callback.message.answer(msg)
+
+
+@dp.callback_query(F.data == "set_backup_path")
+async def set_backup_path(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="db_backup_dir")
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "✏️ Enter new backup path.\n"
+        "Examples:\n"
+        "<code>market_neutral/backups/db</code>\n"
+        "<code>D:\\Backups\\market_neutral</code>\n"
+        "<code>/mnt/gdrive/market_neutral</code>"
+    )
 
 
 # --- Blacklist Management ---
