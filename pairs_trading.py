@@ -129,8 +129,15 @@ class PairsManager:
         # CRITICAL: Lock to prevent race condition when opening trades
         self._trade_lock = asyncio.Lock()
         
-        # CPU Pool for heavy computations
-        self.executor = ProcessPoolExecutor(max_workers=None)
+        # CPU Pool for heavy computations (bounded workers to avoid weak-laptop thrashing)
+        cpu_count = os.cpu_count() or 2
+        default_workers = max(1, min(4, cpu_count - 1))
+        configured_workers = getattr(self.config, 'discovery_workers', None) if self.config else None
+        try:
+            worker_count = int(configured_workers) if configured_workers else default_workers
+        except Exception:
+            worker_count = default_workers
+        self.executor = ProcessPoolExecutor(max_workers=max(1, worker_count))
         
         # Real-time Z-score monitoring
         self.last_prices: dict[str, float] = {}  # {symbol: last_price} from WebSocket ticker
@@ -162,6 +169,12 @@ class PairsManager:
         # Cached unrealized PnL from exchange (updated every 15s from get_position_risk)
         # Source of truth for all PnL decisions — NO manual calculations
         self._exchange_pnl_cache: dict[str, float] = {}  # {symbol: unrealizedProfit}
+        
+        # Symbol-level cooldown after margin/capital/order-limit failures
+        self._symbol_block_until: dict[str, float] = {}
+        
+        # Background warmup/discovery task (quick startup mode)
+        self._warmup_task = None
 
     async def initialize(self):
         """
@@ -1118,21 +1131,6 @@ class PairsManager:
                 if pair_info.position_status == 0 or pair_info.is_trading:
                     continue
                 
-                # VALIDATION: Skip stale pairs where symbols don't exist
-                if pair_info.symbol1 not in self.all_symbols or pair_info.symbol2 not in self.all_symbols:
-                    print(f"⚠️ Skipping stale pair {pair_info.symbol1}-{pair_info.symbol2}: symbols not in trading list. Cleaning up...")
-                    pair_info.position_status = 0
-                    pair_info.qty1 = 0
-                    pair_info.qty2 = 0
-                    if pair_info.db_id:
-                        await db.update_pair({
-                            'id': pair_info.db_id,
-                            'position_status': 0,
-                            'qty1': 0,
-                            'qty2': 0,
-                            'close_reason': 'stale_symbols'
-                        })
-                    continue
                     
                 leg1_open = pair_info.symbol1 in pos_by_symbol
                 leg2_open = pair_info.symbol2 in pos_by_symbol
@@ -1423,7 +1421,7 @@ class PairsManager:
             except Exception as e:
                 print(f"  ⚠️ Error adding test pair {s1}-{s2}: {e}")
 
-    async def initialize_all_symbols_data(self, target_symbols=None, concurrency=20):
+    async def initialize_all_symbols_data(self, target_symbols=None, concurrency=20, run_discovery=True):
         """
         Loads historical data for specified symbols with controlled concurrency.
         Prioritizes active pairs and priority pairs.
@@ -1497,9 +1495,10 @@ class PairsManager:
         btc_len = len(self.all_data.get('BTCUSDT', Data()).close) if 'BTCUSDT' in self.all_data else 0
         print(f"📊 BTCUSDT data: {btc_len} candles loaded")
         
-        # CRITICAL: Run Discovery to find cointegrated pairs BEFORE checking signals
-        print("🔍 Running initial Discovery...")
-        await self._discover_new_pairs()
+        # Optional heavy step: full discovery. Can be deferred for quick startup.
+        if run_discovery:
+            print("🔍 Running initial Discovery...")
+            await self._discover_new_pairs()
         
         
         # Force run analysis for test_mode
@@ -1517,6 +1516,14 @@ class PairsManager:
                     if s1 in self.all_data and s2 in self.all_data:
                         print(f"  Analyzing {s1}-{s2}...")
                         await self._check_signals_for_active_pairs(s1)
+
+    def start_background_warmup(self, target_symbols, concurrency=20):
+        """Start full history warmup + discovery in background (non-blocking startup)."""
+        if self._warmup_task is not None and not self._warmup_task.done():
+            return
+        self._warmup_task = self.loop.create_task(
+            self.initialize_all_symbols_data(target_symbols, concurrency=concurrency, run_discovery=True)
+        )
 
     async def add_kline_main(self, kline_data):
         """
@@ -1971,6 +1978,7 @@ class PairsManager:
                 getattr(self.config, 'hl_max_days', 5.0) or 5.0,
                 getattr(self.config, 'hedge_min', 0.3) or 0.3,
                 getattr(self.config, 'hedge_max', 3.0) or 3.0,
+                getattr(self.config, 'p_value_threshold', 0.05) or 0.05,
             )
             tasks.append(task)
         
@@ -2273,6 +2281,22 @@ class PairsManager:
             print(f"⚠️ Failed to refresh exchange position count: {e}")
             return self._exchange_position_count
 
+    def _is_symbol_temporarily_blocked(self, symbol: str) -> bool:
+        until = self._symbol_block_until.get(symbol, 0)
+        if until <= 0:
+            return False
+        if time.time() >= until:
+            self._symbol_block_until.pop(symbol, None)
+            return False
+        return True
+
+    def _set_symbol_cooldown(self, symbol: str, seconds: int, reason: str):
+        until = time.time() + max(1, int(seconds))
+        prev = self._symbol_block_until.get(symbol, 0)
+        self._symbol_block_until[symbol] = max(prev, until)
+        left = int(self._symbol_block_until[symbol] - time.time())
+        print(f"[COOLDOWN] Symbol {symbol} blocked for {left}s ({reason})")
+
     def can_open_new_position(self, s1: str, s2: str, exclude_pair=None) -> bool:
         """Check if we can open a new position for this pair.
         
@@ -2297,6 +2321,10 @@ class PairsManager:
             print(f"🚫 Exchange position limit: {self._exchange_position_count}/{max_exchange_positions} positions on exchange")
             return False
         
+        # Symbol cooldown after insufficient margin/capital/order-limit failures
+        if self._is_symbol_temporarily_blocked(s1) or self._is_symbol_temporarily_blocked(s2):
+            return False
+
         # Check symbol lock - each symbol can only be in one active pair
         if self.is_symbol_locked(s1, exclude_pair=exclude_pair) or self.is_symbol_locked(s2, exclude_pair=exclude_pair):
             return False
@@ -3154,6 +3182,7 @@ class PairsManager:
             # === PRE-FLIGHT: Validate both positions can be opened ===
             try:
                 preflight_ok = True
+                failed_preflight_symbol = None
                 for sym, qty, price in [(s1, qty1_rounded, s1_price), (s2, qty2_rounded, s2_price)]:
                     notional = qty * price
                     brackets = await self.client.leverage_brackets(symbol=sym)
@@ -3170,6 +3199,7 @@ class PairsManager:
                         if bracket_notional_cap and notional > bracket_notional_cap:
                             print(f"🚫 PRE-FLIGHT FAIL: {sym} notional ${notional:.2f} exceeds max ${bracket_notional_cap:.2f} at {leverage}x leverage")
                             preflight_ok = False
+                            failed_preflight_symbol = sym
                             break
                         
                         # Also check if leverage is even supported
@@ -3177,6 +3207,7 @@ class PairsManager:
                         if leverage > max_lev:
                             print(f"🚫 PRE-FLIGHT FAIL: {sym} max leverage is {max_lev}x, requested {leverage}x")
                             preflight_ok = False
+                            failed_preflight_symbol = sym
                             break
                 
                 if not preflight_ok:
@@ -3186,6 +3217,8 @@ class PairsManager:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
                     pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
+                    if failed_preflight_symbol:
+                        self._set_symbol_cooldown(failed_preflight_symbol, 900, 'preflight_limit')
                     return
                     
             except Exception as e:
@@ -3202,10 +3235,12 @@ class PairsManager:
                 results = await asyncio.gather(task1, task2, return_exceptions=True)
                 has_error = False
                 executed_orders = []
-                for res in results:
+                failed_symbols = []
+                for idx, res in enumerate(results):
                     if isinstance(res, Exception):
                         print(f"ERROR placing order: {res}")
                         has_error = True
+                        failed_symbols.append(s1 if idx == 0 else s2)
                     else:
                         executed_orders.append(res)
             
@@ -3230,7 +3265,32 @@ class PairsManager:
                             print(f"  CRITICAL: Failed to prepare revert {exec_symbol}: {rev_e}")
                 
                     if revert_tasks:
-                        await asyncio.gather(*revert_tasks, return_exceptions=True)
+                        revert_results = await asyncio.gather(*revert_tasks, return_exceptions=True)
+                        for rr in revert_results:
+                            if isinstance(rr, Exception):
+                                print(f"  WARNING: Revert order error: {rr}")
+
+                    # Verify no residual positions remain after rollback; force-close if needed
+                    try:
+                        verify_positions = await self.client.get_position_risk()
+                        for vp in verify_positions:
+                            sym = vp.get('symbol')
+                            if sym not in (s1, s2):
+                                continue
+                            amt = float(vp.get('positionAmt', 0))
+                            if amt == 0:
+                                continue
+                            close_side = 'SELL' if amt > 0 else 'BUY'
+                            await self.client.new_order(
+                                symbol=sym,
+                                side=close_side,
+                                type='MARKET',
+                                quantity=abs(amt),
+                                reduceOnly='true'
+                            )
+                            print(f"  Emergency rollback close executed for {sym} (qty={abs(amt)})")
+                    except Exception as verify_err:
+                        print(f"  WARNING: Rollback verification failed: {verify_err}")
                 
                     pair_info.position_status = 0
                     pair_info.is_trading = False
@@ -3240,6 +3300,19 @@ class PairsManager:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
                     pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
+                    
+                    # Block failed symbols to stop retrying same bad symbol across pair combinations
+                    if failed_symbols:
+                        insufficient_markers = (
+                            'insufficient', 'margin', 'balance', 'not enough', 'min notional',
+                            'notional', 'max position', 'position limit', 'risk limit'
+                        )
+                        for idx, res in enumerate(results):
+                            if not isinstance(res, Exception):
+                                continue
+                            msg = str(res).lower()
+                            if any(marker in msg for marker in insufficient_markers):
+                                self._set_symbol_cooldown(s1 if idx == 0 else s2, 900, 'insufficient_capital')
                 else:
                     # DC-3 FIX: Set position_status ONLY after confirmed order success
                     # (removed tentative set from inside _trade_lock to prevent phantom state)
@@ -3357,11 +3430,6 @@ class PairsManager:
                         tp1 = round(tp1, s1_info.tick_size)
                         tp2 = round(tp2, s2_info.tick_size)
                         
-                        # Calculate limit prices with 1% slippage
-                        sl1_limit = round(sl1 * (0.99 if sl_side1 == 'SELL' else 1.01), s1_info.tick_size)
-                        sl2_limit = round(sl2 * (0.99 if sl_side2 == 'SELL' else 1.01), s2_info.tick_size)
-                        tp1_limit = round(tp1 * (1.01 if sl_side1 == 'SELL' else 0.99), s1_info.tick_size)
-                        tp2_limit = round(tp2 * (1.01 if sl_side2 == 'SELL' else 0.99), s2_info.tick_size)
 
                         print(f"🛡️ Placing SL/TP (Algo): {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
                         
@@ -3383,20 +3451,16 @@ class PairsManager:
                         
                         # Use algo orders
                         protection_tasks = [
-                            # SL Orders (STOP via algo endpoint)
-                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='STOP',
-                                                       triggerPrice=sl1, price=sl1_limit,
-                                                       quantity=pair_info.qty1, timeInForce='GTC', reduceOnly='true'),
-                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='STOP',
-                                                       triggerPrice=sl2, price=sl2_limit,
-                                                       quantity=pair_info.qty2, timeInForce='GTC', reduceOnly='true'),
-                            # TP Orders (TAKE_PROFIT via algo endpoint)
-                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT',
-                                                       triggerPrice=tp1, price=tp1_limit,
-                                                       quantity=pair_info.qty1, timeInForce='GTC', reduceOnly='true'),
-                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT',
-                                                       triggerPrice=tp2, price=tp2_limit,
-                                                       quantity=pair_info.qty2, timeInForce='GTC', reduceOnly='true'),
+                            # SL Orders (MARKET trigger via algo endpoint)
+                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='STOP_MARKET',
+                                                       triggerPrice=sl1, quantity=pair_info.qty1, reduceOnly='true'),
+                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='STOP_MARKET',
+                                                       triggerPrice=sl2, quantity=pair_info.qty2, reduceOnly='true'),
+                            # TP Orders (MARKET trigger via algo endpoint)
+                            self.client.new_algo_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT_MARKET',
+                                                       triggerPrice=tp1, quantity=pair_info.qty1, reduceOnly='true'),
+                            self.client.new_algo_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT_MARKET',
+                                                       triggerPrice=tp2, quantity=pair_info.qty2, reduceOnly='true'),
                         ]
                         
                         results = await asyncio.gather(*protection_tasks, return_exceptions=True)
@@ -3934,3 +3998,4 @@ class PairsManager:
         if self._signal_confirmation_task is None:
             self._signal_confirmation_task = self.loop.create_task(self._signal_confirmation_loop())
             print("🔄 Started real-time signal confirmation loop") 
+

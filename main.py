@@ -208,9 +208,29 @@ async def main():
         valid_tickers.sort(key=lambda x: x[1], reverse=True)
         top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
         
+        # SAFETY: Always keep symbols that currently have open positions (DB or exchange)
+        protected_symbols = set()
+        try:
+            db_pairs = await db.get_all_pairs()
+            for p in db_pairs:
+                if getattr(p, 'position_status', 0) != 0:
+                    protected_symbols.add(p.symbol1)
+                    protected_symbols.add(p.symbol2)
+        except Exception as e:
+            print(f"Could not load protected symbols from DB: {e}")
+        try:
+            exchange_positions = await client.get_position_risk()
+            for pos in exchange_positions:
+                if abs(float(pos.get('positionAmt', 0))) > 0:
+                    protected_symbols.add(pos.get('symbol', ''))
+        except Exception as e:
+            print(f"Could not load protected symbols from exchange: {e}")
+        
+        top_symbols.update(s for s in protected_symbols if s in all_symbols)
+        
         # Filter all_symbols to only include top volume symbols
         filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
-        print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)})")
+        print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
         all_symbols = filtered_symbols
     except Exception as e:
         print(f"⚠️ Volume filter failed ({e}). Using all symbols.")
@@ -269,8 +289,25 @@ async def load_symbols_loop():
                             continue
                 valid_tickers.sort(key=lambda x: x[1], reverse=True)
                 top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+                
+                # SAFETY: Preserve symbols used by active/open positions
+                protected_symbols = set()
+                if pairs_manager:
+                    for pair_info in pairs_manager.active_pairs.values():
+                        if getattr(pair_info, 'position_status', 0) != 0 or getattr(pair_info, 'is_trading', False):
+                            protected_symbols.add(pair_info.symbol1)
+                            protected_symbols.add(pair_info.symbol2)
+                try:
+                    exchange_positions = await client.get_position_risk()
+                    for pos in exchange_positions:
+                        if abs(float(pos.get('positionAmt', 0))) > 0:
+                            protected_symbols.add(pos.get('symbol', ''))
+                except Exception as e:
+                    print(f"Could not refresh protected symbols from exchange: {e}")
+                
+                top_symbols.update(s for s in protected_symbols if s in new_symbols)
                 filtered_symbols = {s: obj for s, obj in new_symbols.items() if s in top_symbols}
-                print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)})")
+                print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
                 new_symbols = filtered_symbols
             except Exception as e:
                 print(f"⚠️ Volume filter failed during refresh ({e}). Using all symbols.")
@@ -372,9 +409,21 @@ async def connect_ws(timeframe='1h'):
             
     print(f"Subscribing to {len(target_symbols)} symbols (Filtered: {len(target_symbols) - active_db_count * 2}, DB active: {active_db_count} pairs)...")
 
-    # Optimization: Pre-load historical data using batch processing
+    # Quick startup: preload only critical symbols (open pairs + BTC), full warmup in background
     if pairs_manager:
-        await pairs_manager.initialize_all_symbols_data(target_symbols)
+        critical_symbols = set()
+        for pair_info in pairs_manager.active_pairs.values():
+            if getattr(pair_info, 'position_status', 0) != 0:
+                critical_symbols.add(pair_info.symbol1)
+                critical_symbols.add(pair_info.symbol2)
+        if 'BTCUSDT' in target_symbols:
+            critical_symbols.add('BTCUSDT')
+        if critical_symbols:
+            await pairs_manager.initialize_all_symbols_data(
+                sorted(critical_symbols),
+                concurrency=10,
+                run_discovery=False
+            )
 
     # MAIN TIMEFRAME: for discovery (cointegration tests)
     main_streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
@@ -457,6 +506,9 @@ async def connect_ws(timeframe='1h'):
             print(f"Connected to markPrice websocket ({len(active_symbols)} initial symbols).")
         else:
             print("ℹ️ No active pairs at startup - markPrice will be subscribed dynamically.")
+        
+        # Heavy warmup+discovery is moved to background to avoid blocking startup
+        pairs_manager.start_background_warmup(target_symbols, concurrency=20)
 
 
 # Disconnect from websockets
@@ -559,21 +611,6 @@ async def ws_user_msg(ws, msg):
                         s1, s2 = pair_info.symbol1, pair_info.symbol2
                         other_symbol = s2 if symbol == s1 else s1
                         
-                        # VALIDATION: Skip stale pairs
-                        if s1 not in pairs_manager.all_symbols or s2 not in pairs_manager.all_symbols:
-                            print(f"⚠️ Skipping stale pair {s1}-{s2}: symbols not in trading list. Cleaning up...")
-                            pair_info.position_status = 0
-                            pair_info.qty1 = 0
-                            pair_info.qty2 = 0
-                            if pair_info.db_id:
-                                await db.update_pair({
-                                    'id': pair_info.db_id,
-                                    'position_status': 0,
-                                    'qty1': 0,
-                                    'qty2': 0,
-                                    'close_reason': 'stale_symbols'
-                                })
-                            continue
                         
                         other_closed_in_batch = any(
                             p.get('s') == other_symbol and float(p.get('pa', 0)) == 0 
@@ -1076,3 +1113,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped by user.")
+

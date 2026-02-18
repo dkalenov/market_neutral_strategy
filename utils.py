@@ -128,7 +128,17 @@ def calculate_pair_beta(pair_r, market_r):
         return np.nan
     return float(cov / var_m)
 
-def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h', hl_min_days=2.0, hl_max_days=5.0, hedge_min=0.3, hedge_max=3.0):
+def batch_process_pairs(
+    pairs_chunk,
+    data_dict,
+    min_data_points,
+    timeframe='1h',
+    hl_min_days=2.0,
+    hl_max_days=5.0,
+    hedge_min=0.3,
+    hedge_max=3.0,
+    p_value_threshold=0.05,
+):
     """
     Worker function for parallel processing.
     pairs_chunk: list of tuples (s1, s2)
@@ -159,7 +169,7 @@ def batch_process_pairs(pairs_chunk, data_dict, min_data_points, timeframe='1h',
             l1 = log1[-min_len:]
             l2 = log2[-min_len:]
             
-            flag, hedge, hl, pval = calculate_cointegration(l1, l2)
+            flag, hedge, hl, pval = calculate_cointegration(l1, l2, p_value_threshold=p_value_threshold)
             
             # Filter by timeframe-specific half-life limits
             if flag == 1 and min_hl <= hl <= max_hl:
