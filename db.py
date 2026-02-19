@@ -389,13 +389,13 @@ async def load_config():
         # Default values
         DEFAULTS = {
             'timeframe': '1h',
-            'window_size': '200',
-            'capital': '1000',
+            'window_size': '',
+            'capital': '100',
             'leverage': '20',
-            'max_notional_pct': '0.1',
-            'z_entry': '1.9',
+            'max_notional_pct': '0.4',
+            'z_entry': '1.8',
             'z_entry_max': '2.5',  # Upper bound for entry window
-            'z_exit': '0.0',
+            'z_exit': '0.05',
             'z_stop': '4.0',
             'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
             # Hardware SL/TP defaults
@@ -429,7 +429,7 @@ async def load_config():
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
-            'markprice_max_symbols': '120',
+            'markprice_max_symbols': '450',
         }
 
         # Ensure all expected config keys exist in DB and have defaults if empty

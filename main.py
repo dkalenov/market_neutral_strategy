@@ -670,14 +670,18 @@ async def connect_ws(timeframe='1h'):
         FULL_BLACKLIST = set([s.strip().upper() for s in conf.blacklist.split(',') if s.strip()])
 
     # 1. All USDT pairs from market
+    total_loaded_symbols = len(all_symbols)
+    pass_filter1_count = 0
     for s_name, s_info in all_symbols.items():
         # Filter 1: Active and PERPETUAL only
         try:
             if getattr(s_info, 'contract_type', None) != 'PERPETUAL': continue
             if getattr(s_info, 'status', None) != 'TRADING': continue
             if getattr(s_info, 'quote_asset', None) != 'USDT': continue
+            pass_filter1_count += 1
         except:
             if not s_name.endswith('USDT'): continue
+            pass_filter1_count += 1
 
         # Filter 2: ASCII only (exclude Chinese chars and weird symbols)
         if not s_name.isascii():
@@ -704,6 +708,7 @@ async def connect_ws(timeframe='1h'):
 
         target_symbols.append(s_name)
     
+    print(f"Filter #1 (PERPETUAL+TRADING+USDT): {pass_filter1_count} / {total_loaded_symbols}")
     target_symbols.sort()
     print(f"Subscribing to {len(target_symbols)} high-quality symbols (Filtered for PERPETUAL USDT-M).")
 
@@ -808,12 +813,18 @@ async def connect_ws(timeframe='1h'):
                         if getattr(pi, 'position_status', 0) != 0:
                             protected_symbols.add(pi.symbol1)
                             protected_symbols.add(pi.symbol2)
-                desired_symbols = set(requested_symbols) | protected_symbols
+                # Keep already tracked idle symbols; otherwise each "new pair" update
+                # would replace the full realtime universe with only that pair.
+                desired_symbols = set(dynamic_mark_symbols) | requested_symbols | protected_symbols
                 if len(desired_symbols) > mark_max_symbols:
                     protected_sorted = sorted(desired_symbols & protected_symbols)
-                    other_sorted = sorted(desired_symbols - set(protected_sorted))
+                    requested_sorted = sorted((desired_symbols & requested_symbols) - set(protected_sorted))
+                    existing_sorted = sorted(desired_symbols - set(protected_sorted) - set(requested_sorted))
                     allowed_others = max(0, mark_max_symbols - len(protected_sorted))
-                    desired_symbols = set(protected_sorted + other_sorted[:allowed_others])
+                    desired_symbols = set(protected_sorted + requested_sorted[:allowed_others])
+                    if len(desired_symbols) < mark_max_symbols:
+                        remaining = mark_max_symbols - len(desired_symbols)
+                        desired_symbols.update(existing_sorted[:remaining])
                 if desired_symbols == dynamic_mark_symbols:
                     return
                 dynamic_mark_symbols = desired_symbols

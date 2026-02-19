@@ -2382,6 +2382,79 @@ class PairsManager:
             print("Not enough symbols with sufficient data to find pairs.")
             return
 
+        # Early pre-filter by minNotional feasibility (before cointegration search).
+        # If a symbol cannot fit into pair budget even with allowed bump, any pair with
+        # this symbol will fail at execution stage. Drop it early to save CPU.
+        try:
+            capital = self.config.capital if self.config and self.config.capital else 1000.0
+            max_notional_pct = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1
+            min_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
+            hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
+            hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
+
+            pair_budget = float(capital) * float(max_notional_pct)
+            print(
+                f"Discovery prefilter params: capital={float(capital):.2f}, "
+                f"max_notional_pct={float(max_notional_pct):.4f}, "
+                f"pair_budget=${pair_budget:.2f}, min_order_bump={float(min_order_bump):.2f}"
+            )
+            # Maximum share one leg can receive under configured hedge bounds.
+            max_leg_share = max(
+                1.0 / (1.0 + abs(float(hedge_min))),
+                abs(float(hedge_max)) / (1.0 + abs(float(hedge_max)))
+            )
+            max_leg_notional = pair_budget * max_leg_share
+
+            filtered_ready = []
+            dropped_symbols = []
+            for s in ready_symbols:
+                sinfo = self.all_symbols.get(s)
+                min_notional = float(getattr(sinfo, 'notional', 0.0) or 0.0)
+                # Same safety margin as in execution path.
+                required_min = min_notional * 1.1
+                if required_min <= 0:
+                    filtered_ready.append(s)
+                    continue
+                # At execution, trade is skipped if bump exceeds min_order_bump:
+                # required_min / calc_notional > min_order_bump  -> skip
+                # So minimally viable calc_notional is required_min / min_order_bump.
+                min_viable_calc = required_min / float(min_order_bump)
+                if max_leg_notional + 1e-9 < min_viable_calc:
+                    dropped_symbols.append((s, required_min, min_viable_calc))
+                else:
+                    filtered_ready.append(s)
+
+            if dropped_symbols:
+                print(
+                    f"⛔ Discovery prefilter: dropped {len(dropped_symbols)} symbols by minNotional "
+                    f"(max leg ${max_leg_notional:.2f}, bump<= {min_order_bump}x)"
+                )
+                for s, required_min, min_viable in dropped_symbols[:20]:
+                    print(
+                        f"  - {s}: min_required=${required_min:.2f}, "
+                        f"min_viable_calc=${min_viable:.2f} > max_leg=${max_leg_notional:.2f}"
+                    )
+                if len(dropped_symbols) > 20:
+                    print(f"  ... and {len(dropped_symbols) - 20} more symbols")
+
+            # Fail-safe: if filter is too aggressive, keep original universe.
+            # Better to spend extra CPU than silently run with zero candidates.
+            min_symbols_after_filter = max(10, int(len(ready_symbols) * 0.10))
+            if len(filtered_ready) < 2 or len(filtered_ready) < min_symbols_after_filter:
+                print(
+                    f"⚠️ Discovery prefilter fallback: kept original universe "
+                    f"({len(filtered_ready)} after filter is too low from {len(ready_symbols)})."
+                )
+            else:
+                ready_symbols = filtered_ready
+                data_snapshot = {s: data_snapshot[s] for s in ready_symbols if s in data_snapshot}
+        except Exception as prefilter_err:
+            print(f"⚠️ Discovery minNotional prefilter skipped: {prefilter_err}")
+
+        if len(ready_symbols) < 2:
+            print("Not enough symbols after minNotional prefilter to find pairs.")
+            return
+
         print(f"Analyzing {len(ready_symbols)} symbols using {self.min_data_points} candles.")
         ready_set = set(ready_symbols)
         checked_pairs = set()
@@ -3925,12 +3998,24 @@ class PairsManager:
             # Check if we should skip trade due to size constraints
             if utils.should_skip_trade(min_notional1, calculated_notional1, min_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s1} below min notional with excessive bump required")
+                cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
+                pair_info.pending_signal = None
+                pair_info.pending_since = None
+                pair_info.pending_source = ''
+                pair_info._leverage_fail_until = time.time() + cooldown_sec
+                self._set_symbol_cooldown(s1, cooldown_sec, 'min_notional_bump')
                 pair_info.position_status = 0
                 pair_info.is_trading = False
                 return
             
             if utils.should_skip_trade(min_notional2, calculated_notional2, min_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s2} below min notional with excessive bump required")
+                cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
+                pair_info.pending_signal = None
+                pair_info.pending_since = None
+                pair_info.pending_source = ''
+                pair_info._leverage_fail_until = time.time() + cooldown_sec
+                self._set_symbol_cooldown(s2, cooldown_sec, 'min_notional_bump')
                 pair_info.position_status = 0
                 pair_info.is_trading = False
                 return
@@ -4779,6 +4864,53 @@ class PairsManager:
                     open_count = sum(1 for pi in self.active_pairs.values() if pi.position_status != 0)
                     pending_count = sum(1 for pi in self.active_pairs.values() if pi.pending_signal is not None)
                     print(f"ðŸ“Š Signal monitor: {idle_count} idle pairs, {open_count} open positions, {pending_count} pending signals")
+                    # Diagnostic snapshot at monitor cadence (not every tick).
+                    z_entry_dbg = getattr(self.config, 'z_entry', 1.9) or 1.9
+                    z_entry_max_dbg = getattr(self.config, 'z_entry_max', 2.5) or 2.5
+                    confirm_sec_dbg = getattr(self.config, 'signal_confirm_sec', 10) or 10
+                    details = []
+                    for pi in self.active_pairs.values():
+                        if pi.position_status != 0 or pi.is_trading:
+                            continue
+                        s1 = pi.symbol1
+                        s2 = pi.symbol2
+                        p1 = self.last_prices.get(s1)
+                        p2 = self.last_prices.get(s2)
+                        z = np.nan
+                        if p1 and p2:
+                            z = self._calc_realtime_zscore(pi, p1, p2)
+                        if np.isnan(z):
+                            z_txt = "nan"
+                            near_entry = False
+                        else:
+                            z_txt = f"{z:+.2f}"
+                            near_entry = abs(z) >= (z_entry_dbg * 0.8)
+
+                        if getattr(pi, '_close_cooldown_until', 0) > now:
+                            reason = f"sl_cd:{int(getattr(pi, '_close_cooldown_until', 0) - now)}s"
+                        elif getattr(pi, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pi):
+                            reason = "wait_candle"
+                        elif pi.pending_signal is not None:
+                            elapsed = int(now - (pi.pending_since or now))
+                            left = max(0, int(confirm_sec_dbg - elapsed))
+                            reason = f"pending:{left}s"
+                        elif np.isnan(z):
+                            reason = "no_rt_z"
+                        elif abs(z) >= z_entry_max_dbg:
+                            reason = f"z>{z_entry_max_dbg:.2f}"
+                        elif abs(z) >= z_entry_dbg:
+                            reason = "entry_window"
+                        else:
+                            reason = "z_low"
+
+                        details.append((near_entry, abs(z) if not np.isnan(z) else -1.0, f"  - {s1}-{s2}: z={z_txt}, reason={reason}"))
+
+                    details.sort(key=lambda x: (not x[0], -x[1]))
+                    max_lines = 20
+                    for _, _, line in details[:max_lines]:
+                        print(line)
+                    if len(details) > max_lines:
+                        print(f"  ... and {len(details) - max_lines} more idle pairs")
                 z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
                 z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
                 ready_candidates = []
