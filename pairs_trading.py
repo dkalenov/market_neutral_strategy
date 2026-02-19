@@ -34,6 +34,7 @@ CLOSE_REASONS = {
     'orphan_restart': 'ðŸ”„ Orphan on Restart',
     'stale_symbols': 'â³ Stale Symbols',
     'manual_partial': 'ðŸ‘¤ Manual Close (1 leg)',
+    'audit_fail': 'ðŸ§¾ Trade Audit Safety Close',
 }
 
 class Data:
@@ -1297,7 +1298,11 @@ class PairsManager:
                         # Wait briefly for trade to register
                         await asyncio.sleep(0.5)
                         start_ms = self._trade_window_start_ms(pair_info)
-                        recent_trades = await self.client.get_account_trades(symbol=symbol, startTime=start_ms, limit=20)
+                        recent_trades = await self._fetch_account_trades_window(
+                            symbol=symbol,
+                            start_ms=start_ms,
+                            max_records=1000
+                        )
                         
                         if recent_trades:
                             # Sum realized PnL of recent trades for this symbol
@@ -1713,8 +1718,8 @@ class PairsManager:
                         # Fetch actual PnL from recent trades
                         start_ms = self._trade_window_start_ms(pair_info)
                         
-                        trades1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
-                        trades2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                        trades1 = await self._fetch_account_trades_window(s1, start_ms, max_records=2000)
+                        trades2 = await self._fetch_account_trades_window(s2, start_ms, max_records=2000)
                         
                         print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
                         print(f"ðŸ“Š Trades for {s2}: {len(trades2)} entries")
@@ -2654,6 +2659,49 @@ class PairsManager:
             return start_sec * 1000
         return now_ms - (default_lookback_sec * 1000)
 
+    async def _fetch_account_trades_window(
+        self,
+        symbol: str,
+        start_ms: int,
+        *,
+        max_records: int = 3000,
+        page_limit: int = 1000,
+    ) -> list:
+        """
+        Fetch user trades in pages by moving startTime cursor forward.
+        Reduces risk of missing fills when trade count exceeds small limits.
+        """
+        out = []
+        seen = set()
+        cursor = int(max(0, start_ms))
+        hard_cap = int(max(1, max_records))
+        limit = int(min(1000, max(1, page_limit)))
+        for _ in range(20):  # hard safety cap for API calls per fetch
+            if len(out) >= hard_cap:
+                break
+            batch = await self.client.get_account_trades(symbol=symbol, startTime=cursor, limit=limit)
+            if not batch:
+                break
+            max_time = cursor
+            for t in batch:
+                tid = t.get('id')
+                ttime = int(t.get('time', 0) or t.get('T', 0) or 0)
+                key = (tid, ttime)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(t)
+                if ttime > max_time:
+                    max_time = ttime
+                if len(out) >= hard_cap:
+                    break
+            if len(batch) < limit:
+                break
+            if max_time <= cursor:
+                break
+            cursor = max_time + 1
+        return out
+
     def _build_execution_rows(self, pair_info: PairInfo, symbol: str, trades: list, phase: str, trade_id: int | None = None):
         rows = []
         if not trades:
@@ -3117,8 +3165,8 @@ class PairsManager:
                     # Calculate PnL using EXCHANGE data (source of truth)
                     try:
                         start_ms_pnl = self._trade_window_start_ms(pair_info)
-                        trades_pnl_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_pnl, limit=50)
-                        trades_pnl_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_pnl, limit=50)
+                        trades_pnl_s1 = await self._fetch_account_trades_window(s1, start_ms_pnl, max_records=3000)
+                        trades_pnl_s2 = await self._fetch_account_trades_window(s2, start_ms_pnl, max_records=3000)
                         if trades_pnl_s1 or trades_pnl_s2:
                             pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades_pnl_s1)
                             pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades_pnl_s2)
@@ -3375,6 +3423,7 @@ class PairsManager:
                             'external': 'âš¡ External Close',
                             'orphan_restart': 'ðŸ”„ Orphan on Restart',
                             'stale_symbols': 'â³ Stale Symbols',
+                            'audit_fail': 'ðŸ§¾ Trade Audit Safety Close',
                         }
                         reason_text = CLOSE_REASONS.get(close_reason, 'â“ Unknown') if close_reason else 'â“ Unknown'
                     
@@ -3396,7 +3445,7 @@ class PairsManager:
                             if sym not in close_prices:
                                 try:
                                     start_ms = self._trade_window_start_ms(pair_info)
-                                    trades = await self.client.get_account_trades(symbol=sym, startTime=start_ms, limit=50)
+                                    trades = await self._fetch_account_trades_window(sym, start_ms, max_records=1000)
                                     if trades:
                                         # Last trade price is the close price
                                         close_prices[sym] = float(trades[-1].get('price', 0))
@@ -3417,8 +3466,8 @@ class PairsManager:
                         try:
                             await asyncio.sleep(0.5)  # Brief delay for trade data availability
                             start_ms_pnl = self._trade_window_start_ms(pair_info)
-                            trades_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_pnl, limit=50)
-                            trades_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_pnl, limit=50)
+                            trades_s1 = await self._fetch_account_trades_window(s1, start_ms_pnl, max_records=3000)
+                            trades_s2 = await self._fetch_account_trades_window(s2, start_ms_pnl, max_records=3000)
                             if trades_s1 or trades_s2:
                                 pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades_s1)
                                 pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades_s2)
@@ -4239,8 +4288,8 @@ class PairsManager:
                             start_ms_open = now_ms - 180_000
                             order_id_s1 = int(executed_orders[0].get('orderId')) if executed_orders and len(executed_orders) > 0 and executed_orders[0].get('orderId') is not None else None
                             order_id_s2 = int(executed_orders[1].get('orderId')) if executed_orders and len(executed_orders) > 1 and executed_orders[1].get('orderId') is not None else None
-                            open_trades_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_open, limit=50)
-                            open_trades_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_open, limit=50)
+                            open_trades_s1 = await self._fetch_account_trades_window(s1, start_ms_open, max_records=1500)
+                            open_trades_s2 = await self._fetch_account_trades_window(s2, start_ms_open, max_records=1500)
                             if order_id_s1 is not None:
                                 open_trades_s1 = [t for t in open_trades_s1 if int(t.get('orderId', -1)) == order_id_s1]
                             if order_id_s2 is not None:
@@ -4255,7 +4304,21 @@ class PairsManager:
                         except Exception as fill_err:
                             print(f"⚠️ Could not persist OPEN executions for {s1}-{s2}: {fill_err}")
                     except Exception as e:
-                        print(f"Error creating trade record: {e}")
+                        # Do not keep live positions without a trade row: close immediately for audit safety.
+                        print(f"CRITICAL: could not create OPEN trade record for {s1}-{s2}: {e}")
+                        try:
+                            alert = (f"🚨 <b>Trade audit safety stop</b>\n"
+                                     f"Pair: {s1}-{s2}\n"
+                                     f"Reason: failed to persist OPEN trade record.\n"
+                                     f"Action: position will be closed immediately to avoid untracked exposure.")
+                            reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                            await self._notify(alert, reply_to)
+                        except Exception:
+                            pass
+                        pair_info.close_handled = True
+                        pair_info.is_trading = True
+                        await self._execute_trade(pair_info, 0, close_reason='audit_fail')
+                        return
             
             except Exception as e:
                 print(f"FATAL ERROR during trade execution for {s1}-{s2}: {e}")

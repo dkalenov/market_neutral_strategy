@@ -198,6 +198,40 @@ async def _persist_pair_executions_main(pair_info, trades1, trades2, phase: str)
             print(f"⚠️ Could not persist executions [{phase}] for {pair_info.symbol1}-{pair_info.symbol2}: {e}")
 
 
+async def _fetch_account_trades_window_main(symbol: str, start_ms: int, *, max_records: int = 3000, page_limit: int = 1000):
+    """Paged user-trades fetch to avoid truncating PnL/fill history on busy closes."""
+    out = []
+    seen = set()
+    cursor = int(max(0, start_ms))
+    hard_cap = int(max(1, max_records))
+    limit = int(min(1000, max(1, page_limit)))
+    for _ in range(20):
+        if len(out) >= hard_cap:
+            break
+        batch = await client.get_account_trades(symbol=symbol, startTime=cursor, limit=limit)
+        if not batch:
+            break
+        max_time = cursor
+        for t in batch:
+            tid = t.get('id')
+            ttime = int(t.get('time', 0) or t.get('T', 0) or 0)
+            key = (tid, ttime)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(t)
+            if ttime > max_time:
+                max_time = ttime
+            if len(out) >= hard_cap:
+                break
+        if len(batch) < limit:
+            break
+        if max_time <= cursor:
+            break
+        cursor = max_time + 1
+    return out
+
+
 async def main():
     global client
     global pairs_manager
@@ -223,6 +257,25 @@ async def main():
 
     # Load config from DB
     conf = await db.load_config()
+    # Non-destructive integrity audit (warn-only). Helps detect historical DB drift early.
+    try:
+        integrity = await db.audit_data_integrity(sample_limit=10)
+        issues = []
+        if integrity.get('duplicate_active_pairs', 0) > 0:
+            issues.append(f"duplicate_active_pairs={integrity['duplicate_active_pairs']}")
+        if integrity.get('open_trades_without_pair', 0) > 0:
+            issues.append(f"open_trades_without_pair={integrity['open_trades_without_pair']}")
+        if integrity.get('open_trades_with_closed_pair', 0) > 0:
+            issues.append(f"open_trades_with_closed_pair={integrity['open_trades_with_closed_pair']}")
+        if integrity.get('pairs_with_multiple_open_trades', 0) > 0:
+            issues.append(f"pairs_with_multiple_open_trades={integrity['pairs_with_multiple_open_trades']}")
+        if issues:
+            print("CRITICAL DB integrity issues detected: " + ", ".join(issues))
+            sample = integrity.get('duplicate_active_pairs_sample', [])
+            for item in sample[:5]:
+                print(f"  DUP: {item.get('symbol1')}-{item.get('symbol2')} x{item.get('count')}")
+    except Exception as e:
+        print(f"⚠️ DB integrity audit failed: {e}")
 
     # Load secrets from environment variables (NOT from config.ini or DB)
     api_key = os.getenv('BINANCE_API_KEY')
@@ -964,7 +1017,7 @@ async def ws_user_msg(ws, msg):
                 stored_reason = getattr(pair_info, 'last_close_reason', '')
                 bot_close_reasons = ('manual', 'z_tp', 'z_sl', 'circuit', 'broken_coint', 
                                      'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
-                                     'btc_shock', 'desync', 'orphan_restart', 'stale_symbols')
+                                     'btc_shock', 'desync', 'orphan_restart', 'stale_symbols', 'audit_fail')
                 if getattr(pair_info, 'close_handled', False) and stored_reason in bot_close_reasons:
                     print(f"â„¹ï¸ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping external notification")
                     now_mark = time_mod.time()
@@ -992,8 +1045,8 @@ async def ws_user_msg(ws, msg):
                     start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
                     trades1, trades2 = await asyncio.gather(
-                        client.get_account_trades(symbol=s1, startTime=start_ms, limit=50),
-                        client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                        _fetch_account_trades_window_main(s1, start_ms, max_records=3000),
+                        _fetch_account_trades_window_main(s2, start_ms, max_records=3000)
                     )
                     
                     print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
@@ -1152,7 +1205,7 @@ async def ws_user_msg(ws, msg):
                 stored_reason = getattr(pair_info, 'last_close_reason', '')
                 if getattr(pair_info, 'close_handled', False) and stored_reason in ('manual', 'z_tp', 'z_sl', 'circuit', 'broken_coint', 
                         'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
-                        'btc_shock', 'desync', 'orphan_restart', 'stale_symbols'):
+                        'btc_shock', 'desync', 'orphan_restart', 'stale_symbols', 'audit_fail'):
                     print(f"â„¹ï¸ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping single-leg handler")
                     now_mark = time_mod.time()
                     recently_handled_close_symbols[s1] = now_mark
@@ -1243,8 +1296,8 @@ async def ws_user_msg(ws, msg):
                     start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
                     trades1, trades2 = await asyncio.gather(
-                        client.get_account_trades(symbol=s1, startTime=start_ms, limit=50),
-                        client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                        _fetch_account_trades_window_main(s1, start_ms, max_records=3000),
+                        _fetch_account_trades_window_main(s2, start_ms, max_records=3000)
                     )
                     
                     print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")

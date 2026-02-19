@@ -1,4 +1,4 @@
-import time
+﻿import time
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -220,7 +220,7 @@ async def connect(host, port, user, password, db_name):
 async def run_migrations(engine):
     """Automatically adds missing columns to tables"""
     migrations = [
-        # Table pairs — new columns
+        # Table pairs â€” new columns
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS position_status INTEGER DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty2 FLOAT DEFAULT 0.0;",
@@ -237,12 +237,12 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl2 FLOAT DEFAULT 0.0;",
-        # Pairs — market neutrality metrics (persisted for analysis & restart recovery)
+        # Pairs â€” market neutrality metrics (persisted for analysis & restart recovery)
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS last_pvalue FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_z_score FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;",
-        # Trades — extended metadata for post-trade analysis
+        # Trades â€” extended metadata for post-trade analysis
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hedge_ratio FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pvalue FLOAT DEFAULT 0.0;",
@@ -251,7 +251,7 @@ async def run_migrations(engine):
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
-        # Pair history — structured analytics fields
+        # Pair history â€” structured analytics fields
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS pair_id INTEGER;",
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS trade_id INTEGER;",
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS z_score FLOAT DEFAULT 0.0;",
@@ -285,7 +285,7 @@ async def run_migrations(engine):
             created_at BIGINT DEFAULT 0
         );
         """,
-        # Table config — increase value length
+        # Table config â€” increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
         # Performance indexes (safe, idempotent)
         "CREATE INDEX IF NOT EXISTS idx_pairs_is_archived ON pairs (is_archived);",
@@ -316,8 +316,71 @@ async def run_migrations(engine):
                 sql_head = sql.strip().split('\n', 1)[0]
                 if len(sql_head) > 120:
                     sql_head = sql_head[:120] + "..."
-                print(f"⚠️ Migration skipped/failed: {sql_head} | {e}")
+                print(f"âš ï¸ Migration skipped/failed: {sql_head} | {e}")
+                if 'idx_pairs_unique_active' in sql:
+                    print("CRITICAL: unique active-pair index was NOT created. Active pair duplicates may exist and break trade accounting.")
 
+
+
+
+async def audit_data_integrity(sample_limit: int = 20):
+    """
+    Non-destructive integrity audit for key trading tables.
+    Returns dict with counters and small samples for diagnostics.
+    """
+    result = {
+        'duplicate_active_pairs': 0,
+        'duplicate_active_pairs_sample': [],
+        'open_trades_without_pair': 0,
+        'open_trades_with_closed_pair': 0,
+        'pairs_with_multiple_open_trades': 0,
+    }
+    async with Session() as s:
+        dup_rows = await s.execute(text("""
+            SELECT LEAST(symbol1, symbol2) AS sym_lo,
+                   GREATEST(symbol1, symbol2) AS sym_hi,
+                   COUNT(*) AS cnt
+            FROM pairs
+            WHERE is_archived = FALSE
+            GROUP BY LEAST(symbol1, symbol2), GREATEST(symbol1, symbol2)
+            HAVING COUNT(*) > 1
+            ORDER BY cnt DESC
+            LIMIT :lim
+        """), {'lim': int(max(1, sample_limit))})
+        dup_data = dup_rows.fetchall()
+        result['duplicate_active_pairs'] = len(dup_data)
+        result['duplicate_active_pairs_sample'] = [
+            {'symbol1': r.sym_lo, 'symbol2': r.sym_hi, 'count': int(r.cnt)} for r in dup_data
+        ]
+
+        q1 = await s.execute(text("""
+            SELECT COUNT(*)
+            FROM trades t
+            LEFT JOIN pairs p ON p.id = t.pair_id
+            WHERE t.status = 'OPEN' AND p.id IS NULL
+        """))
+        result['open_trades_without_pair'] = int(q1.scalar() or 0)
+
+        q2 = await s.execute(text("""
+            SELECT COUNT(*)
+            FROM trades t
+            JOIN pairs p ON p.id = t.pair_id
+            WHERE t.status = 'OPEN' AND COALESCE(p.position_status, 0) = 0
+        """))
+        result['open_trades_with_closed_pair'] = int(q2.scalar() or 0)
+
+        q3 = await s.execute(text("""
+            SELECT COUNT(*)
+            FROM (
+                SELECT pair_id
+                FROM trades
+                WHERE status = 'OPEN' AND pair_id IS NOT NULL
+                GROUP BY pair_id
+                HAVING COUNT(*) > 1
+            ) x
+        """))
+        result['pairs_with_multiple_open_trades'] = int(q3.scalar() or 0)
+    return result
 
 async def load_config():
     if Session is None:
@@ -361,8 +424,8 @@ async def load_config():
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
             # Hedge Ratio Bounds (market neutrality)
-            'hedge_min': '0.3',              # Min |hedge| — below this positions are too unbalanced
-            'hedge_max': '3.0',              # Max |hedge| — above this positions are too unbalanced
+            'hedge_min': '0.3',              # Min |hedge| â€” below this positions are too unbalanced
+            'hedge_max': '3.0',              # Max |hedge| â€” above this positions are too unbalanced
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
@@ -388,7 +451,7 @@ async def load_config():
                         await s.execute(update(Config).where(Config.key == key).values(value=default_val))
                         await s.commit()
             except Exception as e:
-                print(f"⚠️ Config default init failed for key '{key}': {e}")
+                print(f"âš ï¸ Config default init failed for key '{key}': {e}")
         # Load all configuration from DB
         async with Session() as session:
             result = (await session.execute(select(Config))).scalars().all()
@@ -652,3 +715,4 @@ async def add_trade_executions(rows: list[dict]):
                     await s.commit()
                 except IntegrityError:
                     await s.rollback()
+
