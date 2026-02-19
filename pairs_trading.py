@@ -98,6 +98,8 @@ class PairInfo:
     _close_cooldown_until: float = 0.0  # Unix timestamp: skip entry signals until this time
     # Wait-for-candle: after ANY close, block re-entry until next candle closes
     _wait_for_candle: bool = False  # True = pair just closed, wait for next candle before re-entry
+    # Persisted/derived candle anchor: do not re-enter while latest closed candle <= this ts (ms).
+    reentry_block_candle_ts: int = 0
 
 class PairsManager:
     """
@@ -119,6 +121,8 @@ class PairsManager:
         self.all_data: dict[str, Data] = {}
         
         self.active_pairs: dict[frozenset, PairInfo] = {}
+        # Pair-local same-candle re-entry guard that survives pair object rotation.
+        self._reentry_block_by_pair: dict[frozenset, int] = {}
         # O(1) symbol â†’ list[PairInfo] index (maintained by _register_pair/_unregister_pair)
         self._symbol_to_pairs: dict[str, list[PairInfo]] = {}
         self.leverage_cache = {} # {symbol: leverage_int}
@@ -198,6 +202,7 @@ class PairsManager:
         
         # Load from DB first (also runs _reconcile_with_exchange internally)
         await self._load_state_from_db()
+        await self._load_reentry_blocks_from_db()
         
         # Update exchange position cache
         await self._refresh_exchange_position_count()
@@ -210,6 +215,34 @@ class PairsManager:
         # Start periodic leg sync loop (BACKUP only - primary sync is via WebSocket)
         self._leg_sync_task = self.loop.create_task(self._periodic_leg_sync_loop())
         print("ðŸ”„ Started backup leg sync loop (every 30s, primary via WebSocket)")
+
+    async def _load_reentry_blocks_from_db(self):
+        """Restore same-candle guard anchors from DB for restart-safe behavior."""
+        try:
+            rows = await db.get_all_pairs(include_archived=True)
+            restored = 0
+            for p in rows:
+                if getattr(p, 'position_status', 0) != 0:
+                    continue
+                sym1 = getattr(p, 'symbol1', '')
+                sym2 = getattr(p, 'symbol2', '')
+                if not sym1 or not sym2:
+                    continue
+                ts = int(getattr(p, 'last_close_candle_ts', 0) or 0)
+                if ts <= 0:
+                    close_time = int(getattr(p, 'close_time', 0) or 0)
+                    ts = close_time if close_time > 1_000_000_000_000 else close_time * 1000
+                if ts <= 0:
+                    continue
+                key = frozenset([sym1, sym2])
+                prev = int(self._reentry_block_by_pair.get(key, 0) or 0)
+                if ts > prev:
+                    self._reentry_block_by_pair[key] = ts
+                    restored += 1
+            if restored:
+                print(f"ðŸ”’ Restored same-candle re-entry guards: {restored}")
+        except Exception as e:
+            print(f"âš ï¸ Could not restore re-entry guards from DB: {e}")
 
     async def _load_state_from_db(self):
         """
@@ -264,6 +297,10 @@ class PairsManager:
                     
                     if s1_open and s2_open:
                         # VALID: Both legs exist on exchange - restore
+                        close_anchor = int(getattr(p, 'last_close_candle_ts', 0) or 0)
+                        if close_anchor <= 0:
+                            close_time = int(getattr(p, 'close_time', 0) or 0)
+                            close_anchor = close_time if close_time > 1_000_000_000_000 else close_time * 1000
                         info = PairInfo(
                             symbol1=p.symbol1,
                             symbol2=p.symbol2,
@@ -275,7 +312,8 @@ class PairsManager:
                             entry_price1=p.entry_price1,
                             entry_price2=p.entry_price2,
                             db_id=p.id,
-                            tg_message_id=getattr(p, 'tg_message_id', 0) or 0
+                            tg_message_id=getattr(p, 'tg_message_id', 0) or 0,
+                            reentry_block_candle_ts=close_anchor
                         )
                         # Restore market neutrality metrics from DB (survive restart)
                         info.beta_btc = getattr(p, 'beta_btc', 0.0) or 0.0
@@ -539,6 +577,10 @@ class PairsManager:
                                 # This is NOT an unknown position - RESTORE it!
                                 pair_set = frozenset([symbol, other_sym])
                                 if pair_set not in self.active_pairs:
+                                    close_anchor = int(getattr(db_pair, 'last_close_candle_ts', 0) or 0)
+                                    if close_anchor <= 0:
+                                        close_time = int(getattr(db_pair, 'close_time', 0) or 0)
+                                        close_anchor = close_time if close_time > 1_000_000_000_000 else close_time * 1000
                                     info = PairInfo(
                                         symbol1=db_pair.symbol1,
                                         symbol2=db_pair.symbol2,
@@ -550,7 +592,8 @@ class PairsManager:
                                         entry_price1=db_pair.entry_price1,
                                         entry_price2=db_pair.entry_price2,
                                         db_id=db_pair.id,
-                                        tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0
+                                        tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0,
+                                        reentry_block_candle_ts=close_anchor
                                     )
                                     self.active_pairs[pair_set] = info
                                     self._register_pair(info)
@@ -702,17 +745,24 @@ class PairsManager:
                                 
                                 pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
                                 pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
+                                fee1 = sum(float(t.get('commission', 0)) for t in trades1)
+                                fee2 = sum(float(t.get('commission', 0)) for t in trades2)
                                 total_pnl = pnl1 + pnl2
-                                pnl_emoji = "ðŸŸ¢" if total_pnl >= 0 else "ðŸ”´"
+                                net_pnl = total_pnl - (fee1 + fee2)
+                                pnl_emoji = "ðŸŸ¢" if net_pnl >= 0 else "ðŸ”´"
                                 
                                 # Update DB with PnL
-                                pairs_to_fix.append((pair_info, 'close_db_with_pnl', total_pnl, pnl1, pnl2))
+                                pairs_to_fix.append((pair_info, 'close_db_with_pnl', net_pnl, pnl1, pnl2, fee1, fee2))
+                                await self._persist_pair_executions(
+                                    pair_info, trades1, trades2, phase='ORPHAN_RESTART_CLOSE', trade_id=pair_info.current_trade_id
+                                )
                                 
                                 # Notify with details
                                 await self._notify(f"âš¡ <b>Orphan Closed (Restart):</b> {s1}-{s2}\n\n"
-                                                   f"ðŸ’µ PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>\n"
+                                                   f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
                                                    f"   {s1}: {pnl1:+.2f} USDT\n"
-                                                   f"   {s2}: {pnl2:+.2f} USDT")
+                                                   f"   {s2}: {pnl2:+.2f} USDT\n"
+                                                   f"ðŸ’¸ Fees: {fee1 + fee2:.4f} USDT")
                             except Exception as e:
                                 print(f"      âš ï¸ Failed to close orphan: {e}")
                                 pairs_to_fix.append((pair_info, 'close_db'))
@@ -802,6 +852,7 @@ class PairsManager:
                     pnl1 = 0.0
                     pnl2 = 0.0
                     total_pnl = 0.0
+                    net_pnl = 0.0
                     fee1 = 0.0
                     fee2 = 0.0
                     pnl_loaded = False
@@ -814,6 +865,7 @@ class PairsManager:
                         fee1 = sum(float(t.get('commission', 0)) for t in trades1)
                         fee2 = sum(float(t.get('commission', 0)) for t in trades2)
                         total_pnl = pnl1 + pnl2
+                        net_pnl = total_pnl - (fee1 + fee2)
                         pnl_loaded = (len(trades1) + len(trades2)) > 0
                     except Exception as pnl_err:
                         print(f"  âš ï¸ Could not fetch external-close PnL for {s1}-{s2}: {pnl_err}")
@@ -825,7 +877,7 @@ class PairsManager:
                     pair_info.entry_price1 = 0
                     pair_info.entry_price2 = 0
                     pair_info.is_trading = False
-                    pair_info._wait_for_candle = True
+                    self.mark_pair_wait_for_next_candle(pair_info, reason='external')
                     
                     if pair_info.db_id:
                         pair_update = {
@@ -840,7 +892,7 @@ class PairsManager:
                         }
                         if pnl_loaded:
                             pair_update.update({
-                                'close_pnl': total_pnl,
+                                'close_pnl': net_pnl,
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
                                 'fee1': fee1,
@@ -854,15 +906,19 @@ class PairsManager:
                             pair_info.current_trade_id,
                             status='CLOSED_EXTERNAL',
                             close_reason='external',
-                            pnl=total_pnl if pnl_loaded else None,
+                            pnl=net_pnl if pnl_loaded else None,
                             fee1=fee1 if pnl_loaded else None,
                             fee2=fee2 if pnl_loaded else None,
                         )
+                        if pnl_loaded:
+                            await self._persist_pair_executions(
+                                pair_info, trades1, trades2, phase='EXTERNAL_CLOSE_SYNC', trade_id=pair_info.current_trade_id
+                            )
                         pair_info.current_trade_id = None
 
                     externally_closed_pairs.append({
                         'pair': f"{s1}-{s2}",
-                        'pnl': total_pnl if pnl_loaded else None
+                        'pnl': net_pnl if pnl_loaded else None
                     })
                     
                     print(f"  âœ… Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as CLOSED in DB")
@@ -892,9 +948,11 @@ class PairsManager:
                 
                 elif action == 'close_db_with_pnl' and len(fix) >= 5:
                     # Mark as closed in DB with PnL info
-                    total_pnl = fix[2]
+                    net_pnl = fix[2]
                     pnl1 = fix[3]
                     pnl2 = fix[4]
+                    fee1 = fix[5] if len(fix) >= 6 else 0.0
+                    fee2 = fix[6] if len(fix) >= 7 else 0.0
                     
                     pair_info.position_status = 0
                     pair_info.qty1 = 0
@@ -913,19 +971,24 @@ class PairsManager:
                             'entry_price1': 0,
                             'entry_price2': 0,
                             'close_time': int(time_mod.time()),
-                            'close_pnl': total_pnl,
+                            'close_pnl': net_pnl,
                             'close_reason': 'orphan_restart',
                             'pnl1': pnl1,
-                            'pnl2': pnl2
+                            'pnl2': pnl2,
+                            'fee1': fee1,
+                            'fee2': fee2,
                         })
                     
                     # Close trade record
                     if pair_info.current_trade_id:
                         await db.close_trade_record(
-                            pair_info.current_trade_id,
-                            status='CLOSED_ORPHAN',
-                            close_reason='orphan_restart',
-                        )
+                                pair_info.current_trade_id,
+                                status='CLOSED_ORPHAN',
+                                close_reason='orphan_restart',
+                                pnl=net_pnl,
+                                fee1=fee1,
+                                fee2=fee2,
+                            )
                         pair_info.current_trade_id = None
                     
                     print(f"  âœ… Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan closed with PnL={total_pnl:.2f}")
@@ -1022,7 +1085,7 @@ class PairsManager:
                         print(f"ðŸ§¹ Syncing stale pair: {pair_info.symbol1}-{pair_info.symbol2}")
                         pair_info.position_status = 0
                         pair_info.is_trading = False
-                        pair_info._wait_for_candle = True
+                        self.mark_pair_wait_for_next_candle(pair_info, reason='stale_symbols')
             
             # Get all algo orders (using fixed endpoint /fapi/v1/openAlgoOrders)
             algo_orders = await self.client.get_algo_orders()
@@ -1492,6 +1555,7 @@ class PairsManager:
                     pnl1 = 0.0
                     pnl2 = 0.0
                     total_pnl = 0.0
+                    net_pnl = 0.0
                     fee1 = 0.0
                     fee2 = 0.0
                     pnl_loaded = False
@@ -1504,6 +1568,7 @@ class PairsManager:
                         fee1 = sum(float(t.get('commission', 0)) for t in trades1)
                         fee2 = sum(float(t.get('commission', 0)) for t in trades2)
                         total_pnl = pnl1 + pnl2
+                        net_pnl = total_pnl - (fee1 + fee2)
                         pnl_loaded = (len(trades1) + len(trades2)) > 0
                     except Exception as pnl_err:
                         print(f"âš ï¸ Could not fetch external-close PnL for {s1}-{s2}: {pnl_err}")
@@ -1514,7 +1579,7 @@ class PairsManager:
                     pair_info.entry_price1 = 0
                     pair_info.entry_price2 = 0
                     pair_info.is_trading = False
-                    pair_info._wait_for_candle = True
+                    self.mark_pair_wait_for_next_candle(pair_info, reason='external')
                     pair_info.close_handled = True
 
                     if pair_info.db_id:
@@ -1530,7 +1595,7 @@ class PairsManager:
                         }
                         if pnl_loaded:
                             pair_update.update({
-                                'close_pnl': total_pnl,
+                                'close_pnl': net_pnl,
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
                                 'fee1': fee1,
@@ -1543,15 +1608,19 @@ class PairsManager:
                             pair_info.current_trade_id,
                             status='CLOSED_EXTERNAL',
                             close_reason='external',
-                            pnl=total_pnl if pnl_loaded else None,
+                            pnl=net_pnl if pnl_loaded else None,
                             fee1=fee1 if pnl_loaded else None,
                             fee2=fee2 if pnl_loaded else None,
                         )
+                        if pnl_loaded:
+                            await self._persist_pair_executions(
+                                pair_info, trades1, trades2, phase='EXTERNAL_CLOSE_SYNC', trade_id=pair_info.current_trade_id
+                            )
                         pair_info.current_trade_id = None
 
                     externally_closed_now.append({
                         'pair': f"{s1}-{s2}",
-                        'pnl': total_pnl if pnl_loaded else None
+                        'pnl': net_pnl if pnl_loaded else None
                     })
                     print(f"âš¡ External close detected: {s1}-{s2}")
                     continue
@@ -1657,8 +1726,9 @@ class PairsManager:
                         fee2 = sum(float(t.get('commission', 0)) for t in trades2)
                         total_pnl = pnl1 + pnl2
                         total_fees = fee1 + fee2
+                        net_pnl = total_pnl - total_fees
                         
-                        pnl_emoji = "ðŸŸ¢" if total_pnl >= 0 else "ðŸ”´"
+                        pnl_emoji = "ðŸŸ¢" if net_pnl >= 0 else "ðŸ”´"
                         e1 = 'ðŸŸ¢' if pnl1 >= 0 else 'ðŸ”´'
                         e2 = 'ðŸŸ¢' if pnl2 >= 0 else 'ðŸ”´'
                         
@@ -1735,10 +1805,13 @@ class PairsManager:
                                     pair_info.current_trade_id,
                                     status='CLOSED',
                                     close_reason='desync',
-                                    pnl=total_pnl,
+                                    pnl=net_pnl,
                                     close_z=close_zscore,
                                     fee1=fee1,
                                     fee2=fee2,
+                                )
+                                await self._persist_pair_executions(
+                                    pair_info, trades1, trades2, phase='DESYNC_CLOSE', trade_id=pair_info.current_trade_id
                                 )
                             except Exception:
                                 pass
@@ -1752,7 +1825,7 @@ class PairsManager:
                                 'qty1': 0,
                                 'qty2': 0,
                                 'close_time': int(time.time()),
-                                'close_pnl': total_pnl,
+                                'close_pnl': net_pnl,
                                 'close_reason': 'desync',
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
@@ -1767,17 +1840,16 @@ class PairsManager:
                                     f"ðŸ” Cause: {desync_reason}\n\n"
                                     f"ðŸ“Š Z: {close_zscore:+.2f} | Î²: {close_beta:.3f} | p: {close_pval:.4f}\n"
                                     f"â³ HL: {close_hl} | Hedge: {hedge:.4f}\n"
-                                    f"ðŸ’µ PnL: {pnl_emoji} <b>{total_pnl:.2f} USDT</b>\n"
+                                    f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:.2f} USDT</b>\n"
                                     f"   {e1} {s1}: {pnl1:+.2f} USDT\n"
                                     f"   {e2} {s2}: {pnl2:+.2f} USDT\n"
-                                    f"ðŸ’¸ Fees (included): {total_fees:.4f} USDT")
+                                    f"ðŸ’¸ Fees: {total_fees:.4f} USDT")
                         print(done_msg.replace('<b>', '').replace('</b>', ''))
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(done_msg, reply_to)
                         
-                        # WAIT FOR CANDLE: Block re-entry until next candle close
-                        pair_info._wait_for_candle = True
-                        print(f"â¸ï¸ {s1}-{s2}: Re-entry blocked until next candle close (reason: desync)")
+                        # WAIT FOR CANDLE: pair-local same-candle guard
+                        self.mark_pair_wait_for_next_candle(pair_info, reason='desync')
                         
                     except Exception as e:
                         print(f"âš ï¸ Desync close error for {s1}-{s2}: {e}")
@@ -2220,9 +2292,9 @@ class PairsManager:
                 
                 # Signal logic
                 if pair_info.position_status == 0:
-                    # CANDLE CLOSE: Reset _wait_for_candle flag
-                    # This is the ONLY place where the flag is reset â€” a new candle has closed,
-                    # so the pair is now eligible for re-entry with fresh parameters.
+                    # Pair-local same-candle guard.
+                    if self._is_pair_reentry_blocked_same_candle(pair_info):
+                        continue
                     if getattr(pair_info, '_wait_for_candle', False):
                         pair_info._wait_for_candle = False
                         print(f"âœ… {s1}-{s2}: New candle closed, pair eligible for re-entry")
@@ -2465,9 +2537,9 @@ class PairsManager:
                             )
                         except Exception:
                             pass
-                        # Remove from DB since we just added it
+                        # Keep historical integrity: archive instead of delete to avoid orphan history rows
                         try:
-                            await db.delete_pair(new_pair.id)
+                            await db.archive_pair(new_pair.id, reason='beta_rejected')
                         except:
                             pass
                         continue  # Skip this pair
@@ -2582,6 +2654,46 @@ class PairsManager:
             return start_sec * 1000
         return now_ms - (default_lookback_sec * 1000)
 
+    def _build_execution_rows(self, pair_info: PairInfo, symbol: str, trades: list, phase: str, trade_id: int | None = None):
+        rows = []
+        if not trades:
+            return rows
+        pair_id = getattr(pair_info, 'db_id', None)
+        for t in trades:
+            try:
+                rows.append({
+                    'trade_id': trade_id,
+                    'pair_id': pair_id,
+                    'symbol': symbol,
+                    'phase': phase,
+                    'side': t.get('side') or t.get('S'),
+                    'order_id': int(t.get('orderId')) if t.get('orderId') is not None else None,
+                    'exchange_trade_id': int(t.get('id')) if t.get('id') is not None else None,
+                    'price': float(t.get('price', 0) or 0),
+                    'qty': float(t.get('qty', 0) or t.get('executedQty', 0) or 0),
+                    'quote_qty': float(t.get('quoteQty', 0) or 0),
+                    'realized_pnl': float(t.get('realizedPnl', 0) or 0),
+                    'commission': float(t.get('commission', 0) or 0),
+                    'commission_asset': str(t.get('commissionAsset', '') or ''),
+                    'event_time': int(t.get('time', 0) or t.get('T', 0) or 0),
+                    'is_buyer': bool(t.get('buyer', False)),
+                    'is_maker': bool(t.get('maker', False)),
+                })
+            except Exception:
+                continue
+        return rows
+
+    async def _persist_pair_executions(self, pair_info: PairInfo, trades1: list, trades2: list, phase: str, trade_id: int | None = None):
+        rows = []
+        rows.extend(self._build_execution_rows(pair_info, pair_info.symbol1, trades1, phase, trade_id))
+        rows.extend(self._build_execution_rows(pair_info, pair_info.symbol2, trades2, phase, trade_id))
+        if not rows:
+            return
+        try:
+            await db.add_trade_executions(rows)
+        except Exception as e:
+            print(f"⚠️ Could not persist trade executions for {pair_info.symbol1}-{pair_info.symbol2} [{phase}]: {e}")
+
     async def _set_leverage(self, symbol, leverage):
         """Sets leverage for the symbol if not already set. Returns True on success."""
         if not leverage or leverage < 1:
@@ -2630,6 +2742,66 @@ class PairsManager:
         except Exception as e:
             print(f"âš ï¸ Could not add to best_pairs: {e}")
 
+    def _timeframe_seconds_local(self) -> int:
+        tf = (self.timeframe or '1h').strip().lower()
+        try:
+            if tf.endswith('m'):
+                return max(60, int(tf[:-1]) * 60)
+            if tf.endswith('h'):
+                return max(3600, int(tf[:-1]) * 3600)
+            if tf.endswith('d'):
+                return max(86400, int(tf[:-1]) * 86400)
+        except Exception:
+            pass
+        return 3600
+
+    def _floor_to_candle_ts_ms(self, ts_ms: int) -> int:
+        tf_ms = self._timeframe_seconds_local() * 1000
+        if tf_ms <= 0:
+            tf_ms = 3600 * 1000
+        return (int(ts_ms) // tf_ms) * tf_ms
+
+    def _latest_closed_candle_ts_ms(self, pair_info: PairInfo) -> int:
+        d1 = self.all_data.get(pair_info.symbol1)
+        d2 = self.all_data.get(pair_info.symbol2)
+        ts1 = int(d1.ts[-1]) if d1 and len(d1.ts) > 0 else 0
+        ts2 = int(d2.ts[-1]) if d2 and len(d2.ts) > 0 else 0
+        if ts1 and ts2:
+            return min(ts1, ts2)
+        return ts1 or ts2 or 0
+
+    def mark_pair_wait_for_next_candle(self, pair_info: PairInfo, reason: str = ''):
+        latest_ts = self._latest_closed_candle_ts_ms(pair_info)
+        if latest_ts <= 0:
+            latest_ts = self._floor_to_candle_ts_ms(int(time.time() * 1000))
+        pair_info.reentry_block_candle_ts = int(latest_ts)
+        key = frozenset([pair_info.symbol1, pair_info.symbol2])
+        prev = int(self._reentry_block_by_pair.get(key, 0) or 0)
+        if pair_info.reentry_block_candle_ts > prev:
+            self._reentry_block_by_pair[key] = pair_info.reentry_block_candle_ts
+        pair_info._wait_for_candle = True
+        print(f"â¸ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Re-entry blocked until next candle close (reason: {reason or 'close'}, candle_ts={pair_info.reentry_block_candle_ts})")
+
+    def _is_pair_reentry_blocked_same_candle(self, pair_info: PairInfo) -> bool:
+        key = frozenset([pair_info.symbol1, pair_info.symbol2])
+        block_ts = int(getattr(pair_info, 'reentry_block_candle_ts', 0) or 0)
+        if block_ts <= 0:
+            block_ts = int(self._reentry_block_by_pair.get(key, 0) or 0)
+            if block_ts > 0:
+                pair_info.reentry_block_candle_ts = block_ts
+        if block_ts <= 0:
+            return False
+        latest_ts = self._latest_closed_candle_ts_ms(pair_info)
+        if latest_ts <= 0:
+            return True
+        if latest_ts <= block_ts:
+            pair_info._wait_for_candle = True
+            return True
+        pair_info.reentry_block_candle_ts = 0
+        pair_info._wait_for_candle = False
+        self._reentry_block_by_pair.pop(key, None)
+        return False
+
     async def _trigger_immediate_analysis(self):
         """
         Triggers immediate analysis of all pairs when a slot becomes available.
@@ -2648,6 +2820,7 @@ class PairsManager:
         
         # Analyze all pairs with data
         analyzed = 0
+        opened_before = self.count_active_positions()
         for pair_set, pair_info in list(self.active_pairs.items()):
             if pair_info.position_status != 0:
                 continue  # Skip pairs with open positions
@@ -2657,7 +2830,7 @@ class PairsManager:
                 continue
             
             # Skip pairs waiting for next candle close before re-entry
-            if getattr(pair_info, '_wait_for_candle', False):
+            if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
                 continue
             
             s1, s2 = pair_info.symbol1, pair_info.symbol2
@@ -2670,6 +2843,20 @@ class PairsManager:
                     break
         
         print(f"ðŸ” Immediate analysis complete. Checked {analyzed} pairs.")
+
+        opened_after = self.count_active_positions()
+
+        # If quick scan did not fill slots enough, run discovery immediately so OTHER pairs can
+        # be traded without waiting for candle on recently closed pairs.
+        need_more_pairs = opened_after < max_pairs
+        weak_progress = (analyzed == 0) or (opened_after <= opened_before + 1)
+        if need_more_pairs and weak_progress:
+            now = time.time()
+            if self._discovery_task is None or self._discovery_task.done():
+                if now - self._last_discovery_time > 30:
+                    self._last_discovery_time = now
+                    print("ðŸ” Immediate scan made weak progress. Triggering discovery for alternative pairs...")
+                    self._discovery_task = self.loop.create_task(self._discover_new_pairs())
 
     def is_symbol_locked(self, symbol: str, exclude_pair=None) -> bool:
         """Check if symbol is already in an active position or being opened (in any pair)."""
@@ -2746,6 +2933,11 @@ class PairsManager:
         if self.count_active_positions(exclude_pair=exclude_pair) >= max_pairs:
             return False
         
+        # Keep scalar counter consistent with current symbol cache to avoid stale blocks.
+        cached_positions = len(self._exchange_positions_cache or {})
+        if cached_positions != self._exchange_position_count:
+            self._exchange_position_count = cached_positions
+
         # SAFETY: Also check exchange position cache (positions / 2 = pairs)
         # Each pair opens 2 positions, so max positions = max_pairs * 2
         max_exchange_positions = max_pairs * 2
@@ -2961,6 +3153,7 @@ class PairsManager:
                         _hw_fee2 = sum(float(t.get('commission', 0)) for t in trades_pnl_s2)
                     except Exception:
                         pass
+                    net_pnl = total_pnl - (_hw_fee1 + _hw_fee2)
                     
                     if saved_trade_id:
                         try:
@@ -2970,10 +3163,13 @@ class PairsManager:
                                 close_reason=close_reason or 'unknown',
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
-                                pnl=total_pnl,
+                                pnl=net_pnl,
                                 close_z=close_zscore,
                                 fee1=_hw_fee1,
                                 fee2=_hw_fee2,
+                            )
+                            await self._persist_pair_executions(
+                                pair_info, trades_pnl_s1, trades_pnl_s2, phase='CLOSE_HARDWARE', trade_id=saved_trade_id
                             )
                         except Exception as e:
                             print(f"âš ï¸ Trade record update failed: {e}")
@@ -2985,7 +3181,7 @@ class PairsManager:
                     }
                     reason_text = HW_REASONS.get(close_reason, f'ðŸ›¡ï¸ Hardware {close_reason}')
                     
-                    pnl_emoji = "ðŸŸ¢" if total_pnl > 0 else "ðŸ”´"
+                    pnl_emoji = "ðŸŸ¢" if net_pnl > 0 else "ðŸ”´"
                     e1 = 'ðŸŸ¢' if pnl1 >= 0 else 'ðŸ”´'
                     e2 = 'ðŸŸ¢' if pnl2 >= 0 else 'ðŸ”´'
                     
@@ -3037,7 +3233,8 @@ class PairsManager:
                     full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
                     full_msg += f"ðŸ“Š Z: {close_zscore:+.2f} | Î²: {close_beta:.3f} | p: {close_pval:.4f}\n"
                     full_msg += f"â³ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
-                    full_msg += f"ðŸ’µ PnL: {pnl_emoji} <b>{total_pnl:+.2f} USDT</b>\n"
+                    full_msg += f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                    full_msg += f"ðŸ’¸ Fees: {_hw_fee1 + _hw_fee2:.4f} USDT\n"
                     full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
                     
                     print(full_msg.replace('<b>', '').replace('</b>', ''))
@@ -3057,9 +3254,8 @@ class PairsManager:
                     self._exchange_positions_cache.pop(s2, None)
                     self._exchange_position_count = len(self._exchange_positions_cache)
                     
-                    # WAIT FOR CANDLE: After ANY close, block re-entry until next candle closes
-                    pair_info._wait_for_candle = True
-                    print(f"â¸ï¸ {s1}-{s2}: Re-entry blocked until next candle close (reason: {close_reason})")
+                    # WAIT FOR CANDLE: pair-local same-candle guard
+                    self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'hardware_close')
                     
                     # Update DB (includes close_pnl + market neutrality metrics)
                     if pair_info.db_id:
@@ -3071,7 +3267,7 @@ class PairsManager:
                             'entry_price1': 0,
                             'entry_price2': 0,
                             'close_time': int(time.time()),
-                            'close_pnl': total_pnl,
+                            'close_pnl': net_pnl,
                             'close_reason': close_reason or 'unknown',
                             'pnl1': pnl1,
                             'pnl2': pnl2,
@@ -3235,8 +3431,6 @@ class PairsManager:
                             pnl1 = (close_price1 - pair_info.entry_price1) * pair_info.qty1 * side1_dir
                             pnl2 = (close_price2 - pair_info.entry_price2) * pair_info.qty2 * side2_dir
                         total_pnl = pnl1 + pnl2
-                    
-                        pnl_emoji = "ðŸŸ¢" if total_pnl > 0 else "ðŸ”´"
 
 
                         # Calculate fees from recent trades (BEFORE trade record update)
@@ -3246,6 +3440,8 @@ class PairsManager:
                             _norm_fee2 = sum(float(t.get('commission', 0)) for t in trades_s2) if trades_s2 else 0.0
                         except Exception:
                             pass
+                        net_pnl = total_pnl - (_norm_fee1 + _norm_fee2)
+                        pnl_emoji = "ðŸŸ¢" if net_pnl > 0 else "ðŸ”´"
 
                         # Calculate real-time Z-score BEFORE DB update (was causing UnboundLocalError)
                         close_zscore = 0.0
@@ -3269,10 +3465,13 @@ class PairsManager:
                                 close_reason=close_reason or 'unknown',
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
-                                pnl=total_pnl,
+                                pnl=net_pnl,
                                 close_z=close_zscore if close_zscore else 0.0,
                                 fee1=_norm_fee1,
                                 fee2=_norm_fee2,
+                            )
+                            await self._persist_pair_executions(
+                                pair_info, trades_s1, trades_s2, phase='CLOSE', trade_id=pair_info.current_trade_id
                             )
                     
                         pair_info.current_trade_id = None
@@ -3364,8 +3563,9 @@ class PairsManager:
                         full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
                         full_msg += f"ðŸ“Š Z: {close_zscore:+.2f} | Î²: {close_beta:.3f} | p: {close_pval:.4f}\n"
                         full_msg += f"â³ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
-                        full_msg += f"ðŸ’µ PnL: {pnl_emoji} <b>{total_pnl:+.2f} USDT</b>\n"
-                        full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n\n"
+                        full_msg += f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                        full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
+                        full_msg += f"ðŸ’¸ Fees: {_norm_fee1 + _norm_fee2:.4f} USDT\n\n"
                         full_msg += f"ðŸ›¡ï¸ Order Cleanup:\n{cleanup_msg}"
                         
                         print(full_msg.replace('<b>', '').replace('</b>', ''))
@@ -3383,7 +3583,7 @@ class PairsManager:
                                 'entry_price1': 0,
                                 'entry_price2': 0,
                                 'close_time': int(time.time()),
-                                'close_pnl': total_pnl,
+                                'close_pnl': net_pnl,
                                 'close_reason': close_reason or 'unknown',
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
@@ -3399,10 +3599,9 @@ class PairsManager:
                         if close_reason in ('z_tp', 'hardware_tp'):
                             self._add_to_best_pairs(s1, s2)
                         
-                        # WAIT FOR CANDLE: After ANY close, block re-entry until next candle closes
-                        # The pair can only re-enter when _check_signals_for_active_pairs resets the flag
-                        pair_info._wait_for_candle = True
-                        print(f"â¸ï¸ {s1}-{s2}: Re-entry blocked until next candle close (reason: {close_reason})")
+                        # WAIT FOR CANDLE: re-entry block is ALWAYS pair-local.
+                        # Only this closed pair is blocked; other pairs may still open.
+                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'close')
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"ðŸ”„ Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -3429,7 +3628,7 @@ class PairsManager:
                         pair_info.entry_price2 = 0
                         pair_info.close_handled = True
                         pair_info.last_close_reason = close_reason or 'unknown'
-                        pair_info._wait_for_candle = True
+                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'close_error')
                         self._exchange_positions_cache.pop(s1, None)
                         self._exchange_positions_cache.pop(s2, None)
                         self._exchange_position_count = len(self._exchange_positions_cache)
@@ -4034,6 +4233,27 @@ class PairsManager:
                             entry_z=pair_info.entry_z_score,
                         )
                         pair_info.current_trade_id = await db.add_trade(trade)
+                        try:
+                            # Persist entry fills for post-trade order analytics.
+                            now_ms = int(time.time() * 1000)
+                            start_ms_open = now_ms - 180_000
+                            order_id_s1 = int(executed_orders[0].get('orderId')) if executed_orders and len(executed_orders) > 0 and executed_orders[0].get('orderId') is not None else None
+                            order_id_s2 = int(executed_orders[1].get('orderId')) if executed_orders and len(executed_orders) > 1 and executed_orders[1].get('orderId') is not None else None
+                            open_trades_s1 = await self.client.get_account_trades(symbol=s1, startTime=start_ms_open, limit=50)
+                            open_trades_s2 = await self.client.get_account_trades(symbol=s2, startTime=start_ms_open, limit=50)
+                            if order_id_s1 is not None:
+                                open_trades_s1 = [t for t in open_trades_s1 if int(t.get('orderId', -1)) == order_id_s1]
+                            if order_id_s2 is not None:
+                                open_trades_s2 = [t for t in open_trades_s2 if int(t.get('orderId', -1)) == order_id_s2]
+                            await self._persist_pair_executions(
+                                pair_info,
+                                open_trades_s1,
+                                open_trades_s2,
+                                phase='OPEN',
+                                trade_id=pair_info.current_trade_id
+                            )
+                        except Exception as fill_err:
+                            print(f"⚠️ Could not persist OPEN executions for {s1}-{s2}: {fill_err}")
                     except Exception as e:
                         print(f"Error creating trade record: {e}")
             
@@ -4153,7 +4373,7 @@ class PairsManager:
                 continue
             
             # Skip if pair is waiting for next candle close before re-entry
-            if getattr(pair_info, '_wait_for_candle', False):
+            if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
                 continue
             
             # Check if signal (between z_entry and z_entry_max)
@@ -4442,7 +4662,7 @@ class PairsManager:
                                             continue
                                         
                                         # Check if pair is waiting for next candle close
-                                        if getattr(pair_info, '_wait_for_candle', False):
+                                        if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
                                             continue
                                         
                                         direction = 1 if current_z < 0 else -1

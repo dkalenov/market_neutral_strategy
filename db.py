@@ -1,8 +1,4 @@
 import time
-import os
-import csv
-import gzip
-import shutil
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -59,6 +55,7 @@ class Pairs(Base):
     # Trade lifecycle
     open_time = Column(BigInteger, default=0)   # Unix timestamp
     close_time = Column(BigInteger, default=0)  # Unix timestamp
+    last_close_candle_ts = Column(BigInteger, default=0)  # Candle guard anchor (ms)
     close_pnl = Column(Float, default=0.0)      # Realized PnL
     close_reason = Column(String, default='')   # z_tp, z_sl, hw_sl, hw_tp, broken, manual, external
     fee1 = Column(Float, default=0.0)           # Fees leg 1
@@ -97,7 +94,33 @@ class Trades(Base):
     fee1 = Column(Float, default=0.0)           # Fees on leg 1
     fee2 = Column(Float, default=0.0)           # Fees on leg 2
     close_reason = Column(String, default='')   # Why trade was closed
-    
+
+
+class TradeExecutions(Base):
+    """
+    Per-fill execution log for post-trade analytics/auditing.
+    One row ~= one exchange trade fill (from get_account_trades).
+    """
+    __tablename__ = 'trade_executions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_id = Column(Integer, nullable=True)
+    pair_id = Column(Integer, nullable=True)
+    symbol = Column(String, nullable=False)
+    phase = Column(String, nullable=False)  # OPEN, CLOSE, EXTERNAL_CLOSE, DESYNC_CLOSE, etc.
+    side = Column(String, nullable=True)    # BUY / SELL
+    order_id = Column(BigInteger, nullable=True)
+    exchange_trade_id = Column(BigInteger, nullable=True)
+    price = Column(Float, default=0.0)
+    qty = Column(Float, default=0.0)
+    quote_qty = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+    commission = Column(Float, default=0.0)
+    commission_asset = Column(String, default='')
+    event_time = Column(BigInteger, default=0)  # exchange trade timestamp (ms)
+    is_buyer = Column(Boolean, default=False)
+    is_maker = Column(Boolean, default=False)
+    created_at = Column(BigInteger, default=0)  # bot insert timestamp (ms)
+
 
 # Helper class for configuration data
 class ConfigInfo:
@@ -153,18 +176,6 @@ class ConfigInfo:
     # Idle Pair Management
     max_idle_pairs: int     # Maximum idle pairs without positions (default 150)
     idle_timeout_hours: float  # Remove idle pairs older than X hours (default 48)
-    # Pair history retention monitoring (alerts only by default)
-    pair_history_retention_days: int        # Retention horizon in days (default 365)
-    pair_history_warn_days: int             # Warn when records are within this many days to retention (default 14)
-    pair_history_cleanup_enabled: bool      # Future switch for cleanup job (default False)
-    pair_history_check_interval_hours: int  # How often to check and alert (default 6)
-    # Pair history backup (2-file rotation: current + prev)
-    pair_history_backup_enabled: bool       # Enable periodic backup snapshots (default False)
-    pair_history_backup_interval_hours: int # Backup check interval (default 24)
-    pair_history_backup_dir: str            # Backup dir path (default 'market_neutral/backups')
-    # Full DB backup (manual/triggered)
-    db_backup_dir: str                      # Full DB backup dir path (default 'market_neutral/backups/db')
-    db_backup_max_copies: int               # Rotating backup copies (default 2)
     # Realtime markPrice load control
     markprice_max_symbols: int              # Max symbols in markPrice realtime subscription (default 120)
 
@@ -219,6 +230,7 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS tg_message_id INTEGER DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS open_time BIGINT DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_time BIGINT DEFAULT 0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS last_close_candle_ts BIGINT DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_pnl FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
@@ -250,12 +262,41 @@ async def run_migrations(engine):
         "ALTER TABLE pair_history DROP COLUMN IF EXISTS metric_value;",
         "ALTER TABLE pair_history DROP COLUMN IF EXISTS metric_threshold;",
         "ALTER TABLE pair_history DROP COLUMN IF EXISTS details;",
+        # Fill-level executions table for order analytics
+        """
+        CREATE TABLE IF NOT EXISTS trade_executions (
+            id SERIAL PRIMARY KEY,
+            trade_id INTEGER NULL,
+            pair_id INTEGER NULL,
+            symbol VARCHAR(32) NOT NULL,
+            phase VARCHAR(32) NOT NULL,
+            side VARCHAR(8) NULL,
+            order_id BIGINT NULL,
+            exchange_trade_id BIGINT NULL,
+            price FLOAT DEFAULT 0.0,
+            qty FLOAT DEFAULT 0.0,
+            quote_qty FLOAT DEFAULT 0.0,
+            realized_pnl FLOAT DEFAULT 0.0,
+            commission FLOAT DEFAULT 0.0,
+            commission_asset VARCHAR(16) DEFAULT '',
+            event_time BIGINT DEFAULT 0,
+            is_buyer BOOLEAN DEFAULT FALSE,
+            is_maker BOOLEAN DEFAULT FALSE,
+            created_at BIGINT DEFAULT 0
+        );
+        """,
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
         # Performance indexes (safe, idempotent)
         "CREATE INDEX IF NOT EXISTS idx_pairs_is_archived ON pairs (is_archived);",
         "CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);",
         "CREATE INDEX IF NOT EXISTS idx_trades_pair_id ON trades (pair_id);",
+        "CREATE INDEX IF NOT EXISTS idx_trade_exec_trade_id ON trade_executions (trade_id);",
+        "CREATE INDEX IF NOT EXISTS idx_trade_exec_pair_id ON trade_executions (pair_id);",
+        "CREATE INDEX IF NOT EXISTS idx_trade_exec_symbol_time ON trade_executions (symbol, event_time);",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_exec_unique_fill "
+        "ON trade_executions (COALESCE(trade_id, -1), symbol, phase, exchange_trade_id) "
+        "WHERE exchange_trade_id IS NOT NULL;",
         "CREATE INDEX IF NOT EXISTS idx_pair_history_ts ON pair_history (timestamp);",
         "CREATE INDEX IF NOT EXISTS idx_pair_history_event ON pair_history (event_type);",
         "CREATE INDEX IF NOT EXISTS idx_pair_history_symbols ON pair_history (symbol1, symbol2);",
@@ -272,8 +313,10 @@ async def run_migrations(engine):
             try:
                 await conn.execute(text(sql))
             except Exception as e:
-                # Column might already exist
-                pass
+                sql_head = sql.strip().split('\n', 1)[0]
+                if len(sql_head) > 120:
+                    sql_head = sql_head[:120] + "..."
+                print(f"⚠️ Migration skipped/failed: {sql_head} | {e}")
 
 
 async def load_config():
@@ -302,14 +345,6 @@ async def load_config():
             'circuit_breaker_pct': '0.50',
             'p_value_threshold': '0.05',
             'min_order_bump': '1.5',
-            # Hardware SL/TP Parameters (ATR-based) - values are decimal fractions
-            'sl_atr_mult': '2.5',
-            'sl_min_pct': '0.10',     # 10% min SL distance
-            'sl_max_pct': '0.30',     # 30% max SL distance
-            'tp_atr_mult': '4.0',
-            'tp_min_pct': '0.15',     # 15% min TP distance
-            'tp_max_pct': '0.50',     # 50% max TP distance
-            'circuit_breaker_pct': '0.50',
             # Position Management (Phase 2)
             'max_active_pairs': '5',
             'test_mode': 'false',
@@ -331,16 +366,6 @@ async def load_config():
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
-            # Pair history retention monitoring (alerts only; no auto-delete in this build)
-            'pair_history_retention_days': '365',
-            'pair_history_warn_days': '14',
-            'pair_history_cleanup_enabled': 'false',
-            'pair_history_check_interval_hours': '6',
-            'pair_history_backup_enabled': 'false',
-            'pair_history_backup_interval_hours': '24',
-            'pair_history_backup_dir': 'market_neutral/backups',
-            'db_backup_dir': 'market_neutral/backups/db',
-            'db_backup_max_copies': '2',
             'markprice_max_symbols': '120',
         }
 
@@ -363,7 +388,7 @@ async def load_config():
                         await s.execute(update(Config).where(Config.key == key).values(value=default_val))
                         await s.commit()
             except Exception as e:
-                pass
+                print(f"⚠️ Config default init failed for key '{key}': {e}")
         # Load all configuration from DB
         async with Session() as session:
             result = (await session.execute(select(Config))).scalars().all()
@@ -447,6 +472,19 @@ async def update_trade_fields(trade_id, **kwargs):
 # Updates pair by ID using dict of fields
 async def update_pair(data: dict):
     data = data.copy()
+    pos = data.get('position_status', None)
+    if pos == 0 and 'last_close_candle_ts' not in data:
+        close_time = data.get('close_time', int(time.time()))
+        try:
+            close_time = int(close_time)
+        except Exception:
+            close_time = int(time.time())
+        # Normalize to milliseconds for candle-boundary math in strategy layer.
+        data['last_close_candle_ts'] = close_time if close_time > 1_000_000_000_000 else close_time * 1000
+    elif pos is not None and pos != 0 and 'last_close_candle_ts' not in data:
+        # Opening/active state clears close-candle guard marker.
+        data['last_close_candle_ts'] = 0
+
     async with Session() as s:
         pair_id = data.pop('id')
         result = await s.execute(update(Pairs).where(Pairs.id == pair_id).values(**data))
@@ -587,150 +625,30 @@ async def close_trade_record(
     await update_trade_fields(trade_id, **data)
 
 
-async def count_pair_history_older_than_days(days: int) -> int:
-    """Count pair_history rows older than N days."""
-    days = max(1, int(days))
-    cutoff_ms = int((time.time() - days * 86400) * 1000)
+async def add_trade_executions(rows: list[dict]):
+    """
+    Bulk insert execution/fill rows. Best-effort (single transaction).
+    Expected row keys align with TradeExecutions model fields.
+    """
+    if not rows:
+        return
+    now_ms = int(time.time() * 1000)
+    objects = []
+    for row in rows:
+        data = dict(row)
+        if 'created_at' not in data or data['created_at'] is None:
+            data['created_at'] = now_ms
+        objects.append(TradeExecutions(**data))
     async with Session() as s:
-        result = await s.execute(
-            select(func.count()).select_from(PairHistory).where(PairHistory.timestamp < cutoff_ms)
-        )
-        return int(result.scalar() or 0)
-
-
-async def count_pair_history_age_between_days(min_days: int, max_days: int) -> int:
-    """
-    Count pair_history rows with age in [min_days, max_days).
-    Useful for "warning window" alerts before retention boundary.
-    """
-    min_days = max(0, int(min_days))
-    max_days = max(min_days + 1, int(max_days))
-    now = time.time()
-    newer_than_ms = int((now - min_days * 86400) * 1000)
-    older_than_ms = int((now - max_days * 86400) * 1000)
-    async with Session() as s:
-        result = await s.execute(
-            select(func.count())
-            .select_from(PairHistory)
-            .where(PairHistory.timestamp < newer_than_ms)
-            .where(PairHistory.timestamp >= older_than_ms)
-        )
-        return int(result.scalar() or 0)
-
-
-async def fetch_pair_history_batch_before_ts(cutoff_ms: int, last_id: int = 0, limit: int = 5000):
-    """
-    Fetch pair_history rows in ascending id batches where timestamp < cutoff_ms.
-    Returns list[PairHistory].
-    """
-    cutoff_ms = int(cutoff_ms)
-    last_id = int(last_id or 0)
-    limit = max(1, int(limit))
-    async with Session() as s:
-        result = await s.execute(
-            select(PairHistory)
-            .where(PairHistory.timestamp < cutoff_ms)
-            .where(PairHistory.id > last_id)
-            .order_by(PairHistory.id.asc())
-            .limit(limit)
-        )
-        return result.scalars().all()
-
-
-def _resolve_backup_dir(path_value: str) -> str:
-    path_value = (path_value or '').strip() or 'market_neutral/backups/db'
-    if os.path.isabs(path_value):
-        return path_value
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = os.path.dirname(script_dir)
-    return os.path.join(root_dir, path_value)
-
-
-async def _dump_table_csv_gz(table_name: str, model, target_dir: str, batch_size: int = 5000) -> int:
-    columns = [c.name for c in model.__table__.columns]
-    out_path = os.path.join(target_dir, f"{table_name}.csv.gz")
-    written = 0
-
-    with gzip.open(out_path, mode='wt', encoding='utf-8', newline='') as gz:
-        writer = csv.writer(gz)
-        writer.writerow(columns)
-
-        has_int_id = hasattr(model, 'id')
-        if has_int_id:
-            last_id = 0
-            while True:
-                async with Session() as s:
-                    result = await s.execute(
-                        select(model)
-                        .where(getattr(model, 'id') > last_id)
-                        .order_by(getattr(model, 'id').asc())
-                        .limit(batch_size)
-                    )
-                    rows = result.scalars().all()
-                if not rows:
-                    break
-                for row in rows:
-                    writer.writerow([getattr(row, col) for col in columns])
-                    written += 1
-                    last_id = getattr(row, 'id')
-                if len(rows) < batch_size:
-                    break
-        else:
-            async with Session() as s:
-                result = await s.execute(select(model))
-                rows = result.scalars().all()
-            for row in rows:
-                writer.writerow([getattr(row, col) for col in columns])
-                written += 1
-
-    return written
-
-
-async def backup_all_tables_rotating(backup_dir: str, max_copies: int = 2) -> dict:
-    """
-    Full DB backup for bot tables with simple rotation.
-    Creates:
-      - db_backup_current/<table>.csv.gz
-      - db_backup_prev/<table>.csv.gz   (if max_copies >= 2)
-    """
-    backup_root = _resolve_backup_dir(backup_dir)
-    os.makedirs(backup_root, exist_ok=True)
-
-    new_dir = os.path.join(backup_root, 'db_backup_new')
-    current_dir = os.path.join(backup_root, 'db_backup_current')
-    prev_dir = os.path.join(backup_root, 'db_backup_prev')
-
-    if os.path.exists(new_dir):
-        shutil.rmtree(new_dir, ignore_errors=True)
-    os.makedirs(new_dir, exist_ok=True)
-
-    table_map = {
-        'config': Config,
-        'pair_history': PairHistory,
-        'pairs': Pairs,
-        'trades': Trades,
-    }
-
-    counts = {}
-    for table_name, model in table_map.items():
-        counts[table_name] = await _dump_table_csv_gz(table_name, model, new_dir, batch_size=5000)
-
-    if max_copies >= 2:
-        if os.path.exists(prev_dir):
-            shutil.rmtree(prev_dir, ignore_errors=True)
-        if os.path.exists(current_dir):
-            shutil.move(current_dir, prev_dir)
-    else:
-        if os.path.exists(current_dir):
-            shutil.rmtree(current_dir, ignore_errors=True)
-
-    shutil.move(new_dir, current_dir)
-
-    total_rows = sum(counts.values())
-    return {
-        'backup_root': backup_root,
-        'current_dir': current_dir,
-        'prev_dir': prev_dir if max_copies >= 2 and os.path.exists(prev_dir) else '',
-        'counts': counts,
-        'total_rows': total_rows,
-    }
+        s.add_all(objects)
+        try:
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            # Fallback: insert one by one, skipping duplicates.
+            for obj in objects:
+                try:
+                    s.add(obj)
+                    await s.commit()
+                except IntegrityError:
+                    await s.rollback()

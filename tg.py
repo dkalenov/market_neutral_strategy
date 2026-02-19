@@ -18,7 +18,6 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 bot: Bot = None  # Will be initialized in run()
 dp = Dispatcher()
 close_ops_lock = asyncio.Lock()
-backup_ops_lock = asyncio.Lock()
 
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -376,18 +375,12 @@ async def settings(message: Message, state: FSMContext):
         [InlineKeyboardButton(text=f"🔄 Trading: {'ON ✅' if trade_mode else 'OFF ❌'}", callback_data="toggle_trade_mode")],
         [InlineKeyboardButton(text="Strategy Settings", callback_data="strategy_settings")],
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
-        [InlineKeyboardButton(text="💾 Backup DB Now", callback_data="backup_db_now")],
-        [InlineKeyboardButton(text="📁 Show Backup Path", callback_data="show_backup_path")],
-        [InlineKeyboardButton(text="✏️ Set Backup Path", callback_data="set_backup_path")],
         [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
         [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
         [InlineKeyboardButton(text="Restart Bot", callback_data="restart")]
     ])
-    # Format message
-    api_key = f"{conf.api_key[:4]}...{conf.api_key[-4:]}" if conf.api_key else "Missing"
-    tg_token = f"{conf.tg_token[:10]}..." if conf.tg_token else "Missing"
-    
+    # Secrets are loaded from .env, not from DB.
     tf = conf.timeframe if conf.timeframe else "1h (default)"
     win = conf.window_size if conf.window_size else "200 (default)"
     
@@ -400,8 +393,7 @@ async def settings(message: Message, state: FSMContext):
     z_out = conf.z_stop if conf.z_stop else "4.0 (default)"
 
     text = (f"<b>Basic Settings:</b>\n"
-            f"API KEY: <b>{api_key}</b>\n"
-            f"TG_TOKEN: <b>{tg_token}</b>\n\n"
+            f"Secrets source: <b>.env file</b>\n\n"
             f"<b>Strategy Parameters:</b>\n"
             f"Timeframe: <b>{tf}</b>\n"
             f"Window: <b>{win}</b>\n\n"
@@ -419,14 +411,17 @@ async def settings(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "strategy_settings")
 async def strategy_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
+    tf = getattr(conf, 'timeframe', None) or '1h'
+    win = getattr(conf, 'window_size', None)
+    win_txt = str(win) if win not in (None, '', 'none', 'None') else 'auto'
     hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
     hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
     hedge_min = getattr(conf, 'hedge_min', 0.3) or 0.3
     hedge_max = getattr(conf, 'hedge_max', 3.0) or 3.0
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Set Timeframe", callback_data="set_timeframe")],
-        [InlineKeyboardButton(text="Set Window Size", callback_data="set_window")],
+        [InlineKeyboardButton(text=f"⏱️ Timeframe: {tf}", callback_data="set_timeframe")],
+        [InlineKeyboardButton(text=f"🪟 Window Size: {win_txt}", callback_data="set_window")],
         [InlineKeyboardButton(text=f"⏱️ Half-Life: {hl_min}-{hl_max} days", callback_data="set_half_life")],
         [InlineKeyboardButton(text=f"⚖️ Hedge Bounds: {hedge_min}-{hedge_max}", callback_data="set_hedge_bounds")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
@@ -481,21 +476,42 @@ async def set_hedge_bounds(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "risk_settings")
 async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
+    capital = getattr(conf, 'capital', 1000) or 1000
+    leverage = getattr(conf, 'leverage', 20) or 20
+    max_notional = getattr(conf, 'max_notional_pct', 0.1) or 0.1
+    z_entry = getattr(conf, 'z_entry', 1.9) or 1.9
+    z_entry_max = getattr(conf, 'z_entry_max', 2.5) or 2.5
+    z_exit = getattr(conf, 'z_exit', 0.0)
+    if z_exit is None:
+        z_exit = 0.0
+    z_stop = getattr(conf, 'z_stop', 4.0) or 4.0
     max_pairs = getattr(conf, 'max_active_pairs', 5) or 5
     max_symbols = getattr(conf, 'max_symbols', 150) or 150
     max_idle = getattr(conf, 'max_idle_pairs', 150) or 150
     idle_timeout = getattr(conf, 'idle_timeout_hours', 48) or 48
+    beta_threshold = getattr(conf, 'beta_threshold', 0.11) or 0.11
+    beta_alert_threshold = getattr(conf, 'beta_alert_threshold', 0.15) or 0.15
+    beta_critical = getattr(conf, 'beta_critical', 1.0) or 1.0
+    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
+    p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
+    bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Capital (USDT)", callback_data="set_capital")],
-        [InlineKeyboardButton(text="Leverage (x)", callback_data="set_leverage")],
-        [InlineKeyboardButton(text="Max % Per Pair", callback_data="set_max_notional")],
-        [InlineKeyboardButton(text="Z-Entry", callback_data="set_z_entry")],
-        [InlineKeyboardButton(text="Z-Entry Max", callback_data="set_z_entry_max")],
-        [InlineKeyboardButton(text="Z-Exit", callback_data="set_z_exit")],
-        [InlineKeyboardButton(text="Z-Stop", callback_data="set_z_stop")],
-        [InlineKeyboardButton(text="🛡️ Hardware SL/TP", callback_data="hardware_sltp")],
+        [InlineKeyboardButton(text=f"💵 Capital: {capital} USDT", callback_data="set_capital")],
+        [InlineKeyboardButton(text=f"🧮 Leverage: x{leverage}", callback_data="set_leverage")],
+        [InlineKeyboardButton(text=f"📦 Max/Pair: {max_notional*100:.1f}%", callback_data="set_max_notional")],
+        [InlineKeyboardButton(text=f"📐 Z-Entry: {z_entry}", callback_data="set_z_entry")],
+        [InlineKeyboardButton(text=f"📏 Z-Entry Max: {z_entry_max}", callback_data="set_z_entry_max")],
+        [InlineKeyboardButton(text=f"🎯 Z-Exit: {z_exit}", callback_data="set_z_exit")],
+        [InlineKeyboardButton(text=f"🛑 Z-Stop: {z_stop}", callback_data="set_z_stop")],
+        [InlineKeyboardButton(text="🛡️ Hardware SL/TP: open", callback_data="hardware_sltp")],
         [InlineKeyboardButton(text=f"📊 Max Pairs: {max_pairs}", callback_data="set_max_pairs")],
+        [InlineKeyboardButton(text=f"β Entry Filter: {beta_threshold}", callback_data="set_beta_threshold")],
+        [InlineKeyboardButton(text=f"β Alert: {beta_alert_threshold}", callback_data="set_beta_alert_threshold"),
+         InlineKeyboardButton(text=f"β Critical: {beta_critical}", callback_data="set_beta_critical_risk")],
+        [InlineKeyboardButton(text=f"🚨 Circuit Breaker: {cb_pct*100:.0f}% notional", callback_data="set_circuit_breaker")],
+        [InlineKeyboardButton(text=f"🧪 P-Value Threshold: {p_val}", callback_data="set_p_value")],
+        [InlineKeyboardButton(text=f"📏 Min Order Bump: {bump}x", callback_data="set_min_bump")],
         [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
         [InlineKeyboardButton(text=f"🗑️ Max Idle: {max_idle}", callback_data="set_max_idle"),
          InlineKeyboardButton(text=f"⏰ Timeout: {idle_timeout}h", callback_data="set_idle_timeout")],
@@ -505,6 +521,8 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
                            "<b>Capital</b>: Your purchasing power.\n"
                            "<b>Hardware SL/TP</b>: ATR-based stop orders.\n"
                            f"<b>Max Pairs</b>: {max_pairs} concurrent trades.\n"
+                           f"<b>β Entry Filter</b>: reject idle pairs if |β| >= {beta_threshold}\n"
+                           f"<b>β Alert/Critical</b>: {beta_alert_threshold} / {beta_critical}\n"
                            f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.\n\n"
                            f"<b>Idle Pair Cleanup:</b>\n"
                            f"  • Max idle pairs: {max_idle}\n"
@@ -557,6 +575,24 @@ async def set_max_pairs_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_active_pairs")
     await answer(callback, "Enter maximum number of concurrent pairs (e.g., 5):")
+
+@dp.callback_query(F.data == "set_beta_threshold")
+async def set_beta_threshold_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="beta_threshold")
+    await answer(callback, "Enter beta entry filter (reject idle pairs if |β| >= value), e.g., 0.11:")
+
+@dp.callback_query(F.data == "set_beta_alert_threshold")
+async def set_beta_alert_threshold_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="beta_alert_threshold")
+    await answer(callback, "Enter beta alert threshold (warn/auto-close logic trigger), e.g., 0.15:")
+
+@dp.callback_query(F.data == "set_beta_critical_risk")
+async def set_beta_critical_risk_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="beta_critical")
+    await answer(callback, "Enter beta critical threshold (force-close if |β| >= value), e.g., 1.0:")
 
 @dp.callback_query(F.data == "set_max_symbols")
 async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
@@ -629,10 +665,6 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
     tp_atr = getattr(conf, 'tp_atr_mult', 4.0) or 4.0
     tp_min = getattr(conf, 'tp_min_pct', 0.15) or 0.15
     tp_max = getattr(conf, 'tp_max_pct', 0.50) or 0.50
-    cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
-    p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
-    bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
-    beta_crit = getattr(conf, 'beta_critical', 1.0) or 1.0
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"SL ATR Mult: {sl_atr}", callback_data="set_sl_atr")],
@@ -641,10 +673,6 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"TP ATR Mult: {tp_atr}", callback_data="set_tp_atr")],
         [InlineKeyboardButton(text=f"TP Min: {tp_min*100:.0f}%", callback_data="set_tp_min"),
          InlineKeyboardButton(text=f"TP Max: {tp_max*100:.0f}%", callback_data="set_tp_max")],
-        [InlineKeyboardButton(text=f"Circuit Breaker: {cb_pct*100:.0f}% notional", callback_data="set_circuit_breaker")],
-        [InlineKeyboardButton(text=f"P-Value Threshold: {p_val}", callback_data="set_p_value")],
-        [InlineKeyboardButton(text=f"Min Order Bump: {bump}x", callback_data="set_min_bump")],
-        [InlineKeyboardButton(text=f"⚠️ Beta Critical: {beta_crit}", callback_data="set_beta_critical")],
         [InlineKeyboardButton(text="Back", callback_data="risk_settings")]
     ])
     await answer(callback, "🛡️ <b>Hardware SL/TP Settings</b>\n\n"
@@ -653,10 +681,7 @@ async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
                            f"  Range: {sl_min*100:.0f}% - {sl_max*100:.0f}%\n\n"
                            "<b>Take-Profit (ATR-based):</b>\n"
                            f"  ATR Multiplier: {tp_atr}x\n"
-                           f"  Range: {tp_min*100:.0f}% - {tp_max*100:.0f}%\n\n"
-                           f"<b>Circuit Breaker:</b> {cb_pct*100:.0f}% of margin (={cb_pct/(conf.leverage or 20)*100:.1f}% notional at {conf.leverage or 20}x)\n"
-                           f"<b>Min Order Bump:</b> {bump}x max increase\n"
-                           f"<b>Beta Critical:</b> {beta_crit} (force-close if |β| ≥ this)", reply_markup=keyboard)
+                           f"  Range: {tp_min*100:.0f}% - {tp_max*100:.0f}%", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_sl_atr")
 async def set_sl_atr_cb(callback: CallbackQuery, state: FSMContext):
@@ -696,7 +721,7 @@ async def set_tp_max_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "set_circuit_breaker")
 async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.hardware_sltp)
+    await state.set_state(States.settings)
     await state.update_data(waiting_for="circuit_breaker_pct")
     conf = await db.load_config()
     lev = conf.leverage if conf.leverage else 20
@@ -710,13 +735,13 @@ async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "set_p_value")
 async def set_p_value_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.hardware_sltp)
+    await state.set_state(States.settings)
     await state.update_data(waiting_for="p_value_threshold")
     await answer(callback, "Enter P-Value threshold (e.g., 0.05). Pair closes if p-value > this:")
 
 @dp.callback_query(F.data == "set_min_bump")
 async def set_min_bump_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.hardware_sltp)
+    await state.set_state(States.settings)
     await state.update_data(waiting_for="min_order_bump")
     await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
 
@@ -841,6 +866,54 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(max_active_pairs=val)
             await answer(message, f"Max Active Pairs: <b>{val}</b>")
+
+        elif waiting_for == "beta_threshold":
+            val = float(value)
+            if val <= 0 or val > 5:
+                await answer(message, "Value must be between 0 and 5.")
+                return
+            await db.config_update(beta_threshold=val)
+            await answer(message, f"β Entry Filter: <b>{val}</b>")
+
+        elif waiting_for == "beta_alert_threshold":
+            val = float(value)
+            if val <= 0 or val > 5:
+                await answer(message, "Value must be between 0 and 5.")
+                return
+            await db.config_update(beta_alert_threshold=val)
+            await answer(message, f"β Alert Threshold: <b>{val}</b>")
+
+        elif waiting_for == "beta_critical":
+            val = float(value)
+            if val <= 0 or val > 10:
+                await answer(message, "Value must be between 0 and 10.")
+                return
+            await db.config_update(beta_critical=val)
+            await answer(message, f"β Critical: <b>{val}</b>")
+
+        elif waiting_for == "circuit_breaker_pct":
+            val = float(value)
+            if val <= 0 or val > 1:
+                await answer(message, "Value must be between 0 and 1 (e.g., 0.20).")
+                return
+            await db.config_update(circuit_breaker_pct=val)
+            await answer(message, f"Circuit Breaker: <b>{val*100:.1f}% notional</b>")
+
+        elif waiting_for == "p_value_threshold":
+            val = float(value)
+            if val <= 0 or val >= 1:
+                await answer(message, "Value must be between 0 and 1 (e.g., 0.05).")
+                return
+            await db.config_update(p_value_threshold=val)
+            await answer(message, f"P-Value Threshold: <b>{val}</b>")
+
+        elif waiting_for == "min_order_bump":
+            val = float(value)
+            if val < 1 or val > 10:
+                await answer(message, "Value must be between 1 and 10.")
+                return
+            await db.config_update(min_order_bump=val)
+            await answer(message, f"Min Order Bump: <b>{val}x</b>")
             
         elif waiting_for == "half_life":
             # Parse "min-max" format
@@ -894,14 +967,10 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             await db.config_update(idle_timeout_hours=val)
             await answer(message, f"⏰ Idle Timeout: <b>{val}h</b>")
 
-        elif waiting_for == "db_backup_dir":
-            path_val = value.strip()
-            if len(path_val) < 3:
-                await answer(message, "Path is too short.")
-                return
-            await db.config_update(db_backup_dir=path_val)
-            await answer(message, f"💾 Backup path set to:\n<code>{path_val}</code>")
-            
+        # Apply runtime config update immediately where possible.
+        if pairs_manager and hasattr(pairs_manager, 'config'):
+            pairs_manager.config = await db.load_config()
+
         await answer(message, "<b>IMPORTANT:</b> Restart the bot to apply some settings.")
 
     except ValueError:
@@ -915,70 +984,21 @@ async def process_strategy_settings(message: Message, state: FSMContext):
 # Change keys
 @dp.callback_query(States.settings, F.data == "change_keys")
 async def change_keys(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.change_keys)
-    await state.update_data({})
     await safe_callback_answer(callback)
-    await callback.message.answer("Enter API KEY (or 'skip' to skip):")
+    await callback.message.answer(
+        "Secrets are managed via <code>market_neutral/.env</code> only.\n"
+        "DB-based key edits are disabled for safety.\n\n"
+        "Update .env and restart the bot."
+    )
+    await settings(callback, state)
 
 @dp.message(States.change_keys)
 async def change_keys_value(message: Message, state: FSMContext):
-    if await route_menu_button(message, state):
-        return
-
-    data = await state.get_data()
-    
-    if 'api_key' not in data:
-        if message.text.lower() != 'skip':
-            await state.update_data(api_key=message.text)
-        else:
-            await state.update_data(api_key=None)
-        await answer(message, "Enter SECRET KEY (or 'skip' to skip):")
-        await message.delete()
-        return
-    
-    if 'api_secret' not in data:
-        if message.text.lower() != 'skip':
-            await state.update_data(api_secret=message.text)
-        else:
-            await state.update_data(api_secret=None)
-        await answer(message, "Enter TG TOKEN (or 'skip' to skip):")
-        await message.delete()
-        return
-
-    if 'tg_token' not in data:
-        if message.text.lower() != 'skip':
-            await state.update_data(tg_token=message.text)
-        else:
-            await state.update_data(tg_token=None)
-        await answer(message, "Enter TG ADMINS (comma separated, or 'skip' to skip):")
-        await message.delete()
-        return
-    
-    if 'tg_admins' not in data:
-        if message.text.lower() != 'skip':
-            await state.update_data(tg_admins=message.text)
-        else:
-            await state.update_data(tg_admins=None)
-        await answer(message, "Enter TG CHANNEL ID for trade notifications (or 'skip' to skip):")
-        await message.delete()
-        return
-    
-    if 'tg_channel' not in data:
-        if message.text.lower() != 'skip':
-            await state.update_data(tg_channel=message.text)
-        else:
-            await state.update_data(tg_channel=None)
-        
-        new_conf = await state.get_data()
-        update_data = {k: v for k, v in new_conf.items() if v is not None}
-        
-        if update_data:
-            await db.config_update(**update_data)
-            await answer(message, "Keys and tokens changed successfully. Restarting bot.")
-            await restart_yes(message, state)
-        else:
-            await answer(message, "No changes made.")
-            await settings(message, state)
+    await answer(
+        message,
+        "DB key editing is disabled. Update <code>market_neutral/.env</code> and restart."
+    )
+    await settings(message, state)
 
 
 @dp.callback_query(F.data == "restart")
@@ -997,79 +1017,6 @@ async def restart_yes(callback: CallbackQuery | Message, state: FSMContext):
         await answer(callback, 'Restarting...')
     finally:
         os._exit(0)
-
-
-@dp.callback_query(F.data == "backup_db_now")
-async def backup_db_now(callback: CallbackQuery, state: FSMContext):
-    await safe_callback_answer(callback, "Starting DB backup...")
-    await callback.message.answer("💾 Starting full DB backup in background...")
-    chat_id = callback.message.chat.id
-
-    async def _backup_task():
-        async with backup_ops_lock:
-            try:
-                conf = await db.load_config()
-                backup_dir = getattr(conf, 'db_backup_dir', 'market_neutral/backups/db') or 'market_neutral/backups/db'
-                max_copies = int(getattr(conf, 'db_backup_max_copies', 2) or 2)
-                max_copies = max(1, min(max_copies, 2))
-
-                result = await db.backup_all_tables_rotating(
-                    backup_dir=backup_dir,
-                    max_copies=max_copies,
-                )
-                counts = result.get('counts', {})
-                msg = (
-                    "✅ <b>DB Backup Completed</b>\n\n"
-                    f"Total rows: <b>{result.get('total_rows', 0)}</b>\n"
-                    f"config: <b>{counts.get('config', 0)}</b>\n"
-                    f"pair_history: <b>{counts.get('pair_history', 0)}</b>\n"
-                    f"pairs: <b>{counts.get('pairs', 0)}</b>\n"
-                    f"trades: <b>{counts.get('trades', 0)}</b>\n\n"
-                    f"Current: <code>{result.get('current_dir', '')}</code>\n"
-                    f"Prev: <code>{result.get('prev_dir', '') or 'not available yet'}</code>"
-                )
-                await bot.send_message(chat_id, msg)
-            except Exception as e:
-                await bot.send_message(chat_id, f"❌ DB backup failed: {e}")
-
-    asyncio.create_task(_backup_task())
-
-
-@dp.callback_query(F.data == "show_backup_path")
-async def show_backup_path(callback: CallbackQuery, state: FSMContext):
-    conf = await db.load_config()
-    raw_path = getattr(conf, 'db_backup_dir', 'market_neutral/backups/db') or 'market_neutral/backups/db'
-    if os.path.isabs(raw_path):
-        abs_path = raw_path
-    else:
-        root_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.dirname(root_dir)
-        abs_path = os.path.abspath(os.path.join(root_dir, raw_path))
-
-    max_copies = int(getattr(conf, 'db_backup_max_copies', 2) or 2)
-    msg = (
-        "📁 <b>Backup Path</b>\n\n"
-        f"Configured: <code>{raw_path}</code>\n"
-        f"Resolved: <code>{abs_path}</code>\n"
-        f"Copies: <b>{max_copies}</b> (rotation current/prev)\n\n"
-        "Tip: for Google Drive mount, set mounted folder path here."
-    )
-    await safe_callback_answer(callback)
-    await callback.message.answer(msg)
-
-
-@dp.callback_query(F.data == "set_backup_path")
-async def set_backup_path(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="db_backup_dir")
-    await safe_callback_answer(callback)
-    await callback.message.answer(
-        "✏️ Enter new backup path.\n"
-        "Examples:\n"
-        "<code>market_neutral/backups/db</code>\n"
-        "<code>D:\\Backups\\market_neutral</code>\n"
-        "<code>/mnt/gdrive/market_neutral</code>"
-    )
 
 
 # --- Blacklist Management ---

@@ -6,9 +6,6 @@ import time as time_mod
 import math
 import sys
 import builtins
-import csv
-import gzip
-import shutil
 from collections import deque
 import aiohttp
 from urllib.parse import urlsplit, parse_qs
@@ -23,7 +20,6 @@ import tg
 client: binance.Futures
 
 all_symbols: dict[str, binance.SymbolFutures] = {}
-positions = {}
 websockets_list: list[binance.futures.WebsocketAsync] = []
 userdata_ws: binance.futures.WebsocketAsync
 pairs_manager: pairs_trading.PairsManager
@@ -36,9 +32,7 @@ untracked_close_alerts: dict[str, float] = {}
 # Short-lived suppression for symbols that were just handled by pair close logic.
 # Prevents false "UNTRACKED POSITION CLOSED" on the next ACCOUNT_UPDATE tick.
 recently_handled_close_symbols: dict[str, float] = {}
-_pair_history_last_alert_key: str = ''
 _orig_print = builtins.print
-_pair_history_last_backup_key: str = ''
 _main_timeframe_global: str = '1h'
 
 # WS health/watchdog state
@@ -163,6 +157,45 @@ async def send_tg_notification(message, reply_to_message_id=None, reply_markup=N
         print("âš ï¸ TG: no channel or admins configured")
     
     return msg_id
+
+
+async def _persist_pair_executions_main(pair_info, trades1, trades2, phase: str):
+    """Persist fill-level executions for closure paths handled in main.py."""
+    if not pair_info:
+        return
+    rows = []
+    trade_id = getattr(pair_info, 'current_trade_id', None)
+    pair_id = getattr(pair_info, 'db_id', None)
+    now_ms = int(time_mod.time() * 1000)
+    for symbol, trades in ((pair_info.symbol1, trades1), (pair_info.symbol2, trades2)):
+        for t in trades or []:
+            try:
+                rows.append({
+                    'trade_id': trade_id,
+                    'pair_id': pair_id,
+                    'symbol': symbol,
+                    'phase': phase,
+                    'side': t.get('side') or t.get('S'),
+                    'order_id': int(t.get('orderId')) if t.get('orderId') is not None else None,
+                    'exchange_trade_id': int(t.get('id')) if t.get('id') is not None else None,
+                    'price': float(t.get('price', 0) or 0),
+                    'qty': float(t.get('qty', 0) or t.get('executedQty', 0) or 0),
+                    'quote_qty': float(t.get('quoteQty', 0) or 0),
+                    'realized_pnl': float(t.get('realizedPnl', 0) or 0),
+                    'commission': float(t.get('commission', 0) or 0),
+                    'commission_asset': str(t.get('commissionAsset', '') or ''),
+                    'event_time': int(t.get('time', 0) or t.get('T', 0) or 0),
+                    'is_buyer': bool(t.get('buyer', False)),
+                    'is_maker': bool(t.get('maker', False)),
+                    'created_at': now_ms,
+                })
+            except Exception:
+                continue
+    if rows:
+        try:
+            await db.add_trade_executions(rows)
+        except Exception as e:
+            print(f"⚠️ Could not persist executions [{phase}] for {pair_info.symbol1}-{pair_info.symbol2}: {e}")
 
 
 async def main():
@@ -362,7 +395,6 @@ async def main():
 
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
-    loop.create_task(pair_history_retention_notice_loop())
     loop.create_task(sync_exchange_time_loop())
     loop.create_task(ws_health_watchdog_loop())
     
@@ -556,157 +588,6 @@ async def ws_health_watchdog_loop():
             break
         except Exception as e:
             print(f"⚠️ WS watchdog loop error: {e}")
-
-
-def _to_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
-
-
-async def pair_history_retention_notice_loop():
-    """
-    Non-destructive retention monitor:
-    - sends TG reminder when pair_history rows are close to retention threshold
-    - sends TG warning when rows are already older than retention horizon
-    No deletion is performed here.
-    """
-    global _pair_history_last_alert_key
-    global _pair_history_last_backup_key
-    while True:
-        sleep_sec = 6 * 3600
-        try:
-            conf = await db.load_config()
-            retention_days = int(getattr(conf, 'pair_history_retention_days', 365) or 365)
-            warn_days = int(getattr(conf, 'pair_history_warn_days', 14) or 14)
-            warn_days = max(1, min(warn_days, retention_days))
-            cleanup_enabled = _to_bool(getattr(conf, 'pair_history_cleanup_enabled', False))
-            interval_h = int(getattr(conf, 'pair_history_check_interval_hours', 6) or 6)
-            sleep_sec = max(1, interval_h) * 3600
-
-            old_count = await db.count_pair_history_older_than_days(retention_days)
-            warn_from = max(1, retention_days - warn_days)
-            near_count = await db.count_pair_history_age_between_days(warn_from, retention_days)
-
-            alert_kind = ''
-            if old_count > 0:
-                alert_kind = f'over:{retention_days}:{old_count}:{int(cleanup_enabled)}'
-                msg = (
-                    f"📦 <b>DB Retention Notice</b>\n\n"
-                    f"Table: <b>pair_history</b>\n"
-                    f"Older than retention ({retention_days}d): <b>{old_count}</b> rows\n"
-                    f"Cleanup enabled: <b>{'YES' if cleanup_enabled else 'NO'}</b>\n\n"
-                    f"Recommendation: export/backup data before enabling cleanup."
-                )
-            elif near_count > 0:
-                alert_kind = f'near:{warn_from}-{retention_days}:{near_count}:{int(cleanup_enabled)}'
-                msg = (
-                    f"📦 <b>DB Retention Warning</b>\n\n"
-                    f"Table: <b>pair_history</b>\n"
-                    f"Will reach retention in ≤ {warn_days} days: <b>{near_count}</b> rows\n"
-                    f"Retention horizon: <b>{retention_days} days</b>\n"
-                    f"Cleanup enabled: <b>{'YES' if cleanup_enabled else 'NO'}</b>\n\n"
-                    f"Recommendation: export/backup data on server."
-                )
-            else:
-                msg = ''
-
-            # Send at most once per UTC day per alert snapshot
-            if msg:
-                day_key = time_mod.strftime('%Y-%m-%d', time_mod.gmtime())
-                key = f"{day_key}:{alert_kind}"
-                if key != _pair_history_last_alert_key:
-                    await send_tg_notification(msg)
-                    _pair_history_last_alert_key = key
-
-            # Optional 2-slot rotating backup (current/prev), non-destructive.
-            backup_enabled = _to_bool(getattr(conf, 'pair_history_backup_enabled', False))
-            if backup_enabled and (old_count > 0 or near_count > 0):
-                backup_interval_h = int(getattr(conf, 'pair_history_backup_interval_hours', 24) or 24)
-                backup_day_key = time_mod.strftime('%Y-%m-%d', time_mod.gmtime())
-                backup_key = f"{backup_day_key}:{backup_interval_h}:{retention_days}:{warn_days}"
-                if backup_key != _pair_history_last_backup_key:
-                    cutoff_days = max(1, retention_days - warn_days)
-                    backup_rows, backup_path = await _backup_pair_history_rotating(conf, cutoff_days=cutoff_days)
-                    if backup_rows > 0:
-                        await send_tg_notification(
-                            f"💾 <b>pair_history backup done</b>\n\n"
-                            f"Rows exported: <b>{backup_rows}</b>\n"
-                            f"Age filter: older than <b>{cutoff_days}</b> days\n"
-                            f"File: <code>{backup_path}</code>\n"
-                            f"Rotation: current + prev"
-                        )
-                    _pair_history_last_backup_key = backup_key
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"⚠️ Retention monitor error: {e}")
-        await asyncio.sleep(sleep_sec)
-
-
-async def _backup_pair_history_rotating(conf, cutoff_days: int = 351):
-    """
-    Export old pair_history rows into a rotating 2-file backup set:
-    - pair_history_backup_current.csv.gz
-    - pair_history_backup_prev.csv.gz
-    """
-    cutoff_days = max(1, int(cutoff_days))
-    cutoff_ms = int((time_mod.time() - cutoff_days * 86400) * 1000)
-
-    backup_dir = getattr(conf, 'pair_history_backup_dir', 'market_neutral/backups') or 'market_neutral/backups'
-    if not os.path.isabs(backup_dir):
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        backup_dir = os.path.join(root_dir, backup_dir)
-    os.makedirs(backup_dir, exist_ok=True)
-
-    new_path = os.path.join(backup_dir, 'pair_history_backup_new.csv.gz')
-    current_path = os.path.join(backup_dir, 'pair_history_backup_current.csv.gz')
-    prev_path = os.path.join(backup_dir, 'pair_history_backup_prev.csv.gz')
-
-    written = 0
-    last_id = 0
-    with gzip.open(new_path, mode='wt', encoding='utf-8', newline='') as gz:
-        writer = csv.writer(gz)
-        writer.writerow([
-            'id', 'symbol1', 'symbol2', 'event_type', 'timestamp',
-            'hedge_ratio', 'half_life', 'pair_id', 'trade_id',
-            'z_score', 'beta_btc', 'pvalue', 'reason'
-        ])
-        while True:
-            batch = await db.fetch_pair_history_batch_before_ts(cutoff_ms=cutoff_ms, last_id=last_id, limit=5000)
-            if not batch:
-                break
-            for row in batch:
-                writer.writerow([
-                    row.id, row.symbol1, row.symbol2, row.event_type, row.timestamp,
-                    row.hedge_ratio, row.half_life,
-                    getattr(row, 'pair_id', None),
-                    getattr(row, 'trade_id', None),
-                    getattr(row, 'z_score', None),
-                    getattr(row, 'beta_btc', None),
-                    getattr(row, 'pvalue', None),
-                    row.reason
-                ])
-                last_id = row.id
-                written += 1
-            if len(batch) < 5000:
-                break
-
-    # Rotate: current -> prev, new -> current
-    try:
-        if os.path.exists(prev_path):
-            os.remove(prev_path)
-        if os.path.exists(current_path):
-            shutil.move(current_path, prev_path)
-        shutil.move(new_path, current_path)
-    finally:
-        if os.path.exists(new_path):
-            os.remove(new_path)
-
-    return written, current_path
 
 
 # Connect to websockets
@@ -1019,13 +900,11 @@ async def ws_user_msg(ws, msg):
             known_open_before.update((pairs_manager._exchange_pnl_cache or {}).keys())
         
         # Notify about ALL position changes immediately
-        closed_symbols = []
         for pos in positions:
             sym = pos.get('s')
             amt = float(pos.get('pa', 0))
             up = float(pos.get('up', 0))  # unrealizedProfit from exchange
             if amt == 0:
-                closed_symbols.append(sym)
                 # Clear PnL cache for closed position
                 if pairs_manager:
                     pairs_manager._exchange_pnl_cache.pop(sym, None)
@@ -1035,6 +914,11 @@ async def ws_user_msg(ws, msg):
                 if pairs_manager:
                     pairs_manager._exchange_pnl_cache[sym] = up
                     pairs_manager._exchange_positions_cache[sym] = abs(amt)
+
+        # Keep cached exchange position counter in sync with websocket position cache.
+        # Otherwise can_open_new_position() may see stale "limit reached" state.
+        if pairs_manager:
+            pairs_manager._exchange_position_count = len(pairs_manager._exchange_positions_cache)
         
         # Note: Detailed notifications will be sent per-pair below
         # Skip simple "Position Changes" message - too noisy
@@ -1093,8 +977,11 @@ async def ws_user_msg(ws, msg):
                 # Both legs closed together - fetch actual PnL and cleanup
                 print(f"âš¡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
                 try:
-                    await client.cancel_open_orders(s1)
-                    await client.cancel_open_orders(s2)
+                    await asyncio.gather(
+                        client.cancel_open_orders(s1),
+                        client.cancel_open_orders(s2),
+                        return_exceptions=True
+                    )
                     
                     # Small delay to ensure trade data is available
                     await asyncio.sleep(1)
@@ -1104,8 +991,10 @@ async def ws_user_msg(ws, msg):
                     open_time = int(getattr(pair_info, 'open_time', 0) or 0)
                     start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
-                    trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
-                    trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    trades1, trades2 = await asyncio.gather(
+                        client.get_account_trades(symbol=s1, startTime=start_ms, limit=50),
+                        client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    )
                     
                     print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
                     print(f"ðŸ“Š Trades for {s2}: {len(trades2)} entries")
@@ -1131,8 +1020,10 @@ async def ws_user_msg(ws, msg):
                         print(f"ðŸ“‹ Using stored reason: {stored_reason} -> {close_type}")
                     else:
                         try:
-                            orders1 = await client.get_all_orders(symbol=s1, limit=15)
-                            orders2 = await client.get_all_orders(symbol=s2, limit=15)
+                            orders1, orders2 = await asyncio.gather(
+                                client.get_all_orders(symbol=s1, limit=15),
+                                client.get_all_orders(symbol=s2, limit=15)
+                            )
                             
                             now_ms = int(time_mod.time() * 1000)
                             recent_orders = []
@@ -1214,7 +1105,10 @@ async def ws_user_msg(ws, msg):
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
                     pair_info.is_trading = False
-                    pair_info._wait_for_candle = True  # Block re-entry until next candle
+                    if pairs_manager:
+                        pairs_manager.mark_pair_wait_for_next_candle(pair_info, reason=stored_reason if stored_reason else 'external')
+                    if pairs_manager:
+                        pairs_manager.loop.create_task(pairs_manager._trigger_immediate_analysis())
                     
                     # Update DB
                     if pair_info.db_id:
@@ -1244,6 +1138,7 @@ async def ws_user_msg(ws, msg):
                                 close_price_1=close_price1 if close_price1 > 0 else None,
                                 close_price_2=close_price2 if close_price2 > 0 else None,
                             )
+                            await _persist_pair_executions_main(pair_info, trades1, trades2, phase='EXTERNAL_CLOSE_WS')
                         except Exception as trade_err:
                             print(f"âš ï¸ Trade update failed for {s1}-{s2}: {trade_err}")
                         pair_info.current_trade_id = None
@@ -1318,8 +1213,11 @@ async def ws_user_msg(ws, msg):
                     
                     # THEN cancel remaining algo/SL/TP orders (non-critical, can be slower)
                     try:
-                        await client.cancel_open_orders(s1)
-                        await client.cancel_open_orders(s2)
+                        await asyncio.gather(
+                            client.cancel_open_orders(s1),
+                            client.cancel_open_orders(s2),
+                            return_exceptions=True
+                        )
                     except Exception as cancel_err:
                         print(f"âš ï¸ Cancel orders error (non-critical): {cancel_err}")
                     
@@ -1344,8 +1242,10 @@ async def ws_user_msg(ws, msg):
                     open_time = int(getattr(pair_info, 'open_time', 0) or 0)
                     start_ms = (max(0, open_time - 120) * 1000) if open_time > 0 else (now_ms - 300_000)
                     
-                    trades1 = await client.get_account_trades(symbol=s1, startTime=start_ms, limit=50)
-                    trades2 = await client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    trades1, trades2 = await asyncio.gather(
+                        client.get_account_trades(symbol=s1, startTime=start_ms, limit=50),
+                        client.get_account_trades(symbol=s2, startTime=start_ms, limit=50)
+                    )
                     
                     print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
                     print(f"ðŸ“Š Trades for {s2}: {len(trades2)} entries")
@@ -1367,10 +1267,12 @@ async def ws_user_msg(ws, msg):
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
                     pair_info.is_trading = False
-                    pair_info._wait_for_candle = True  # Block re-entry until next candle
-                    
                     stored_reason = getattr(pair_info, 'last_close_reason', '')
-                    
+                    if pairs_manager:
+                        pairs_manager.mark_pair_wait_for_next_candle(pair_info, reason=stored_reason if stored_reason else 'external')
+                    if pairs_manager:
+                        pairs_manager.loop.create_task(pairs_manager._trigger_immediate_analysis())
+
                     if pair_info.db_id:
                         await db.update_pair({
                             'id': pair_info.db_id,
@@ -1398,6 +1300,7 @@ async def ws_user_msg(ws, msg):
                                 close_price_1=close_price1 if close_price1 > 0 else None,
                                 close_price_2=close_price2 if close_price2 > 0 else None,
                             )
+                            await _persist_pair_executions_main(pair_info, trades1, trades2, phase='MANUAL_PARTIAL_CLOSE_WS')
                         except Exception as trade_err:
                             print(f"âš ï¸ Trade update failed for {s1}-{s2}: {trade_err}")
                         pair_info.current_trade_id = None
@@ -1412,8 +1315,10 @@ async def ws_user_msg(ws, msg):
                         print(f"ðŸ“‹ Using stored reason: {stored_reason} -> {close_type}")
                     else:
                         try:
-                            orders1 = await client.get_all_orders(symbol=s1, limit=15)
-                            orders2 = await client.get_all_orders(symbol=s2, limit=15)
+                            orders1, orders2 = await asyncio.gather(
+                                client.get_all_orders(symbol=s1, limit=15),
+                                client.get_all_orders(symbol=s2, limit=15)
+                            )
                             
                             now_time = int(time_mod.time() * 1000)
                             recent_orders = []
@@ -1577,8 +1482,6 @@ async def ws_user_msg(ws, msg):
                         if getattr(pair_info, 'is_trading', False):
                             print(f"â„¹ï¸ {s1}-{s2} already being processed, skipping cancel handler")
                             break
-                        
-                        other_symbol = s2 if symbol == s1 else s1
                         
                         # Notify user about manual order cancellation
                         cancel_msg = (f"âš ï¸ <b>Order CANCELED:</b> {symbol}\n"
