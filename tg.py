@@ -495,6 +495,14 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
     p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
     bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
+    et_target = getattr(conf, 'entry_et_target_abs_z', 0.5) or 0.5
+    et_hours = getattr(conf, 'entry_et_max_hours', 24.0) or 24.0
+    et_hl_mult = getattr(conf, 'entry_et_max_hl_mult', 2.2) or 2.2
+    epw = int(getattr(conf, 'entry_phase_window_bars', 6) or 6)
+    epminv = getattr(conf, 'entry_phase_min_toward_velocity', 0.004) or 0.004
+    epminr = getattr(conf, 'entry_phase_min_toward_ratio', 0.55) or 0.55
+    epv = getattr(conf, 'entry_phase_max_away_velocity', 0.03) or 0.03
+    eps = getattr(conf, 'entry_phase_max_abs_slope', 0.05) or 0.05
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💵 Capital: {capital} USDT", callback_data="set_capital")],
@@ -512,6 +520,14 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"🚨 Circuit Breaker: {cb_pct*100:.0f}% notional", callback_data="set_circuit_breaker")],
         [InlineKeyboardButton(text=f"🧪 P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"📏 Min Order Bump: {bump}x", callback_data="set_min_bump")],
+        [InlineKeyboardButton(text=f"⏱️ ET Max: {et_hours:.0f}h", callback_data="set_entry_et_max_hours"),
+         InlineKeyboardButton(text=f"×HL: {et_hl_mult:.2f}", callback_data="set_entry_et_max_hl_mult")],
+        [InlineKeyboardButton(text=f"🎯 ET Target |Z|: {et_target:.2f}", callback_data="set_entry_et_target_abs_z")],
+        [InlineKeyboardButton(text=f"🧭 Phase Window: {epw}", callback_data="set_entry_phase_window_bars")],
+        [InlineKeyboardButton(text=f"➡️ Min Toward Vel: {epminv:.3f}", callback_data="set_entry_phase_min_toward_velocity"),
+         InlineKeyboardButton(text=f"📊 Min Toward Ratio: {epminr:.2f}", callback_data="set_entry_phase_min_toward_ratio")],
+        [InlineKeyboardButton(text=f"↘️ Away Vel: {epv:.3f}", callback_data="set_entry_phase_max_away_velocity"),
+         InlineKeyboardButton(text=f"📉 |Z| Slope: {eps:.3f}", callback_data="set_entry_phase_max_abs_slope")],
         [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
         [InlineKeyboardButton(text=f"🗑️ Max Idle: {max_idle}", callback_data="set_max_idle"),
          InlineKeyboardButton(text=f"⏰ Timeout: {idle_timeout}h", callback_data="set_idle_timeout")],
@@ -523,6 +539,8 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
                            f"<b>Max Pairs</b>: {max_pairs} concurrent trades.\n"
                            f"<b>β Entry Filter</b>: reject idle pairs if |β| >= {beta_threshold}\n"
                            f"<b>β Alert/Critical</b>: {beta_alert_threshold} / {beta_critical}\n"
+                           f"<b>Entry ET (soft)</b>: target |Z| {et_target:.2f}, cap {et_hours:.0f}h, ×HL {et_hl_mult:.2f}\n"
+                           f"<b>Entry Phase Filter</b>: window {epw}, toward≥{epminv:.3f}, ratio≥{epminr:.2f}\n"
                            f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.\n\n"
                            f"<b>Idle Pair Cleanup:</b>\n"
                            f"  • Max idle pairs: {max_idle}\n"
@@ -745,6 +763,54 @@ async def set_min_bump_cb(callback: CallbackQuery, state: FSMContext):
     await state.update_data(waiting_for="min_order_bump")
     await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
 
+@dp.callback_query(F.data == "set_entry_phase_window_bars")
+async def set_entry_phase_window_bars_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_phase_window_bars")
+    await answer(callback, "Enter phase estimation window in bars (recommended 5-8):")
+
+@dp.callback_query(F.data == "set_entry_et_target_abs_z")
+async def set_entry_et_target_abs_z_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_et_target_abs_z")
+    await answer(callback, "Enter ET target |Z| (recommended 0.4-0.8, e.g., 0.5):")
+
+@dp.callback_query(F.data == "set_entry_et_max_hours")
+async def set_entry_et_max_hours_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_et_max_hours")
+    await answer(callback, "Enter ET soft max hours (e.g., 24). Use 0 to disable ET filter:")
+
+@dp.callback_query(F.data == "set_entry_et_max_hl_mult")
+async def set_entry_et_max_hl_mult_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_et_max_hl_mult")
+    await answer(callback, "Enter ET cap as half-life multiplier (recommended 1.8-3.0, e.g., 2.2):")
+
+@dp.callback_query(F.data == "set_entry_phase_min_toward_velocity")
+async def set_entry_phase_min_toward_velocity_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_phase_min_toward_velocity")
+    await answer(callback, "Enter minimum average velocity toward mean (recommended 0.002-0.010, e.g., 0.004):")
+
+@dp.callback_query(F.data == "set_entry_phase_min_toward_ratio")
+async def set_entry_phase_min_toward_ratio_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_phase_min_toward_ratio")
+    await answer(callback, "Enter minimum share of steps toward mean in phase window (0-1, recommended 0.50-0.70):")
+
+@dp.callback_query(F.data == "set_entry_phase_max_away_velocity")
+async def set_entry_phase_max_away_velocity_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_phase_max_away_velocity")
+    await answer(callback, "Enter max allowed away-from-mean velocity (recommended 0.02-0.06, e.g., 0.03):")
+
+@dp.callback_query(F.data == "set_entry_phase_max_abs_slope")
+async def set_entry_phase_max_abs_slope_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="entry_phase_max_abs_slope")
+    await answer(callback, "Enter max allowed slope of |Z| trend (recommended 0.03-0.08, e.g., 0.05):")
+
 @dp.callback_query(F.data == "set_beta_critical")
 async def set_beta_critical_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.hardware_sltp)
@@ -914,6 +980,73 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(min_order_bump=val)
             await answer(message, f"Min Order Bump: <b>{val}x</b>")
+
+        elif waiting_for == "entry_phase_window_bars":
+            val = int(value)
+            if val < 3 or val > 100:
+                await answer(message, "Value must be between 3 and 100 bars.")
+                return
+            await db.config_update(entry_phase_window_bars=val)
+            await answer(message, f"Entry phase window: <b>{val}</b> bars")
+
+        elif waiting_for == "entry_et_target_abs_z":
+            val = float(value)
+            if val <= 0 or val > 5:
+                await answer(message, "Value must be between 0 and 5.")
+                return
+            await db.config_update(entry_et_target_abs_z=val)
+            await answer(message, f"ET target |Z|: <b>{val:.2f}</b>")
+
+        elif waiting_for == "entry_et_max_hours":
+            val = float(value)
+            if val < 0 or val > 240:
+                await answer(message, "Value must be between 0 and 240 hours.")
+                return
+            await db.config_update(entry_et_max_hours=val)
+            if val == 0:
+                await answer(message, "ET filter: <b>disabled</b>")
+            else:
+                await answer(message, f"ET soft max: <b>{val:.1f}h</b>")
+
+        elif waiting_for == "entry_et_max_hl_mult":
+            val = float(value)
+            if val <= 0 or val > 10:
+                await answer(message, "Value must be between 0 and 10.")
+                return
+            await db.config_update(entry_et_max_hl_mult=val)
+            await answer(message, f"ET max as half-life multiplier: <b>{val:.2f}x</b>")
+
+        elif waiting_for == "entry_phase_min_toward_velocity":
+            val = float(value)
+            if val <= 0 or val > 1:
+                await answer(message, "Value must be between 0 and 1.")
+                return
+            await db.config_update(entry_phase_min_toward_velocity=val)
+            await answer(message, f"Entry min toward velocity: <b>{val:.3f}</b>")
+
+        elif waiting_for == "entry_phase_min_toward_ratio":
+            val = float(value)
+            if val <= 0 or val > 1:
+                await answer(message, "Value must be between 0 and 1.")
+                return
+            await db.config_update(entry_phase_min_toward_ratio=val)
+            await answer(message, f"Entry min toward ratio: <b>{val:.2f}</b>")
+
+        elif waiting_for == "entry_phase_max_away_velocity":
+            val = float(value)
+            if val <= 0 or val > 1:
+                await answer(message, "Value must be between 0 and 1.")
+                return
+            await db.config_update(entry_phase_max_away_velocity=val)
+            await answer(message, f"Entry max away velocity: <b>{val:.3f}</b>")
+
+        elif waiting_for == "entry_phase_max_abs_slope":
+            val = float(value)
+            if val <= 0 or val > 1:
+                await answer(message, "Value must be between 0 and 1.")
+                return
+            await db.config_update(entry_phase_max_abs_slope=val)
+            await answer(message, f"Entry max |Z| slope: <b>{val:.3f}</b>")
             
         elif waiting_for == "half_life":
             # Parse "min-max" format

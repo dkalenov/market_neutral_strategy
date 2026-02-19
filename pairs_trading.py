@@ -4607,6 +4607,209 @@ class PairsManager:
             return float(z_score)
         except Exception:
             return np.nan
+
+    def _evaluate_entry_viability(
+        self,
+        pair_info: PairInfo,
+        current_z: float,
+        price1: float | None = None,
+        price2: float | None = None,
+    ) -> tuple[bool, float, dict]:
+        """
+        Evaluate whether an entry is statistically viable right now.
+
+        Combines:
+        1) Half-life regime gate (reuses global hl_min_days/hl_max_days).
+        2) Local phase dynamics of z-score (speed and stability of movement toward mean).
+        3) Soft expected-time gate to target |Z| (ET) to avoid very late entries.
+
+        Notes:
+        - HL band is structural (pair regime), phase is tactical (entry timing now).
+        - ET is intentionally soft: slight overshoots are penalized via score, not immediately rejected.
+        - For 4h TF, recommended practical preset (also documented in db defaults comments):
+          hl_min_days=0.5, hl_max_days=4.0,
+          entry_et_target_abs_z=0.5, entry_et_max_hours=36, entry_et_max_hl_mult=2.0,
+          entry_phase_window_bars=6, entry_phase_min_toward_velocity=0.003,
+          entry_phase_min_toward_ratio=0.55, entry_phase_max_away_velocity=0.025,
+          entry_phase_max_abs_slope=0.04.
+
+        Returns:
+            (is_viable, viability_score, metrics_dict)
+        """
+        metrics = {
+            'reason': '',
+            'half_life_bars': np.nan,
+            'hl_min_bars': np.nan,
+            'hl_max_bars': np.nan,
+            'expected_hours': np.nan,
+            'expected_max_hours': np.nan,
+            'phase_toward_vel_last': np.nan,   # >0 means moving toward mean
+            'phase_toward_vel_mean': np.nan,   # average velocity toward mean
+            'phase_toward_ratio': np.nan,      # share of steps toward mean
+            'phase_abs_slope': np.nan,         # slope of |z| over recent bars
+        }
+
+        try:
+            z_now = float(current_z)
+        except Exception:
+            metrics['reason'] = 'z_invalid'
+            return False, -1.0, metrics
+        if not np.isfinite(z_now):
+            metrics['reason'] = 'z_nan'
+            return False, -1.0, metrics
+
+        data1 = self.all_data.get(pair_info.symbol1)
+        data2 = self.all_data.get(pair_info.symbol2)
+        if not data1 or not data2:
+            metrics['reason'] = 'no_data'
+            return False, -1.0, metrics
+        if len(data1.close) < self.min_data_points or len(data2.close) < self.min_data_points:
+            metrics['reason'] = 'short_history'
+            return False, -1.0, metrics
+
+        log1 = np.log(list(data1.close)[-self.min_data_points:])
+        log2 = np.log(list(data2.close)[-self.min_data_points:])
+        spread = log1 - pair_info.hedge_ratio * log2
+
+        # Optionally use live prices for the latest point to evaluate current phase.
+        if price1 and price2 and price1 > 0 and price2 > 0:
+            spread = np.array(spread, dtype=float)
+            spread[-1] = np.log(float(price1)) - pair_info.hedge_ratio * np.log(float(price2))
+
+        spread_mean = float(np.mean(spread))
+        spread_std = float(np.std(spread))
+        if spread_std <= 0 or np.isnan(spread_std):
+            metrics['reason'] = 'zero_std'
+            return False, -1.0, metrics
+
+        z_hist = (spread - spread_mean) / spread_std
+
+        # ---- 1) Half-life regime gate (single source of truth from global hl settings) ----
+        half_life = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+        if half_life <= 0 or np.isnan(half_life):
+            half_life = float(utils.calculate_half_life(spread))
+        metrics['half_life_bars'] = half_life
+
+        hl_min_days = float(getattr(self.config, 'hl_min_days', 0.25) or 0.25)
+        hl_max_days = float(getattr(self.config, 'hl_max_days', 2.0) or 2.0)
+        hl_min_bars, hl_max_bars = utils.get_half_life_limits(self.timeframe, hl_min_days, hl_max_days)
+        metrics['hl_min_bars'] = float(hl_min_bars)
+        metrics['hl_max_bars'] = float(hl_max_bars)
+
+        if not np.isfinite(half_life) or half_life <= 0:
+            metrics['reason'] = 'hl_invalid'
+            return False, -1.0, metrics
+        if half_life < hl_min_bars or half_life > hl_max_bars:
+            metrics['reason'] = 'hl_out_of_band'
+            return False, -1.0, metrics
+
+        # ---- 1b) Expected reversion time (soft gate + score; avoids over-filtering) ----
+        tf_hours = self._timeframe_seconds_local() / 3600.0
+        et_max_hours_conf = float(getattr(self.config, 'entry_et_max_hours', 24.0) or 24.0)
+        if et_max_hours_conf > 0 and tf_hours > 0:
+            et_target_abs_z = float(getattr(self.config, 'entry_et_target_abs_z', 0.5) or 0.5)
+            et_max_hl_mult = float(getattr(self.config, 'entry_et_max_hl_mult', 2.2) or 2.2)
+            expected_bars = float(utils.expected_reversion_bars(abs(z_now), et_target_abs_z, half_life))
+            expected_hours = expected_bars * tf_hours if np.isfinite(expected_bars) else np.inf
+            hl_hours = half_life * tf_hours
+            dyn_max_hours = hl_hours * et_max_hl_mult if np.isfinite(hl_hours) else et_max_hours_conf
+            expected_max_hours = min(et_max_hours_conf, dyn_max_hours) if np.isfinite(dyn_max_hours) else et_max_hours_conf
+            metrics['expected_hours'] = expected_hours
+            metrics['expected_max_hours'] = expected_max_hours
+            # Hard reject only on clearly too-long trades; small overshoots only penalize score.
+            if not np.isfinite(expected_hours):
+                metrics['reason'] = 'et_invalid'
+                return False, -1.0, metrics
+            if expected_hours > expected_max_hours * 1.35:
+                metrics['reason'] = 'et_too_slow'
+                return False, -1.0, metrics
+        else:
+            expected_hours = np.nan
+            expected_max_hours = np.nan
+
+        # ---- 2) Phase dynamics gate ----
+        phase_window = int(getattr(self.config, 'entry_phase_window_bars', 6) or 6)
+        phase_window = max(4, min(phase_window, len(z_hist)))
+        z_tail = np.array(z_hist[-phase_window:], dtype=float)
+        dz = np.diff(z_tail)
+        toward_series = -np.sign(z_now) * dz  # >0 means convergence toward mean
+        toward_vel_last = float(toward_series[-1]) if len(toward_series) > 0 else 0.0
+        toward_vel_mean = float(np.mean(toward_series)) if len(toward_series) > 0 else 0.0
+        toward_ratio = float(np.mean(toward_series > 0)) if len(toward_series) > 0 else 0.0
+        metrics['phase_toward_vel_last'] = toward_vel_last
+        metrics['phase_toward_vel_mean'] = toward_vel_mean
+        metrics['phase_toward_ratio'] = toward_ratio
+
+        abs_tail = np.abs(z_tail)
+        if len(abs_tail) >= 3:
+            try:
+                x = np.arange(len(abs_tail), dtype=float)
+                abs_slope = float(np.polyfit(x, abs_tail, 1)[0])
+            except Exception:
+                abs_slope = 0.0
+        else:
+            abs_slope = 0.0
+        metrics['phase_abs_slope'] = abs_slope
+
+        min_toward_vel = float(getattr(self.config, 'entry_phase_min_toward_velocity', 0.004) or 0.004)
+        min_toward_ratio = float(getattr(self.config, 'entry_phase_min_toward_ratio', 0.55) or 0.55)
+        max_away_vel = float(getattr(self.config, 'entry_phase_max_away_velocity', 0.03) or 0.03)
+        max_abs_slope = float(getattr(self.config, 'entry_phase_max_abs_slope', 0.05) or 0.05)
+
+        # Reject if spread still runs away from mean too quickly.
+        if toward_vel_last < -max_away_vel:
+            metrics['reason'] = 'phase_away'
+            return False, -1.0, metrics
+        # Reject if average movement is too weak toward mean (late/noisy phase).
+        if toward_vel_mean < min_toward_vel:
+            metrics['reason'] = 'phase_slow'
+            return False, -1.0, metrics
+        # Reject if too many steps still move away from mean.
+        if toward_ratio < min_toward_ratio:
+            metrics['reason'] = 'phase_unstable'
+            return False, -1.0, metrics
+        # Reject if |z| trend is still expanding too fast on recent bars.
+        if abs_slope > max_abs_slope:
+            metrics['reason'] = 'phase_expand'
+            return False, -1.0, metrics
+
+        # Composite score for ranking (higher is better).
+        vel_score = np.clip(toward_vel_mean / max(min_toward_vel, 1e-6), 0.0, 2.0) / 2.0
+        ratio_score = np.clip((toward_ratio - min_toward_ratio) / max(1.0 - min_toward_ratio, 1e-6), 0.0, 1.0)
+        slope_score = np.clip(1.0 - (abs_slope / max(max_abs_slope, 1e-6)), 0.0, 1.0)
+        last_step_score = np.clip((toward_vel_last + max_away_vel) / max(2.0 * max_away_vel, 1e-6), 0.0, 1.0)
+        phase_score = float(0.35 * vel_score + 0.30 * ratio_score + 0.20 * slope_score + 0.15 * last_step_score)
+        if np.isfinite(expected_hours) and np.isfinite(expected_max_hours) and expected_max_hours > 0:
+            et_score = float(np.clip(1.0 - (expected_hours / expected_max_hours), 0.0, 1.0))
+            viability_score = 0.75 * phase_score + 0.25 * et_score
+        else:
+            viability_score = phase_score
+        metrics['reason'] = 'ok'
+        return True, viability_score, metrics
+
+    @staticmethod
+    def _fmt_entry_viability(metrics: dict) -> str:
+        reason = metrics.get('reason', '')
+        hl = metrics.get('half_life_bars', np.nan)
+        hl_min = metrics.get('hl_min_bars', np.nan)
+        hl_max = metrics.get('hl_max_bars', np.nan)
+        eh = metrics.get('expected_hours', np.nan)
+        emh = metrics.get('expected_max_hours', np.nan)
+        tv_last = metrics.get('phase_toward_vel_last', np.nan)
+        tv_mean = metrics.get('phase_toward_vel_mean', np.nan)
+        tv_ratio = metrics.get('phase_toward_ratio', np.nan)
+        sl = metrics.get('phase_abs_slope', np.nan)
+        hl_txt = f"{hl:.1f}" if np.isfinite(hl) else "nan"
+        hl_rng_txt = f"[{hl_min:.1f},{hl_max:.1f}]" if np.isfinite(hl_min) and np.isfinite(hl_max) else "[nan,nan]"
+        et_txt = f"{eh:.1f}h/{emh:.1f}h" if np.isfinite(eh) and np.isfinite(emh) else "off"
+        tv_last_txt = f"{tv_last:+.3f}" if np.isfinite(tv_last) else "nan"
+        tv_mean_txt = f"{tv_mean:+.3f}" if np.isfinite(tv_mean) else "nan"
+        tv_ratio_txt = f"{tv_ratio:.2f}" if np.isfinite(tv_ratio) else "nan"
+        sl_txt = f"{sl:+.3f}" if np.isfinite(sl) else "nan"
+        return (
+            f"reason={reason}, hl={hl_txt} in {hl_rng_txt}, E[T]={et_txt}, "
+            f"toward(last/mean)={tv_last_txt}/{tv_mean_txt}, toward_ratio={tv_ratio_txt}, |z|_slope={sl_txt}"
+        )
     
     async def on_ticker_update(self, symbol: str, price: float):
         """
@@ -4991,9 +5194,19 @@ class PairsManager:
 
                     # Must remain inside entry window and keep original direction.
                     if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
-                        score = float(getattr(pair_info, 'quality_score', 0.0) or 0.0)
+                        viable, viability_score, viability = self._evaluate_entry_viability(
+                            pair_info, current_z, price1, price2
+                        )
+                        if not viable:
+                            print(
+                                f"⏭️ Entry filtered {pair_info.symbol1}-{pair_info.symbol2}: "
+                                f"{self._fmt_entry_viability(viability)}"
+                            )
+                            continue
+
+                        quality_score = float(getattr(pair_info, 'quality_score', 0.0) or 0.0)
                         updated_at = float(getattr(pair_info, 'quality_updated_at', 0.0) or 0.0)
-                        ready_candidates.append((score, updated_at, pair_info, current_z))
+                        ready_candidates.append((viability_score, quality_score, updated_at, pair_info, current_z, viability))
                     elif abs(current_z) >= z_entry_max:
                         print(f"âš ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
 
@@ -5006,14 +5219,14 @@ class PairsManager:
                 if not ready_candidates:
                     continue
 
-                # Rank by cached quality score (higher is better), then recency of metrics.
-                ready_candidates.sort(key=lambda x: (-x[0], -x[1]))
+                # Rank by viability first (expected reversion + phase), then quality score.
+                ready_candidates.sort(key=lambda x: (-x[0], -x[1], -x[2]))
                 max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
                 free_slots = max(0, int(max_pairs - self.count_active_positions()))
                 if free_slots <= 0:
                     continue
 
-                for score, _, pair_info, current_z in ready_candidates:
+                for viability_score, quality_score, _, pair_info, current_z, viability in ready_candidates:
                     if free_slots <= 0:
                         break
                     if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
@@ -5037,7 +5250,11 @@ class PairsManager:
 
                     direction = 1 if current_z < 0 else -1
                     pair_info.entry_z_score = current_z
-                    print(f"âœ… Ranked entry: {pair_info.symbol1}-{pair_info.symbol2} | score={score:.3f} | Z={current_z:.2f}. Opening...")
+                    print(
+                        f"✅ Ranked entry: {pair_info.symbol1}-{pair_info.symbol2} | "
+                        f"viability={viability_score:.3f}, quality={quality_score:.3f}, Z={current_z:.2f} | "
+                        f"{self._fmt_entry_viability(viability)}. Opening..."
+                    )
                     pair_info.is_trading = True
                     self.loop.create_task(self._execute_trade(pair_info, direction))
                     free_slots -= 1

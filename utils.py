@@ -112,6 +112,39 @@ def calculate_z_last(spread):
         return np.nan
     return float((s.iloc[-1] - m) / sd)
 
+def expected_reversion_bars(abs_z_now: float, abs_z_target: float, half_life_bars: float):
+    """
+    Estimate expected bars to revert from |z_now| to |z_target| under OU/AR(1) decay.
+
+    Uses relation phi = exp(-ln(2)/half_life), and:
+        E[T] ~= ln(|z_target|/|z_now|) / ln(phi)
+
+    Returns:
+        float bars to target, 0.0 if already at/inside target, np.inf if invalid/non-mean-reverting.
+    """
+    try:
+        z0 = float(abs(abs_z_now))
+        zt = float(abs(abs_z_target))
+        hl = float(half_life_bars)
+        if not np.isfinite(z0) or not np.isfinite(zt) or not np.isfinite(hl):
+            return np.inf
+        if zt <= 0:
+            zt = 1e-6
+        if z0 <= zt:
+            return 0.0
+        if hl <= 0:
+            return np.inf
+        phi = math.exp(-math.log(2.0) / hl)
+        # Require stationary decay.
+        if phi <= 0 or phi >= 1:
+            return np.inf
+        bars = math.log(zt / z0) / math.log(phi)
+        if not np.isfinite(bars):
+            return np.inf
+        return float(max(0.0, bars))
+    except Exception:
+        return np.inf
+
 def calculate_pair_beta(pair_r, market_r):
     if pair_r is None or market_r is None:
         return np.nan

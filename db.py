@@ -170,6 +170,15 @@ class ConfigInfo:
     beta_critical: float    # Force-close if |beta| > this, regardless of PnL (default 1.0)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
     trade_mode: bool        # If True, allow opening new positions (default True)
+    # Entry Viability Filter (phase-only, half-life band reused from hl_min_days/hl_max_days)
+    entry_et_target_abs_z: float      # Target |Z| for expected reversion estimate (default 0.5)
+    entry_et_max_hours: float         # Soft expected-time cap in hours (default 24; <=0 disables)
+    entry_et_max_hl_mult: float       # Soft cap as multiple of half-life (default 2.2)
+    entry_phase_window_bars: int      # Bars for local phase estimation (default 6)
+    entry_phase_min_toward_velocity: float  # Minimum average velocity toward mean (default 0.004)
+    entry_phase_min_toward_ratio: float     # Minimum share of steps toward mean in phase window (default 0.55)
+    entry_phase_max_away_velocity: float  # Max allowed "away from mean" velocity (default 0.03)
+    entry_phase_max_abs_slope: float  # Max allowed slope of |Z| (default 0.05)
     # Hedge Ratio Bounds (market neutrality)
     hedge_min: float        # Minimum |hedge_ratio| for pair acceptance (default 0.3)
     hedge_max: float        # Maximum |hedge_ratio| for pair acceptance (default 3.0)
@@ -423,6 +432,29 @@ async def load_config():
             'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
+            # Entry viability filter defaults (balanced baseline for 1h).
+            #
+            # Recommended 4h preset (if moving to 4h timeframe):
+            #   hl_min_days = 0.5
+            #   hl_max_days = 4.0
+            #   entry_et_target_abs_z = 0.5
+            #   entry_et_max_hours = 36
+            #   entry_et_max_hl_mult = 2.0
+            #   entry_phase_window_bars = 6
+            #   entry_phase_min_toward_velocity = 0.003
+            #   entry_phase_min_toward_ratio = 0.55
+            #   entry_phase_max_away_velocity = 0.025
+            #   entry_phase_max_abs_slope = 0.04
+            # Rationale: 4h bars are slower/noisier, so velocity/slope thresholds are slightly tighter,
+            # while ET cap is longer in hours.
+            'entry_et_target_abs_z': '0.5',
+            'entry_et_max_hours': '24',
+            'entry_et_max_hl_mult': '2.2',
+            'entry_phase_window_bars': '6',
+            'entry_phase_min_toward_velocity': '0.004',
+            'entry_phase_min_toward_ratio': '0.55',
+            'entry_phase_max_away_velocity': '0.03',
+            'entry_phase_max_abs_slope': '0.05',
             # Hedge Ratio Bounds (market neutrality)
             'hedge_min': '0.3',              # Min |hedge| â€” below this positions are too unbalanced
             'hedge_max': '3.0',              # Max |hedge| â€” above this positions are too unbalanced
