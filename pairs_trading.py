@@ -90,6 +90,10 @@ class PairInfo:
     # Signal confirmation (for real-time mode)
     pending_signal: float = None  # Pending Z-score signal awaiting confirmation
     pending_since: float = None   # Time when signal started
+    pending_source: str = ''      # 'realtime' | 'candle' (for confirmation fallback logic)
+    # Cached quality score (updated on candle-close metrics refresh)
+    quality_score: float = 0.0
+    quality_updated_at: float = 0.0
     # Idle pair management
     discovered_at: float = field(default_factory=time.time)  # When pair was discovered
     # Close tracking - prevents duplicate notifications
@@ -320,6 +324,7 @@ class PairsManager:
                         info.beta_btc = getattr(p, 'beta_btc', 0.0) or 0.0
                         info.last_pvalue = getattr(p, 'last_pvalue', 0.0) or 0.0
                         info.entry_z_score = getattr(p, 'entry_z_score', 0.0) or 0.0
+                        self._update_quality_score_cache(info)
                         
                         last_trade = await db.get_last_open_trade_for_pair(p.id)
                         if last_trade:
@@ -596,6 +601,10 @@ class PairsManager:
                                         tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0,
                                         reentry_block_candle_ts=close_anchor
                                     )
+                                    info.beta_btc = getattr(db_pair, 'beta_btc', 0.0) or 0.0
+                                    info.last_pvalue = getattr(db_pair, 'last_pvalue', 0.0) or 0.0
+                                    info.entry_z_score = getattr(db_pair, 'entry_z_score', 0.0) or 0.0
+                                    self._update_quality_score_cache(info)
                                     self.active_pairs[pair_set] = info
                                     self._register_pair(info)
                                     tracked_symbols.add(db_pair.symbol1)
@@ -2206,6 +2215,7 @@ class PairsManager:
                 # Update parameters
                 pair_info.hedge_ratio = hedge
                 pair_info.half_life = hl
+                self._update_quality_score_cache(pair_info)
                 
                 if pair_info.db_id:
                     # CRITICAL: Await DB update to prevent pool exhaustion (was create_task)
@@ -2319,11 +2329,12 @@ class PairsManager:
                     # Live fallback entry on candle-close.
                     # Protects from missing entries if markPrice WS is unstable.
                     if abs(z_score) >= z_entry and abs(z_score) < getattr(self.config, 'z_entry_max', 2.5):
-                        direction = 1 if z_score < 0 else -1
-                        pair_info.entry_z_score = z_score
-                        print(f"âš¡ CANDLE ENTRY {s1}-{s2}: Z={z_score:.2f} -> {'LONG' if direction == 1 else 'SHORT'}")
-                        pair_info.is_trading = True
-                        self.loop.create_task(self._execute_trade(pair_info, direction))
+                        # Queue as pending candidate and let ranked confirmation loop open top pairs.
+                        pair_info.pending_signal = z_score
+                        # Make candle fallback eligible immediately in confirmation loop.
+                        pair_info.pending_since = time.time() - max(1, int(getattr(self.config, 'signal_confirm_sec', 10) or 10))
+                        pair_info.pending_source = 'candle'
+                        print(f"âš¡ CANDLE SIGNAL queued {s1}-{s2}: Z={z_score:.2f} (will be ranked against other candidates)")
                         continue
                 
                 elif pair_info.position_status == 1: # Long spread
@@ -2577,6 +2588,8 @@ class PairsManager:
                     )
                     pair_info.beta_btc = beta_btc
                     pair_info.discovered_at = time.time()  # Track when pair was discovered
+                    pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
+                    self._update_quality_score_cache(pair_info)
                     self.active_pairs[pair_set] = pair_info
                     self._register_pair(pair_info)
                     new_pairs_count += 1
@@ -2658,6 +2671,70 @@ class PairsManager:
             start_sec = max(0, open_time - buffer_sec)
             return start_sec * 1000
         return now_ms - (default_lookback_sec * 1000)
+
+    def _clamp01(self, x: float) -> float:
+        try:
+            v = float(x)
+        except Exception:
+            return 0.0
+        if v < 0:
+            return 0.0
+        if v > 1:
+            return 1.0
+        return v
+
+    def _update_quality_score_cache(self, pair_info: PairInfo):
+        """
+        Update lightweight pair quality score from cached candle-close metrics.
+        No heavy computations here by design.
+        """
+        pval = float(getattr(pair_info, 'last_pvalue', 0.0) or 0.0)
+        beta = abs(float(getattr(pair_info, 'beta_btc', 0.0) or 0.0))
+        hedge = abs(float(getattr(pair_info, 'hedge_ratio', 0.0) or 0.0))
+        hl = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+
+        # Normalize to [0,1] quality components (higher is better).
+        # p-value: 0 is best, 0.05+ is poor.
+        p_quality = 1.0 - self._clamp01(pval / 0.05) if pval > 0 else 0.0
+        # Beta: 0 is best, 0.15+ is poor.
+        beta_quality = 1.0 - self._clamp01(beta / 0.15)
+        # Hedge balance: ideal near 1.0, degrade as distance grows.
+        hedge_quality = 1.0 - self._clamp01(abs(hedge - 1.0) / 1.0)
+        # Half-life quality: prefer roughly 6h..72h in current timeframe units.
+        if hl <= 0:
+            hl_quality = 0.0
+        elif hl < 6:
+            hl_quality = self._clamp01(hl / 6.0)
+        elif hl > 72:
+            hl_quality = 1.0 - self._clamp01((hl - 72.0) / 120.0)
+        else:
+            hl_quality = 1.0
+
+        # Recent adverse outcomes penalty (cached counters on PairInfo, optional).
+        fail_penalty = float(getattr(pair_info, '_recent_fail_penalty', 0.0) or 0.0)
+        fail_penalty = self._clamp01(fail_penalty)
+
+        score = (
+            0.38 * p_quality +
+            0.32 * beta_quality +
+            0.20 * hedge_quality +
+            0.10 * hl_quality
+        )
+        score = max(0.0, score - 0.25 * fail_penalty)
+
+        pair_info.quality_score = float(score)
+        pair_info.quality_updated_at = time.time()
+
+    def _update_pair_quality_penalty_on_close(self, pair_info: PairInfo, close_reason: str | None):
+        reason = (close_reason or '').strip().lower()
+        penalty = float(getattr(pair_info, '_recent_fail_penalty', 0.0) or 0.0)
+        if reason in {'z_sl', 'hardware_sl', 'broken_coint', 'beta_critical', 'circuit', 'desync'}:
+            penalty = min(1.0, penalty + 0.35)
+        elif reason in {'z_tp', 'hardware_tp'}:
+            penalty = max(0.0, penalty - 0.20)
+        else:
+            penalty = max(0.0, penalty - 0.05)
+        pair_info._recent_fail_penalty = penalty
 
     async def _fetch_account_trades_window(
         self,
@@ -3049,6 +3126,7 @@ class PairsManager:
                 # Cooldown to prevent immediate retry
                 pair_info.pending_signal = None
                 pair_info.pending_since = None
+                pair_info.pending_source = ''
                 pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
                 return
         
@@ -3290,6 +3368,8 @@ class PairsManager:
                     await self._notify(full_msg, reply_to)
                     
                     # State cleanup for hardware close
+                    self._update_pair_quality_penalty_on_close(pair_info, close_reason)
+                    self._update_quality_score_cache(pair_info)
                     pair_info.position_status = 0
                     pair_info.qty1 = 0
                     pair_info.qty2 = 0
@@ -3623,6 +3703,8 @@ class PairsManager:
                         await self._notify(full_msg, reply_to)
                         
                         # Update DB with close details + market neutrality metrics
+                        self._update_pair_quality_penalty_on_close(pair_info, close_reason)
+                        self._update_quality_score_cache(pair_info)
                         if pair_info.db_id:
                             await db.update_pair({
                                 'id': pair_info.db_id,
@@ -3739,6 +3821,7 @@ class PairsManager:
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     return
             except Exception as e:
                 print(f"âš ï¸ Hedge refresh error for {s1}-{s2}: {e}. Using existing hedge={hedge:.4f}")
@@ -3771,6 +3854,7 @@ class PairsManager:
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await self._notify(warn_msg, reply_to)
                     return
@@ -3781,6 +3865,7 @@ class PairsManager:
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     # Notify TG to explain why signal was rejected
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await self._notify(warn_msg, reply_to)
@@ -3801,6 +3886,7 @@ class PairsManager:
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await self._notify(warn_msg, reply_to)
                     return
@@ -3936,6 +4022,7 @@ class PairsManager:
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
                     if failed_preflight_symbol:
                         self._set_symbol_cooldown(failed_preflight_symbol, 900, 'preflight_limit')
@@ -4021,6 +4108,7 @@ class PairsManager:
                     # Cooldown to prevent immediate retry loop
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
                     pair_info._leverage_fail_until = time.time() + 600  # 10 min cooldown
                     
                     # Block failed symbols to stop retrying same bad symbol across pair combinations
@@ -4446,11 +4534,13 @@ class PairsManager:
                     # Start confirmation timer
                     pair_info.pending_signal = z_score
                     pair_info.pending_since = time.time()
+                    pair_info.pending_source = 'realtime'
             else:
                 # Signal went away - reset
                 if pair_info.pending_signal is not None:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
+                    pair_info.pending_source = ''
     
     async def _check_btc_shock(self):
         """
@@ -4689,56 +4779,86 @@ class PairsManager:
                     open_count = sum(1 for pi in self.active_pairs.values() if pi.position_status != 0)
                     pending_count = sum(1 for pi in self.active_pairs.values() if pi.pending_signal is not None)
                     print(f"ðŸ“Š Signal monitor: {idle_count} idle pairs, {open_count} open positions, {pending_count} pending signals")
-                
+                z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
+                z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
+                ready_candidates = []
+                processed_pending = []
+
                 for pair_info in list(self.active_pairs.values()):
                     if pair_info.position_status != 0 or pair_info.is_trading:
                         continue
-                    
-                    if pair_info.pending_signal is not None and pair_info.pending_since is not None:
-                        elapsed = time.time() - pair_info.pending_since
-                        
-                        if elapsed >= confirm_sec:
-                            # Re-check current Z-score
-                            price1 = self.last_prices.get(pair_info.symbol1)
-                            price2 = self.last_prices.get(pair_info.symbol2)
-                            
-                            if price1 and price2:
-                                current_z = self._calc_realtime_zscore(pair_info, price1, price2)
-                                z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
-                                z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
-                                
-                                # Check signal still valid and in same direction
-                                # Also reject if Z-score exceeds entry window (spread may be broken)
-                                if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
-                                    # Check can open
-                                    if self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
-                                        # Check cooldown from failed leverage/trade
-                                        fail_until = getattr(pair_info, '_leverage_fail_until', 0)
-                                        if fail_until and time.time() < fail_until:
-                                            continue
-                                        
-                                        # Check cooldown after stop-loss close
-                                        close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
-                                        if close_cooldown and time.time() < close_cooldown:
-                                            remaining = int(close_cooldown - time.time())
-                                            print(f"â¸ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
-                                            continue
-                                        
-                                        # Check if pair is waiting for next candle close
-                                        if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
-                                            continue
-                                        
-                                        direction = 1 if current_z < 0 else -1
-                                        pair_info.entry_z_score = current_z
-                                        print(f"âœ… Signal CONFIRMED for {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f}. Opening position...")
-                                        pair_info.is_trading = True
-                                        self.loop.create_task(self._execute_trade(pair_info, direction))
-                                elif abs(current_z) >= z_entry_max:
-                                    print(f"âš ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
-                            
-                            # Reset pending after confirmed check (timer expired)
-                            pair_info.pending_signal = None
-                            pair_info.pending_since = None
+                    if pair_info.pending_signal is None or pair_info.pending_since is None:
+                        continue
+
+                    elapsed = time.time() - pair_info.pending_since
+                    if elapsed < confirm_sec:
+                        continue
+
+                    # Primary: realtime z from markPrice. Fallback for candle-origin signals.
+                    price1 = self.last_prices.get(pair_info.symbol1)
+                    price2 = self.last_prices.get(pair_info.symbol2)
+                    current_z = np.nan
+                    if price1 and price2:
+                        current_z = self._calc_realtime_zscore(pair_info, price1, price2)
+                    elif getattr(pair_info, 'pending_source', '') == 'candle':
+                        current_z = float(getattr(pair_info, 'last_z_score', np.nan))
+
+                    processed_pending.append(pair_info)
+                    if np.isnan(current_z):
+                        continue
+
+                    # Must remain inside entry window and keep original direction.
+                    if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
+                        score = float(getattr(pair_info, 'quality_score', 0.0) or 0.0)
+                        updated_at = float(getattr(pair_info, 'quality_updated_at', 0.0) or 0.0)
+                        ready_candidates.append((score, updated_at, pair_info, current_z))
+                    elif abs(current_z) >= z_entry_max:
+                        print(f"âš ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
+
+                # Reset matured pending signals after evaluation cycle.
+                for pair_info in processed_pending:
+                    pair_info.pending_signal = None
+                    pair_info.pending_since = None
+                    pair_info.pending_source = ''
+
+                if not ready_candidates:
+                    continue
+
+                # Rank by cached quality score (higher is better), then recency of metrics.
+                ready_candidates.sort(key=lambda x: (-x[0], -x[1]))
+                max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
+                free_slots = max(0, int(max_pairs - self.count_active_positions()))
+                if free_slots <= 0:
+                    continue
+
+                for score, _, pair_info, current_z in ready_candidates:
+                    if free_slots <= 0:
+                        break
+                    if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
+                        continue
+
+                    # Check cooldown from failed leverage/trade
+                    fail_until = getattr(pair_info, '_leverage_fail_until', 0)
+                    if fail_until and time.time() < fail_until:
+                        continue
+
+                    # Check cooldown after stop-loss close
+                    close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
+                    if close_cooldown and time.time() < close_cooldown:
+                        remaining = int(close_cooldown - time.time())
+                        print(f"â¸ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
+                        continue
+
+                    # Check if pair is waiting for next candle close
+                    if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
+                        continue
+
+                    direction = 1 if current_z < 0 else -1
+                    pair_info.entry_z_score = current_z
+                    print(f"âœ… Ranked entry: {pair_info.symbol1}-{pair_info.symbol2} | score={score:.3f} | Z={current_z:.2f}. Opening...")
+                    pair_info.is_trading = True
+                    self.loop.create_task(self._execute_trade(pair_info, direction))
+                    free_slots -= 1
             except Exception as e:
                 print(f"âš ï¸ Signal confirmation loop error (continuing): {e}")
     
