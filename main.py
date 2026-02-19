@@ -118,6 +118,11 @@ def _install_print_mojibake_fix():
         _orig_print(*fixed_args, **kwargs)
     builtins.print = _fixed_print
 
+def _order_type_text(order) -> str:
+    if not isinstance(order, dict):
+        return ''
+    return str(order.get('type') or order.get('origType') or order.get('orderType') or '').upper()
+
 async def send_tg_notification(message, reply_to_message_id=None, reply_markup=None):
     """Send notification to TG channel or admins. Returns message_id for reply threading."""
     if isinstance(message, str):
@@ -1098,7 +1103,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = o.get('type', '') or o.get('origType', '')
+                                o_type = _order_type_text(o)
                                 
                                 if 'STOP' in o_type:
                                     close_type = 'ðŸ›¡ï¸ Hardware SL'
@@ -1393,7 +1398,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = o.get('type', '') or o.get('origType', '')
+                                o_type = _order_type_text(o)
                                 
                                 if 'STOP' in o_type:
                                     close_type = 'ðŸ›¡ï¸ Hardware SL'

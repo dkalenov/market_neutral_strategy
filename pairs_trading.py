@@ -1701,7 +1701,7 @@ class PairsManager:
                         if close_candidates:
                             close_candidates.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                             trigger_order = close_candidates[0]
-                            o_type = trigger_order.get('type', '') or trigger_order.get('origType', '')
+                            o_type = self._order_type_text(trigger_order)
                             
                             if 'STOP' in o_type:
                                 desync_reason = f'Hardware SL triggered on {closed_leg}'
@@ -2759,6 +2759,33 @@ class PairsManager:
                 print(f"Error in _notify: {e}")
         return None
 
+    @staticmethod
+    def _order_type_text(order) -> str:
+        """Return normalized uppercase order type from exchange order payload."""
+        if not isinstance(order, dict):
+            return ''
+        return str(order.get('type') or order.get('origType') or order.get('orderType') or '').upper()
+
+    @staticmethod
+    def _safe_order_price(order) -> float:
+        """Extract effective execution price from order payload, safely handling None/malformed values."""
+        if not isinstance(order, dict):
+            return 0.0
+        try:
+            avg_price = float(order.get('avgPrice', 0) or 0)
+            if avg_price > 0:
+                return avg_price
+        except Exception:
+            pass
+        try:
+            quote_qty = float(order.get('cummulativeQuoteQty', 0) or 0)
+            executed_qty = float(order.get('executedQty', 0) or 0)
+            if executed_qty > 0:
+                return quote_qty / executed_qty
+        except Exception:
+            pass
+        return 0.0
+
     def _format_half_life(self, hl_hours: float) -> str:
         """Format half-life in human-readable format (e.g., '1d 6h' or '16h 48m')."""
         if hl_hours >= 24:
@@ -3617,18 +3644,11 @@ class PairsManager:
                         }
                         reason_text = CLOSE_REASONS.get(close_reason, 'â“ Unknown') if close_reason else 'â“ Unknown'
                     
-                        def get_price(order):
-                            if 'avgPrice' in order and float(order['avgPrice']) > 0:
-                                return float(order['avgPrice'])
-                            if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:
-                                return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
-                            return 0.0
-
                         # Safely get prices - MAP by symbol (results array may not match s1/s2 order!)
                         close_prices = {}
                         for i, res in enumerate(results):
                             if not isinstance(res, Exception) and i < len(close_symbols):
-                                close_prices[close_symbols[i]] = get_price(res)
+                                close_prices[close_symbols[i]] = self._safe_order_price(res)
                         
                         # For legs already closed by exchange (SL/TP trigger), fetch actual close price
                         for sym in [s1, s2]:
@@ -3737,10 +3757,10 @@ class PairsManager:
                             for o in algo_orders:
                                 sym = o['symbol']
                                 if sym in orders_by_sym:
-                                    order_type = o.get('type', '') or o.get('orderType', '')
-                                    if 'STOP' in order_type.upper():
+                                    order_type = str(o.get('type') or o.get('orderType') or '').upper()
+                                    if 'STOP' in order_type:
                                         orders_by_sym[sym].append(('SL', o['algoId']))
-                                    elif 'TAKE_PROFIT' in order_type.upper():
+                                    elif 'TAKE_PROFIT' in order_type:
                                         orders_by_sym[sym].append(('TP', o['algoId']))
                                     else:
                                         orders_by_sym[sym].append((order_type or 'ORDER', o['algoId']))
@@ -4264,15 +4284,8 @@ class PairsManager:
                     self._exchange_positions_cache[s2] = pair_info.qty2
                     self._exchange_position_count = len(self._exchange_positions_cache)
                 
-                    def get_price(order):
-                        if 'avgPrice' in order and float(order['avgPrice']) > 0:
-                            return float(order['avgPrice'])
-                        if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:
-                            return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
-                        return 0.0
-
-                    pair_info.entry_price1 = get_price(executed_orders[0])
-                    pair_info.entry_price2 = get_price(executed_orders[1])
+                    pair_info.entry_price1 = self._safe_order_price(executed_orders[0])
+                    pair_info.entry_price2 = self._safe_order_price(executed_orders[1])
                     
                     # Set open time
                     from datetime import datetime
