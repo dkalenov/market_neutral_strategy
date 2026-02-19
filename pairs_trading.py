@@ -105,6 +105,15 @@ class PairInfo:
     _wait_for_candle: bool = False  # True = pair just closed, wait for next candle before re-entry
     # Persisted/derived candle anchor: do not re-enter while latest closed candle <= this ts (ms).
     reentry_block_candle_ts: int = 0
+    # Entry diagnostics (set when ranked entry is selected; shown in OPEN alert).
+    entry_phase_label: str = ''
+    entry_expected_hours: float = 0.0
+    entry_expected_max_hours: float = 0.0
+    entry_rank_score: float = 0.0
+    entry_phase_score: float = 0.0
+    entry_et_score: float = 0.0
+    entry_quality_score: float = 0.0
+    entry_diag_ready: bool = False
 
 class PairsManager:
     """
@@ -4318,6 +4327,24 @@ class PairsManager:
                         except Exception as e:
                             print(f"âš ï¸ Beta calculation error: {e}")
                     
+                    # Optional diagnostics from ranked-entry selector.
+                    if getattr(pair_info, 'entry_diag_ready', False):
+                        phase_label = getattr(pair_info, 'entry_phase_label', '') or 'n/a'
+                        et_hours = float(getattr(pair_info, 'entry_expected_hours', 0.0) or 0.0)
+                        et_max_hours = float(getattr(pair_info, 'entry_expected_max_hours', 0.0) or 0.0)
+                        rank_score = float(getattr(pair_info, 'entry_rank_score', 0.0) or 0.0)
+                        phase_score = float(getattr(pair_info, 'entry_phase_score', 0.0) or 0.0)
+                        et_score = float(getattr(pair_info, 'entry_et_score', 0.0) or 0.0)
+                        quality_score = float(getattr(pair_info, 'entry_quality_score', 0.0) or 0.0)
+                        et_txt = f"{et_hours:.1f}h / {et_max_hours:.1f}h" if et_max_hours > 0 else "off"
+                    else:
+                        phase_label = 'n/a'
+                        rank_score = 0.0
+                        phase_score = 0.0
+                        et_score = 0.0
+                        quality_score = 0.0
+                        et_txt = "n/a"
+
                     success_msg = (f"ðŸš€ <b>Trade OPENED:</b> {s1}-{s2}\n"
                                    f"ðŸ“… {open_dt}\n\n"
                                    f"ðŸ“ˆ LONG: {long_qty} {long_sym} @ {long_price:.4f}\n"
@@ -4326,8 +4353,10 @@ class PairsManager:
                                    f"     ðŸ’° ${short_qty * short_price:.2f}\n\n"
                                    f"âš–ï¸ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}\n"
                                    f"ðŸ“Š Beta: {pair_info.beta_btc:.3f} | p-value: {pair_info.last_pvalue:.4f}\n"
-                                   # Format half-life as readable hours/days
-                                   f"â³ Half-life: {self._format_half_life(pair_info.half_life)}")
+                                   f"â³ Half-life: {self._format_half_life(pair_info.half_life)}\n"
+                                   f"ðŸ§  Phase: {phase_label} | E[T]: {et_txt}\n"
+                                   f"ðŸ† Entry score: {rank_score:.3f} (phase {phase_score:.3f}, ET {et_score:.3f}, quality {quality_score:.3f})")
+                    pair_info.entry_diag_ready = False
                     print(success_msg.replace('<b>', '').replace('</b>', ''))
                     # Save msg_id for reply threading on close
                     msg_id = await self._notify(success_msg)
@@ -4638,6 +4667,7 @@ class PairsManager:
         """
         metrics = {
             'reason': '',
+            'abs_z_now': np.nan,
             'half_life_bars': np.nan,
             'hl_min_bars': np.nan,
             'hl_max_bars': np.nan,
@@ -4647,6 +4677,9 @@ class PairsManager:
             'phase_toward_vel_mean': np.nan,   # average velocity toward mean
             'phase_toward_ratio': np.nan,      # share of steps toward mean
             'phase_abs_slope': np.nan,         # slope of |z| over recent bars
+            'phase_score': 0.0,                # 0..1
+            'et_score': 0.5,                   # 0..1 (0.5 neutral when ET disabled)
+            'quality_score': 0.0,              # 0..1 (filled by caller for logging/rank trace)
         }
 
         try:
@@ -4657,6 +4690,7 @@ class PairsManager:
         if not np.isfinite(z_now):
             metrics['reason'] = 'z_nan'
             return False, -1.0, metrics
+        metrics['abs_z_now'] = abs(z_now)
 
         data1 = self.all_data.get(pair_info.symbol1)
         data2 = self.all_data.get(pair_info.symbol2)
@@ -4723,9 +4757,11 @@ class PairsManager:
             if expected_hours > expected_max_hours * 1.35:
                 metrics['reason'] = 'et_too_slow'
                 return False, -1.0, metrics
+            metrics['et_score'] = float(np.clip(1.0 - (expected_hours / max(expected_max_hours, 1e-6)), 0.0, 1.0))
         else:
             expected_hours = np.nan
             expected_max_hours = np.nan
+            metrics['et_score'] = 0.5
 
         # ---- 2) Phase dynamics gate ----
         phase_window = int(getattr(self.config, 'entry_phase_window_bars', 6) or 6)
@@ -4779,11 +4815,10 @@ class PairsManager:
         slope_score = np.clip(1.0 - (abs_slope / max(max_abs_slope, 1e-6)), 0.0, 1.0)
         last_step_score = np.clip((toward_vel_last + max_away_vel) / max(2.0 * max_away_vel, 1e-6), 0.0, 1.0)
         phase_score = float(0.35 * vel_score + 0.30 * ratio_score + 0.20 * slope_score + 0.15 * last_step_score)
-        if np.isfinite(expected_hours) and np.isfinite(expected_max_hours) and expected_max_hours > 0:
-            et_score = float(np.clip(1.0 - (expected_hours / expected_max_hours), 0.0, 1.0))
-            viability_score = 0.75 * phase_score + 0.25 * et_score
-        else:
-            viability_score = phase_score
+        metrics['phase_score'] = phase_score
+        # Legacy viability score used as pre-rank score. Final rank is computed in signal loop
+        # with explicit weights: phase / ET / quality.
+        viability_score = 0.75 * phase_score + 0.25 * metrics['et_score']
         metrics['reason'] = 'ok'
         return True, viability_score, metrics
 
@@ -4799,6 +4834,9 @@ class PairsManager:
         tv_mean = metrics.get('phase_toward_vel_mean', np.nan)
         tv_ratio = metrics.get('phase_toward_ratio', np.nan)
         sl = metrics.get('phase_abs_slope', np.nan)
+        ps = metrics.get('phase_score', np.nan)
+        es = metrics.get('et_score', np.nan)
+        qs = metrics.get('quality_score', np.nan)
         hl_txt = f"{hl:.1f}" if np.isfinite(hl) else "nan"
         hl_rng_txt = f"[{hl_min:.1f},{hl_max:.1f}]" if np.isfinite(hl_min) and np.isfinite(hl_max) else "[nan,nan]"
         et_txt = f"{eh:.1f}h/{emh:.1f}h" if np.isfinite(eh) and np.isfinite(emh) else "off"
@@ -4806,10 +4844,29 @@ class PairsManager:
         tv_mean_txt = f"{tv_mean:+.3f}" if np.isfinite(tv_mean) else "nan"
         tv_ratio_txt = f"{tv_ratio:.2f}" if np.isfinite(tv_ratio) else "nan"
         sl_txt = f"{sl:+.3f}" if np.isfinite(sl) else "nan"
+        ps_txt = f"{ps:.3f}" if np.isfinite(ps) else "nan"
+        es_txt = f"{es:.3f}" if np.isfinite(es) else "nan"
+        qs_txt = f"{qs:.3f}" if np.isfinite(qs) else "nan"
         return (
             f"reason={reason}, hl={hl_txt} in {hl_rng_txt}, E[T]={et_txt}, "
-            f"toward(last/mean)={tv_last_txt}/{tv_mean_txt}, toward_ratio={tv_ratio_txt}, |z|_slope={sl_txt}"
+            f"toward(last/mean)={tv_last_txt}/{tv_mean_txt}, toward_ratio={tv_ratio_txt}, "
+            f"|z|_slope={sl_txt}, scores(p/e/q)={ps_txt}/{es_txt}/{qs_txt}"
         )
+
+    @staticmethod
+    def _entry_phase_label(metrics: dict) -> str:
+        """Human-readable phase label for OPEN notifications."""
+        tv_mean = float(metrics.get('phase_toward_vel_mean', 0.0) or 0.0)
+        tv_ratio = float(metrics.get('phase_toward_ratio', 0.0) or 0.0)
+        abs_slope = float(metrics.get('phase_abs_slope', 0.0) or 0.0)
+        reason = str(metrics.get('reason', '') or '')
+        if reason in {'phase_away', 'phase_expand', 'phase_unstable'}:
+            return 'divergence_risk'
+        if tv_ratio >= 0.72 and tv_mean >= 0.008 and abs_slope <= 0.0:
+            return 'early_reversion'
+        if tv_ratio >= 0.60 and tv_mean >= 0.004 and abs_slope <= 0.04:
+            return 'mid_reversion'
+        return 'late_reversion'
     
     async def on_ticker_update(self, symbol: str, price: float):
         """
@@ -5205,8 +5262,28 @@ class PairsManager:
                             continue
 
                         quality_score = float(getattr(pair_info, 'quality_score', 0.0) or 0.0)
+                        quality_score = float(np.clip(quality_score, 0.0, 1.0))
+                        viability['quality_score'] = quality_score
+                        phase_score = float(np.clip(float(viability.get('phase_score', 0.0) or 0.0), 0.0, 1.0))
+                        et_score = float(np.clip(float(viability.get('et_score', 0.5) or 0.5), 0.0, 1.0))
+                        # Final ranking weights:
+                        # - phase 0.55: primary signal quality (captures "early/mid reversion" objective)
+                        # - ET 0.30: avoids entries that statistically take too long to converge
+                        # - quality 0.15: structural pair quality as tie-breaker, not the main driver
+                        # Weights sum to 1.0.
+                        final_rank = 0.55 * phase_score + 0.30 * et_score + 0.15 * quality_score
                         updated_at = float(getattr(pair_info, 'quality_updated_at', 0.0) or 0.0)
-                        ready_candidates.append((viability_score, quality_score, updated_at, pair_info, current_z, viability))
+                        ready_candidates.append((
+                            float(final_rank),
+                            phase_score,
+                            et_score,
+                            quality_score,
+                            updated_at,
+                            pair_info,
+                            current_z,
+                            viability,
+                            viability_score,
+                        ))
                     elif abs(current_z) >= z_entry_max:
                         print(f"âš ï¸ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
 
@@ -5219,14 +5296,15 @@ class PairsManager:
                 if not ready_candidates:
                     continue
 
-                # Rank by viability first (expected reversion + phase), then quality score.
-                ready_candidates.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+                # Rank by final score with explicit weights:
+                # phase(0.55) > ET(0.30) > quality(0.15).
+                ready_candidates.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], -x[4]))
                 max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
                 free_slots = max(0, int(max_pairs - self.count_active_positions()))
                 if free_slots <= 0:
                     continue
 
-                for viability_score, quality_score, _, pair_info, current_z, viability in ready_candidates:
+                for final_rank, phase_score, et_score, quality_score, _, pair_info, current_z, viability, viability_score in ready_candidates:
                     if free_slots <= 0:
                         break
                     if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
@@ -5250,9 +5328,18 @@ class PairsManager:
 
                     direction = 1 if current_z < 0 else -1
                     pair_info.entry_z_score = current_z
+                    pair_info.entry_phase_label = self._entry_phase_label(viability)
+                    pair_info.entry_expected_hours = float(viability.get('expected_hours', 0.0) or 0.0)
+                    pair_info.entry_expected_max_hours = float(viability.get('expected_max_hours', 0.0) or 0.0)
+                    pair_info.entry_rank_score = float(final_rank)
+                    pair_info.entry_phase_score = float(phase_score)
+                    pair_info.entry_et_score = float(et_score)
+                    pair_info.entry_quality_score = float(quality_score)
+                    pair_info.entry_diag_ready = True
                     print(
                         f"✅ Ranked entry: {pair_info.symbol1}-{pair_info.symbol2} | "
-                        f"viability={viability_score:.3f}, quality={quality_score:.3f}, Z={current_z:.2f} | "
+                        f"rank={final_rank:.3f} (phase={phase_score:.3f}, et={et_score:.3f}, quality={quality_score:.3f}), "
+                        f"legacy={viability_score:.3f}, Z={current_z:.2f} | "
                         f"{self._fmt_entry_viability(viability)}. Opening..."
                     )
                     pair_info.is_trading = True
