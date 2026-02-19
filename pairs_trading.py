@@ -343,12 +343,10 @@ class PairsManager:
                             else:
                                 await self.client.cancel_open_orders(remaining_sym)
                                 close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
-                                await self.client.new_order(
+                                await self._close_leg_reduce_only(
                                     symbol=remaining_sym,
                                     side=close_side,
-                                    type='MARKET',
-                                    quantity=remaining_qty,
-                                    reduceOnly='true'
+                                    quantity=remaining_qty
                                 )
                                 print(f"      âœ… Closed orphan {remaining_sym}")
                             
@@ -598,12 +596,10 @@ class PairsManager:
                             await self.client.cancel_open_orders(symbol)
                             
                             close_side = 'SELL' if side == 'LONG' else 'BUY'
-                            await self.client.new_order(
+                            await self._close_leg_reduce_only(
                                 symbol=symbol,
                                 side=close_side,
-                                type='MARKET',
-                                quantity=qty,
-                                reduceOnly='true'
+                                quantity=qty
                             )
                             print(f"      âœ… Closed unknown position {symbol}")
                             
@@ -686,12 +682,10 @@ class PairsManager:
                                     
                                     # Close remaining leg with market order
                                     close_side = 'SELL' if remaining_side == 'LONG' else 'BUY'
-                                    await self.client.new_order(
+                                    await self._close_leg_reduce_only(
                                         symbol=remaining_sym,
                                         side=close_side,
-                                        type='MARKET',
-                                        quantity=remaining_qty,
-                                        reduceOnly='true'
+                                        quantity=remaining_qty
                                     )
                                     print(f"      âœ… Closed orphan leg {remaining_sym}")
                                 
@@ -1384,6 +1378,85 @@ class PairsManager:
                 except Exception:
                     pass
 
+    async def _close_leg_reduce_only(self, symbol: str, side: str, quantity: float) -> None:
+        """
+        Close one futures leg with reduceOnly.
+        Primary path: MARKET.
+        Fallback for -4131 (PERCENT_PRICE): LIMIT IOC with safe bounded price.
+        """
+        qty = abs(float(quantity or 0))
+        if qty <= 0:
+            return
+
+        try:
+            await self.client.new_order(
+                symbol=symbol,
+                side=side,
+                type='MARKET',
+                quantity=qty,
+                reduceOnly='true'
+            )
+            return
+        except Exception as e:
+            is_percent_price = getattr(e, 'error_code', None) == -4131 or 'PERCENT_PRICE' in str(e)
+            if not is_percent_price:
+                raise
+            print(f"⚠️ MARKET reduceOnly failed for {symbol} ({e}). Trying LIMIT IOC fallback...")
+
+        sym_info = self.client.symbols.get(symbol) if getattr(self.client, 'symbols', None) else None
+        tick_digits = int(getattr(sym_info, 'tick_size', 3) or 3)
+        multiplier_up = float(getattr(sym_info, 'multiplier_up', 0) or 0)
+        multiplier_down = float(getattr(sym_info, 'multiplier_down', 0) or 0)
+
+        last_err = None
+        for _ in range(2):
+            try:
+                book = await self.client.book_ticker(symbol=symbol)
+                bid = float(book.get('bidPrice', 0) or 0)
+                ask = float(book.get('askPrice', 0) or 0)
+
+                mark_data = await self.client.mark_price(symbol=symbol)
+                mark = float(mark_data.get('markPrice', 0) or 0)
+                if mark <= 0:
+                    mark = ask if ask > 0 else bid
+                if mark <= 0:
+                    raise RuntimeError(f"Could not get valid mark/bbo for {symbol}")
+
+                lower = mark * multiplier_down if multiplier_down > 0 else 0.0
+                upper = mark * multiplier_up if multiplier_up > 0 else float('inf')
+
+                if side == 'SELL':
+                    price = bid if bid > 0 else mark
+                else:
+                    price = ask if ask > 0 else mark
+
+                if lower > 0:
+                    price = max(price, lower)
+                if upper < float('inf'):
+                    price = min(price, upper)
+
+                price = round(price, tick_digits)
+                if price <= 0:
+                    raise RuntimeError(f"Invalid fallback price for {symbol}: {price}")
+
+                await self.client.new_order(
+                    symbol=symbol,
+                    side=side,
+                    type='LIMIT',
+                    timeInForce='IOC',
+                    quantity=qty,
+                    price=price,
+                    reduceOnly='true',
+                    newOrderRespType='RESULT'
+                )
+                print(f"✅ Closed {symbol} via LIMIT IOC fallback at {price}")
+                return
+            except Exception as ioc_err:
+                last_err = ioc_err
+                await asyncio.sleep(0.2)
+
+        raise last_err if last_err is not None else RuntimeError(f"Failed to close {symbol} with fallback path")
+
     async def _check_leg_synchronization(self):
         """Check that both legs of each active pair are open."""
         try:
@@ -1558,12 +1631,10 @@ class PairsManager:
                         # Close remaining leg if it has position
                         if remaining_qty != 0:
                             close_side = 'SELL' if remaining_qty > 0 else 'BUY'
-                            await self.client.new_order(
-                                symbol=remaining_leg, 
-                                side=close_side, 
-                                type='MARKET',
-                                quantity=abs(remaining_qty), 
-                                reduceOnly='true'
+                            await self._close_leg_reduce_only(
+                                symbol=remaining_leg,
+                                side=close_side,
+                                quantity=remaining_qty
                             )
                             print(f"âœ… Closed remaining leg {remaining_leg}")
                         
@@ -2031,19 +2102,21 @@ class PairsManager:
                             continue # Do not delete pair if close failed
 
                     if pair_info.db_id:
-                        reason = f"Broken. Flag={flag}, HL={hl:.2f}, Pval={pval:.4f}"
-                        history_item = db.PairHistory(
-                            symbol1=s1,
-                            symbol2=s2,
-                            event_type='BROKEN',
-                            timestamp=int(time.time() * 1000),
-                            hedge_ratio=hedge,
-                            half_life=hl,
-                            reason=reason
-                        )
+                        reason = f"Broken cointegration (flag={flag}, p={pval:.4f})"
                         # CRITICAL: Await this to prevent pool exhaustion (was create_task)
                         try:
-                            await db.add_pair_history(history_item)
+                            await db.log_pair_history_event(
+                                symbol1=s1,
+                                symbol2=s2,
+                                event_type='BROKEN',
+                                timestamp_ms=int(time.time() * 1000),
+                                hedge_ratio=hedge,
+                                half_life=hl,
+                                reason=reason,
+                                pair_id=pair_info.db_id,
+                                beta_btc=pair_info.beta_btc,
+                                pvalue=pval,
+                            )
                             await db.archive_pair(pair_info.db_id, reason='broken_coint')
                         except Exception as e:
                             print(f"âš ï¸ Failed to update DB content for broken pair {s1}-{s2}: {e}")
@@ -2225,6 +2298,17 @@ class PairsManager:
         ready_set = set(ready_symbols)
         checked_pairs = set()
         candidates_to_process = []
+
+        # Pre-filter pairs that already exist in DB to avoid duplicate discovery noise
+        # and unnecessary stats/beta calculations for known pairs.
+        try:
+            existing_db_keys = await db.get_active_pair_keys()
+            for sym1, sym2 in existing_db_keys:
+                checked_pairs.add(frozenset([sym1, sym2]))
+            if existing_db_keys:
+                print(f"Loaded {len(existing_db_keys)} active pairs from DB for duplicate pre-filter.")
+        except Exception as e:
+            print(f"⚠️ Could not preload active pair keys from DB: {e}")
         
         # --- 1. Load and process Priority Pairs ---
         priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
@@ -2323,6 +2407,9 @@ class PairsManager:
                     if pair_set in self.active_pairs:
                         print(f"  âš ï¸ Skipping duplicate (race condition): {s1}-{s2}")
                         continue
+                    if await db.active_pair_exists(s1, s2):
+                        print(f"  âš ï¸ Skipping duplicate (already active in DB): {s1}-{s2}")
+                        continue
 
                     new_pair = db.Pairs(
                         symbol1=s1, 
@@ -2331,7 +2418,11 @@ class PairsManager:
                         half_life=hl,
                         position_status=0
                     )
-                    await db.add_pair(new_pair)
+                    try:
+                        await db.add_pair(new_pair)
+                    except db.DuplicateActivePairError:
+                        print(f"  âš ï¸ Skipping duplicate in DB: {s1}-{s2}")
+                        continue
                     
                     # === BETA CHECK BEFORE ADDING TO ACTIVE PAIRS ===
                     # Calculate beta to BTC to ensure pair is market-neutral
@@ -2360,16 +2451,18 @@ class PairsManager:
                     if not test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
                         print(f"âš ï¸ {s1}-{s2} REJECTED at discovery: |beta|={abs(beta_btc):.3f} >= {beta_threshold}")
                         try:
-                            reject_history = db.PairHistory(
+                            await db.log_pair_history_event(
                                 symbol1=s1,
                                 symbol2=s2,
                                 event_type='BETA_REJECTED',
-                                timestamp=int(time.time() * 1000),
+                                timestamp_ms=int(time.time() * 1000),
                                 hedge_ratio=hedge,
                                 half_life=hl,
-                                reason=f'|beta|={abs(beta_btc):.3f} >= {beta_threshold}'
+                                reason='Discovery rejected by beta threshold',
+                                pair_id=new_pair.id,
+                                beta_btc=beta_btc,
+                                pvalue=pval,
                             )
-                            await db.add_pair_history(reject_history)
                         except Exception:
                             pass
                         # Remove from DB since we just added it
@@ -2383,16 +2476,18 @@ class PairsManager:
                     
                     print(f"âœ… FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}, Hedge: {hedge:.4f}")
                     try:
-                        history_item = db.PairHistory(
+                        await db.log_pair_history_event(
                             symbol1=s1,
                             symbol2=s2,
                             event_type='FOUND',
-                            timestamp=int(time.time() * 1000),
+                            timestamp_ms=int(time.time() * 1000),
                             hedge_ratio=hedge,
                             half_life=hl,
-                            reason='Discovery'
+                            reason='Discovery passed',
+                            pair_id=new_pair.id,
+                            beta_btc=beta_btc,
+                            pvalue=pval,
                         )
-                        await db.add_pair_history(history_item)
                     except Exception as hist_err:
                         print(f"âš ï¸ Could not write PairHistory FOUND for {s1}-{s2}: {hist_err}")
                     
@@ -2744,9 +2839,10 @@ class PairsManager:
                         # s1 closed by SL/TP, close s2
                         if qty2_close and qty2_close > 0:
                             try:
-                                await self.client.new_order(
-                                    symbol=s2, side=side2_close, type='MARKET',
-                                    quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT'
+                                await self._close_leg_reduce_only(
+                                    symbol=s2,
+                                    side=side2_close,
+                                    quantity=qty2_close
                                 )
                                 print(f"âœ… FAST closed {s2} (qty={qty2_close})")
                             except Exception as e:
@@ -2755,9 +2851,10 @@ class PairsManager:
                         # s2 closed by SL/TP, close s1
                         if qty1_close and qty1_close > 0:
                             try:
-                                await self.client.new_order(
-                                    symbol=s1, side=side1_close, type='MARKET',
-                                    quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT'
+                                await self._close_leg_reduce_only(
+                                    symbol=s1,
+                                    side=side1_close,
+                                    quantity=qty1_close
                                 )
                                 print(f"âœ… FAST closed {s1} (qty={qty1_close})")
                             except Exception as e:
@@ -2766,14 +2863,16 @@ class PairsManager:
                         # Unknown which leg triggered - close both using stored qty
                         close_tasks = []
                         if qty1_close and qty1_close > 0:
-                            close_tasks.append(self.client.new_order(
-                                symbol=s1, side=side1_close, type='MARKET',
-                                quantity=qty1_close, reduceOnly='true', newOrderRespType='RESULT'
+                            close_tasks.append(self._close_leg_reduce_only(
+                                symbol=s1,
+                                side=side1_close,
+                                quantity=qty1_close
                             ))
                         if qty2_close and qty2_close > 0:
-                            close_tasks.append(self.client.new_order(
-                                symbol=s2, side=side2_close, type='MARKET',
-                                quantity=qty2_close, reduceOnly='true', newOrderRespType='RESULT'
+                            close_tasks.append(self._close_leg_reduce_only(
+                                symbol=s2,
+                                side=side2_close,
+                                quantity=qty2_close
                             ))
                         if close_tasks:
                             results = await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -3021,18 +3120,20 @@ class PairsManager:
                         close_symbols = []
                         
                         if leg1_exists:
-                            close_tasks.append(self.client.new_order(
-                                symbol=s1, side=side1_close, type='MARKET', 
-                                quantity=abs(open_positions[s1]), reduceOnly='true', newOrderRespType='RESULT'
+                            close_tasks.append(self._close_leg_reduce_only(
+                                symbol=s1,
+                                side=side1_close,
+                                quantity=abs(open_positions[s1])
                             ))
                             close_symbols.append(s1)
                         else:
                             print(f"â„¹ï¸ {s1} already closed, skipping")
                             
                         if leg2_exists:
-                            close_tasks.append(self.client.new_order(
-                                symbol=s2, side=side2_close, type='MARKET', 
-                                quantity=abs(open_positions[s2]), reduceOnly='true', newOrderRespType='RESULT'
+                            close_tasks.append(self._close_leg_reduce_only(
+                                symbol=s2,
+                                side=side2_close,
+                                quantity=abs(open_positions[s2])
                             ))
                             close_symbols.append(s2)
                         else:
@@ -3630,7 +3731,11 @@ class PairsManager:
                             exec_side = executed['side']
                             revert_side = 'SELL' if exec_side == 'BUY' else 'BUY'
                             revert_tasks.append(
-                                self.client.new_order(symbol=exec_symbol, side=revert_side, type='MARKET', quantity=exec_qty, reduceOnly='true')
+                                self._close_leg_reduce_only(
+                                    symbol=exec_symbol,
+                                    side=revert_side,
+                                    quantity=exec_qty
+                                )
                             )
                         except Exception as rev_e:
                             print(f"  CRITICAL: Failed to prepare revert {exec_symbol}: {rev_e}")
@@ -3652,12 +3757,10 @@ class PairsManager:
                             if amt == 0:
                                 continue
                             close_side = 'SELL' if amt > 0 else 'BUY'
-                            await self.client.new_order(
+                            await self._close_leg_reduce_only(
                                 symbol=sym,
                                 side=close_side,
-                                type='MARKET',
-                                quantity=abs(amt),
-                                reduceOnly='true'
+                                quantity=abs(amt)
                             )
                             print(f"  Emergency rollback close executed for {sym} (qty={abs(amt)})")
                     except Exception as verify_err:
@@ -4134,6 +4237,14 @@ class PairsManager:
         Checks: Z-score TP/SL, Circuit Breaker, Beta Drift (with live recalc every 10s).
         """
         s1, s2 = pair_info.symbol1, pair_info.symbol2
+        now_ts = time.time()
+        close_retry_sec = int(getattr(self.config, 'close_retry_cooldown_sec', 30) or 30)
+        next_close_try_ts = float(getattr(pair_info, '_next_close_try_ts', 0) or 0)
+        if next_close_try_ts > now_ts:
+            return
+
+        def _arm_close_retry():
+            pair_info._next_close_try_ts = time.time() + max(5, close_retry_sec)
         
         # --- 1. Z-Score TP / SL (instant, every tick) ---
         z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
@@ -4144,12 +4255,14 @@ class PairsManager:
                 print(f"ðŸ’° RT TAKE PROFIT (Long) on {s1}-{s2}. Z: {z_score:.2f} >= {z_exit}. Closing...")
                 pair_info.close_handled = True
                 pair_info.is_trading = True
+                _arm_close_retry()
                 await self._execute_trade(pair_info, 0, close_reason='z_tp')
                 return
             elif z_score <= -z_stop:
                 print(f"ðŸ›‘ RT STOP LOSS (Long) on {s1}-{s2}. Z: {z_score:.2f} <= -{z_stop}. Closing...")
                 pair_info.close_handled = True
                 pair_info.is_trading = True
+                _arm_close_retry()
                 await self._execute_trade(pair_info, 0, close_reason='z_sl')
                 return
         
@@ -4158,12 +4271,14 @@ class PairsManager:
                 print(f"ðŸ’° RT TAKE PROFIT (Short) on {s1}-{s2}. Z: {z_score:.2f} <= {-z_exit}. Closing...")
                 pair_info.close_handled = True
                 pair_info.is_trading = True
+                _arm_close_retry()
                 await self._execute_trade(pair_info, 0, close_reason='z_tp')
                 return
             elif z_score >= z_stop:
                 print(f"ðŸ›‘ RT STOP LOSS (Short) on {s1}-{s2}. Z: {z_score:.2f} >= {z_stop}. Closing...")
                 pair_info.close_handled = True
                 pair_info.is_trading = True
+                _arm_close_retry()
                 await self._execute_trade(pair_info, 0, close_reason='z_sl')
                 return
         
@@ -4190,6 +4305,7 @@ class PairsManager:
                     await self._notify(cb_msg, reply_to)
                     pair_info.close_handled = True
                     pair_info.is_trading = True
+                    _arm_close_retry()
                     await self._execute_trade(pair_info, 0, close_reason='circuit')
                     return
         
@@ -4230,6 +4346,7 @@ class PairsManager:
                     await self._notify(beta_msg, reply_to)
                     pair_info.close_handled = True
                     pair_info.is_trading = True
+                    _arm_close_retry()
                     await self._execute_trade(pair_info, 0, close_reason='beta_critical')
                     return
             
@@ -4251,6 +4368,7 @@ class PairsManager:
                     await self._notify(beta_msg, reply_to)
                     pair_info.close_handled = True
                     pair_info.is_trading = True
+                    _arm_close_retry()
                     await self._execute_trade(pair_info, 0, close_reason='beta_drift')
                     return
                 else:

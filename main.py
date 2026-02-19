@@ -670,7 +670,11 @@ async def _backup_pair_history_rotating(conf, cutoff_days: int = 351):
     last_id = 0
     with gzip.open(new_path, mode='wt', encoding='utf-8', newline='') as gz:
         writer = csv.writer(gz)
-        writer.writerow(['id', 'symbol1', 'symbol2', 'event_type', 'timestamp', 'hedge_ratio', 'half_life', 'reason'])
+        writer.writerow([
+            'id', 'symbol1', 'symbol2', 'event_type', 'timestamp',
+            'hedge_ratio', 'half_life', 'pair_id', 'trade_id',
+            'z_score', 'beta_btc', 'pvalue', 'reason'
+        ])
         while True:
             batch = await db.fetch_pair_history_batch_before_ts(cutoff_ms=cutoff_ms, last_id=last_id, limit=5000)
             if not batch:
@@ -678,7 +682,13 @@ async def _backup_pair_history_rotating(conf, cutoff_days: int = 351):
             for row in batch:
                 writer.writerow([
                     row.id, row.symbol1, row.symbol2, row.event_type, row.timestamp,
-                    row.hedge_ratio, row.half_life, row.reason
+                    row.hedge_ratio, row.half_life,
+                    getattr(row, 'pair_id', None),
+                    getattr(row, 'trade_id', None),
+                    getattr(row, 'z_score', None),
+                    getattr(row, 'beta_btc', None),
+                    getattr(row, 'pvalue', None),
+                    row.reason
                 ])
                 last_id = row.id
                 written += 1

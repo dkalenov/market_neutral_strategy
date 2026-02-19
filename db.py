@@ -3,13 +3,19 @@ import os
 import csv
 import gzip
 import shutil
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, JSON, text, func
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 # Create base class for DB operations
 Base = declarative_base()
 Session: async_sessionmaker = None
+
+
+class DuplicateActivePairError(Exception):
+    """Raised when inserting duplicate active pair blocked by unique index."""
+    pass
 
 
 # Table for main configuration keys
@@ -28,6 +34,11 @@ class PairHistory(Base):
     timestamp = Column(BigInteger)
     hedge_ratio = Column(Float)
     half_life = Column(Float)
+    pair_id = Column(Integer, nullable=True)      # FK-like reference to pairs.id (not enforced)
+    trade_id = Column(Integer, nullable=True)     # FK-like reference to trades.id (not enforced)
+    z_score = Column(Float, default=0.0)          # Snapshot metric at event time
+    beta_btc = Column(Float, default=0.0)         # Snapshot beta at event time
+    pvalue = Column(Float, default=0.0)           # Snapshot p-value at event time
     reason = Column(String, nullable=True) # Removal reason
 
 # Table for active trading pairs
@@ -228,12 +239,26 @@ async def run_migrations(engine):
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
+        # Pair history — structured analytics fields
+        "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS pair_id INTEGER;",
+        "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS trade_id INTEGER;",
+        "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS z_score FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS pvalue FLOAT DEFAULT 0.0;",
+        # Cleanup deprecated pair_history columns (kept in older builds)
+        "ALTER TABLE pair_history DROP COLUMN IF EXISTS metric;",
+        "ALTER TABLE pair_history DROP COLUMN IF EXISTS metric_value;",
+        "ALTER TABLE pair_history DROP COLUMN IF EXISTS metric_threshold;",
+        "ALTER TABLE pair_history DROP COLUMN IF EXISTS details;",
         # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
         # Performance indexes (safe, idempotent)
         "CREATE INDEX IF NOT EXISTS idx_pairs_is_archived ON pairs (is_archived);",
         "CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);",
         "CREATE INDEX IF NOT EXISTS idx_trades_pair_id ON trades (pair_id);",
+        "CREATE INDEX IF NOT EXISTS idx_pair_history_ts ON pair_history (timestamp);",
+        "CREATE INDEX IF NOT EXISTS idx_pair_history_event ON pair_history (event_type);",
+        "CREATE INDEX IF NOT EXISTS idx_pair_history_symbols ON pair_history (symbol1, symbol2);",
         # Prevent duplicate ACTIVE pairs regardless of symbol order.
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_pairs_unique_active "
         "ON pairs (LEAST(symbol1, symbol2), GREATEST(symbol1, symbol2)) "
@@ -368,10 +393,49 @@ async def get_all_pairs(include_archived: bool = False):
         return pairs.scalars().all()
 
 
+async def get_active_pair_keys() -> set[tuple[str, str]]:
+    """
+    Return canonical symbol keys for all active (non-archived) pairs.
+    Key format: (min(symbol1, symbol2), max(symbol1, symbol2)).
+    """
+    async with Session() as s:
+        rows = await s.execute(
+            select(Pairs.symbol1, Pairs.symbol2).where(Pairs.is_archived.is_(False))
+        )
+        result = set()
+        for sym1, sym2 in rows.all():
+            if not sym1 or not sym2:
+                continue
+            a, b = sorted((str(sym1), str(sym2)))
+            result.add((a, b))
+        return result
+
+
+async def active_pair_exists(symbol1: str, symbol2: str) -> bool:
+    """Check if an active (non-archived) pair exists regardless of symbol order."""
+    sym_lo, sym_hi = sorted((symbol1, symbol2))
+    async with Session() as s:
+        stmt = (
+            select(Pairs.id)
+            .where(Pairs.is_archived.is_(False))
+            .where(func.least(Pairs.symbol1, Pairs.symbol2) == sym_lo)
+            .where(func.greatest(Pairs.symbol1, Pairs.symbol2) == sym_hi)
+            .limit(1)
+        )
+        result = await s.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+
 async def add_pair(pair):
     async with Session() as s:
         s.add(pair)
-        await s.commit()
+        try:
+            await s.commit()
+        except IntegrityError as e:
+            await s.rollback()
+            if 'idx_pairs_unique_active' in str(e):
+                raise DuplicateActivePairError from e
+            raise
 
 
 async def update_trade_fields(trade_id, **kwargs):
@@ -395,6 +459,42 @@ async def add_pair_history(history_item):
     async with Session() as s:
         s.add(history_item)
         await s.commit()
+
+
+async def log_pair_history_event(
+    *,
+    symbol1: str,
+    symbol2: str,
+    event_type: str,
+    timestamp_ms: int | None = None,
+    hedge_ratio: float | None = None,
+    half_life: float | None = None,
+    reason: str | None = None,
+    pair_id: int | None = None,
+    trade_id: int | None = None,
+    z_score: float | None = None,
+    beta_btc: float | None = None,
+    pvalue: float | None = None,
+):
+    """
+    Structured PairHistory event writer.
+    Keeps reason as human-readable text but stores analyzable numeric/context fields.
+    """
+    item = PairHistory(
+        symbol1=symbol1,
+        symbol2=symbol2,
+        event_type=event_type,
+        timestamp=timestamp_ms if timestamp_ms is not None else int(time.time() * 1000),
+        hedge_ratio=float(hedge_ratio) if hedge_ratio is not None else 0.0,
+        half_life=float(half_life) if half_life is not None else 0.0,
+        reason=reason,
+        pair_id=pair_id,
+        trade_id=trade_id,
+        z_score=float(z_score) if z_score is not None else 0.0,
+        beta_btc=float(beta_btc) if beta_btc is not None else 0.0,
+        pvalue=float(pvalue) if pvalue is not None else 0.0,
+    )
+    await add_pair_history(item)
 
 
 async def delete_pair(pair_id):
