@@ -194,6 +194,8 @@ class PairsManager:
         
         # Background warmup/discovery task (quick startup mode)
         self._warmup_task = None
+        # Prevent recursive/parallel reconcile loops.
+        self._reconcile_lock = asyncio.Lock()
 
     async def initialize(self):
         """
@@ -249,7 +251,7 @@ class PairsManager:
         except Exception as e:
             print(f"âš ï¸ Could not restore re-entry guards from DB: {e}")
 
-    async def _load_state_from_db(self):
+    async def _load_state_from_db(self, run_reconcile: bool = True):
         """
         CRITICAL: Exchange is source of truth.
         1. Fetch actual positions from exchange FIRST
@@ -466,7 +468,8 @@ class PairsManager:
             
             # Continue with full reconciliation (orphan handling, unknown positions, etc.)
             # MUST be inside try block - if DB load failed, we must NOT reconcile with empty active_pairs
-            await self._reconcile_with_exchange()
+            if run_reconcile:
+                await self._reconcile_with_exchange()
             
         except Exception as e:
             print(f"âŒ Error loading state: {e}")
@@ -480,8 +483,12 @@ class PairsManager:
         CRITICAL: Synchronize DB state with actual exchange positions.
         Exchange is the SINGLE SOURCE OF TRUTH.
         """
-        print("ðŸ”„ Reconciling DB with exchange positions...")
         try:
+            if self._reconcile_lock.locked():
+                print("⏭️ Reconcile already in progress, skipping re-entry.")
+                return
+            await self._reconcile_lock.acquire()
+            print("ðŸ”„ Reconciling DB with exchange positions...")
             # Get all open positions from exchange
             exchange_positions = await self.client.get_position_risk()
             
@@ -539,7 +546,7 @@ class PairsManager:
                 if len(self.active_pairs) == 0 and len(open_on_exchange) > 0:
                     print("âš ï¸ SAFETY: active_pairs is EMPTY but exchange has positions. Attempting emergency DB recovery...")
                     try:
-                        await self._load_state_from_db()
+                        await self._load_state_from_db(run_reconcile=False)
                     except Exception as e:
                         print(f"âš ï¸ Emergency DB load failed: {e}")
                     
@@ -565,6 +572,12 @@ class PairsManager:
                     print(f"  âš ï¸ Could not query DB for safety check: {e}")
                     db_pair_map = {}
                 
+                recovered_pairs = []
+                unknown_to_close = []
+                unknown_already_closed = []
+                unknown_closed = []
+                unknown_failed = []
+
                 for symbol in unknown_positions:
                     pos_data = open_on_exchange[symbol]
                     qty = pos_data['qty']
@@ -610,26 +623,14 @@ class PairsManager:
                                     tracked_symbols.add(db_pair.symbol1)
                                     tracked_symbols.add(db_pair.symbol2)
                                     print(f"      ðŸ”„ RECOVERED from DB: {db_pair.symbol1}-{db_pair.symbol2} (was missed during load)")
-                                    await self._notify(
-                                        f"ðŸ”„ <b>PAIR RECOVERED</b>\n\n"
-                                        f"Pair: {db_pair.symbol1}-{db_pair.symbol2}\n"
-                                        f"Was missed during DB load but found on exchange + DB.\n"
-                                        f"Restored to active trading."
-                                    )
+                                    recovered_pairs.append(f"{db_pair.symbol1}-{db_pair.symbol2}")
                                 recovered_from_db = True
                                 break
                     if recovered_from_db:
                         continue  # Skip closing - symbol is no longer unknown
                     
                     # Only close if truly unknown (not found in DB either)
-                    pnl_emoji = "ðŸ”´" if unrealized_pnl < 0 else "ðŸŸ¢"
-                    await self._notify(
-                        f"ðŸš¨ <b>UNKNOWN POSITION DETECTED</b>\n\n"
-                        f"Symbol: {symbol} ({side})\n"
-                        f"Qty: {qty}\n"
-                        f"ðŸ’µ Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>\n\n"
-                        f"â±ï¸ <b>Closing...</b>"
-                    )
+                    unknown_to_close.append(f"{symbol} ({side} {qty}) upnl={unrealized_pnl:+.2f}")
                     
                     try:
                         # Re-verify position still exists before closing
@@ -644,7 +645,7 @@ class PairsManager:
                         
                         if not position_exists:
                             print(f"      â†’ Position {symbol} already closed, skipping")
-                            await self._notify(f"âœ… Unknown position {symbol} was already closed.")
+                            unknown_already_closed.append(symbol)
                         else:
                             await self.client.cancel_open_orders(symbol)
                             
@@ -663,13 +664,43 @@ class PairsManager:
                             start_ms = now_ms - 300_000
                             trades = await self.client.get_account_trades(symbol=symbol, startTime=start_ms, limit=50)
                             pnl = sum(float(t.get('realizedPnl', 0)) for t in trades)
-                            pnl_emoji = "ðŸŸ¢" if pnl >= 0 else "ðŸ”´"
-                            
-                            await self._notify(f"âš¡ <b>Unknown Position Closed:</b> {symbol}\n"
-                                               f"ðŸ’µ PnL: {pnl_emoji} <b>{pnl:.2f} USDT</b>")
+                            unknown_closed.append((symbol, pnl))
                     except Exception as e:
                         print(f"      âš ï¸ Failed to close {symbol}: {e}")
-                        await self._notify(f"ðŸš¨ FAILED to close: {symbol}\nError: {e}")
+                        unknown_failed.append((symbol, str(e)))
+
+                # Send ONE aggregated notification instead of N per-symbol messages.
+                if recovered_pairs or unknown_to_close or unknown_already_closed or unknown_closed or unknown_failed:
+                    lines = [
+                        "🚨 <b>UNKNOWN POSITIONS RECONCILE</b>",
+                        f"Detected: {len(unknown_positions)}",
+                    ]
+                    if recovered_pairs:
+                        uniq_recovered = sorted(set(recovered_pairs))
+                        lines.append(f"Recovered from DB: {len(uniq_recovered)}")
+                        lines.extend([f"  • {p}" for p in uniq_recovered[:10]])
+                        if len(uniq_recovered) > 10:
+                            lines.append(f"  • ... and {len(uniq_recovered) - 10} more")
+                    if unknown_to_close:
+                        lines.append(f"Tried to close: {len(unknown_to_close)}")
+                        lines.extend([f"  • {x}" for x in unknown_to_close[:10]])
+                        if len(unknown_to_close) > 10:
+                            lines.append(f"  • ... and {len(unknown_to_close) - 10} more")
+                    if unknown_already_closed:
+                        lines.append(f"Already closed before action: {len(unknown_already_closed)}")
+                    if unknown_closed:
+                        lines.append(f"Closed: {len(unknown_closed)}")
+                        for sym, pnl in unknown_closed[:10]:
+                            lines.append(f"  • {sym}: pnl={pnl:+.2f} USDT")
+                        if len(unknown_closed) > 10:
+                            lines.append(f"  • ... and {len(unknown_closed) - 10} more")
+                    if unknown_failed:
+                        lines.append(f"Failed: {len(unknown_failed)}")
+                        for sym, err in unknown_failed[:5]:
+                            lines.append(f"  • {sym}: {err[:120]}")
+                        if len(unknown_failed) > 5:
+                            lines.append(f"  • ... and {len(unknown_failed) - 5} more")
+                    await self._notify("\n".join(lines))
             
             # Check each pair in DB
             pairs_to_fix = []
@@ -1038,6 +1069,12 @@ class PairsManager:
             print(f"âŒ Error during reconciliation: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            if self._reconcile_lock.locked():
+                try:
+                    self._reconcile_lock.release()
+                except Exception:
+                    pass
 
     def _get_exchange_pair_pnl(self, pair_info: PairInfo, price1: float = 0, price2: float = 0) -> float:
         """
