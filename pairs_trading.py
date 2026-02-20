@@ -242,6 +242,8 @@ class PairsManager:
         self._progress_last_kline_open_ts = 0
         self._progress_last_pair = ''
         self._progress_last_pair_ts = 0
+        # Discovery sharding cursor (for weak CPU: spread full universe over cycles).
+        self._discovery_round_idx = 0
 
     async def initialize(self):
         """
@@ -932,7 +934,14 @@ class PairsManager:
                             orphan_symbol = s1 if s1_open else s2
                             orphan_pos = open_on_exchange.get(orphan_symbol)
                             if orphan_pos:
-                                pairs_to_fix.append((pair_info, 'close_orphan_leg_keep_closed', orphan_symbol, orphan_pos))
+                                owner_pair = self._find_symbol_owner_pair(orphan_symbol, exclude_pair=pair_info)
+                                if owner_pair:
+                                    print(
+                                        f"  ℹ️ Skip orphan close for CLOSED pair {s1}-{s2}: "
+                                        f"{orphan_symbol} belongs to active pair {owner_pair}"
+                                    )
+                                else:
+                                    pairs_to_fix.append((pair_info, 'close_orphan_leg_keep_closed', orphan_symbol, orphan_pos))
             
             # Apply fixes
             externally_closed_pairs = []
@@ -1046,6 +1055,13 @@ class PairsManager:
                     orphan_qty = abs(float(orphan_pos.get('qty', 0) or 0))
                     orphan_side = orphan_pos.get('side', 'LONG')
                     if orphan_qty <= 0:
+                        continue
+                    owner_pair = self._find_symbol_owner_pair(orphan_symbol, exclude_pair=pair_info)
+                    if owner_pair:
+                        print(
+                            f"  ℹ️ Skip orphan close action for CLOSED pair {pair_info.symbol1}-{pair_info.symbol2}: "
+                            f"{orphan_symbol} belongs to active pair {owner_pair}"
+                        )
                         continue
 
                     close_side = 'SELL' if orphan_side == 'LONG' else 'BUY'
@@ -1747,6 +1763,18 @@ class PairsManager:
                 if pair_info.position_status == 0:
                     if leg1_open != leg2_open:
                         orphan_symbol = pair_info.symbol1 if leg1_open else pair_info.symbol2
+                        owner_pair = self._find_symbol_owner_pair(orphan_symbol, exclude_pair=pair_info)
+                        if owner_pair:
+                            now_conflict = time.time()
+                            last_warn = float(getattr(pair_info, '_orphan_conflict_warn_ts', 0) or 0)
+                            # Throttle to avoid log spam in 15s sync loop.
+                            if now_conflict - last_warn >= 120:
+                                pair_info._orphan_conflict_warn_ts = now_conflict
+                                print(
+                                    f"ℹ️ Skip orphan close for CLOSED pair {pair_info.symbol1}-{pair_info.symbol2}: "
+                                    f"{orphan_symbol} belongs to active pair {owner_pair}"
+                                )
+                            continue
                         orphan_amt = pos_by_symbol.get(orphan_symbol, 0)
                         if orphan_amt != 0:
                             print(f"⚠️ Orphan leg on CLOSED pair {pair_info.symbol1}-{pair_info.symbol2}: {orphan_symbol} amt={orphan_amt}. Closing...")
@@ -1899,7 +1927,7 @@ class PairsManager:
                         if close_candidates:
                             close_candidates.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                             trigger_order = close_candidates[0]
-                            o_type = trigger_order.get('type', '') or trigger_order.get('origType', '')
+                            o_type = str(trigger_order.get('type') or trigger_order.get('origType') or '')
                             
                             if 'STOP' in o_type:
                                 desync_reason = f'Hardware SL triggered on {closed_leg}'
@@ -2275,12 +2303,12 @@ class PairsManager:
                         print(f"  Analyzing {s1}-{s2}...")
                         await self._check_signals_for_active_pairs(s1)
 
-    def start_background_warmup(self, target_symbols, concurrency=20):
-        """Start full history warmup + discovery in background (non-blocking startup)."""
+    def start_background_warmup(self, target_symbols, concurrency=20, run_discovery=True):
+        """Start history warmup (and optional discovery) in background (non-blocking)."""
         if self._warmup_task is not None and not self._warmup_task.done():
             return
         self._warmup_task = self.loop.create_task(
-            self.initialize_all_symbols_data(target_symbols, concurrency=concurrency, run_discovery=True)
+            self.initialize_all_symbols_data(target_symbols, concurrency=concurrency, run_discovery=run_discovery)
         )
         def _warmup_done(task):
             try:
@@ -2818,6 +2846,7 @@ class PairsManager:
 
         # Pre-filter pairs that already exist in DB to avoid duplicate discovery noise
         # and unnecessary stats/beta calculations for known pairs.
+        existing_db_keys = set()
         try:
             existing_db_keys = await db.get_active_pair_keys()
             for sym1, sym2 in existing_db_keys:
@@ -2876,29 +2905,59 @@ class PairsManager:
 
         # --- 2. Generate standard combinations ---
         added_count = 0
+        truncated_by_cap = False
         if not priority_only:
+            discovery_shards = int(getattr(self.config, 'discovery_shards', 1) or 1)
+            if discovery_shards < 1:
+                discovery_shards = 1
+            discovery_max_pairs = int(getattr(self.config, 'discovery_max_pairs_per_cycle', 0) or 0)
+            if discovery_max_pairs < 0:
+                discovery_max_pairs = 0
+
+            round_idx = int(getattr(self, '_discovery_round_idx', 0) or 0)
+            shard_idx = round_idx % discovery_shards
+            self._discovery_round_idx = round_idx + 1
+            if discovery_shards > 1:
+                print(
+                    f"Discovery sharding: shard {shard_idx + 1}/{discovery_shards} "
+                    f"(round={round_idx + 1})"
+                )
+            if discovery_max_pairs > 0:
+                print(f"Discovery cap: max {discovery_max_pairs} non-priority pairs this cycle")
+
             all_combinations = itertools.combinations(ready_symbols, 2)
-            for p in all_combinations:
+            for combo_idx, p in enumerate(all_combinations):
+                if discovery_shards > 1 and (combo_idx % discovery_shards) != shard_idx:
+                    continue
                 pair_set = frozenset(p)
                 if pair_set not in self.active_pairs and pair_set not in checked_pairs:
                     candidates_to_process.append(p)
                     added_count += 1
+                    if discovery_max_pairs > 0 and added_count >= discovery_max_pairs:
+                        truncated_by_cap = True
+                        break
         else:
             print("Priority-only discovery: skipping non-priority pair combinations for fast startup.")
                 
         total_pairs = len(candidates_to_process)
         print(f"Total pairs to check: {total_pairs} (Priority: {len(priority_pairs)}, Others: {added_count})")
+        if truncated_by_cap:
+            print("⚡ Discovery non-priority list truncated by cap for this cycle.")
         
         if total_pairs == 0:
             return
 
         worker_count = max(1, int(getattr(self.executor, "_max_workers", 1)))
         # On Windows spawn mode, repeatedly pickling large data_snapshot per chunk is expensive.
-        # If only one worker is available, process in a single chunk to avoid N-times serialization overhead.
-        CHUNK_SIZE = total_pairs if worker_count == 1 else 5000
-        # Priority pairs are first in the list, so they will be in the first chunks
-        chunks = [candidates_to_process[i:i + CHUNK_SIZE] for i in range(0, total_pairs, CHUNK_SIZE)]
-        print(f"Split into {len(chunks)} chunks for parallel processing (workers={worker_count}, chunk_size={CHUNK_SIZE}).")
+        # Keep chunk count close to worker count to minimize serialization overhead.
+        if worker_count <= 1:
+            chunk_size = total_pairs
+        else:
+            target_chunks = min(worker_count, total_pairs)
+            chunk_size = max(1, int(math.ceil(total_pairs / target_chunks)))
+        # Priority pairs are first in the list, so they stay in the first chunks.
+        chunks = [candidates_to_process[i:i + chunk_size] for i in range(0, total_pairs, chunk_size)]
+        print(f"Split into {len(chunks)} chunks for parallel processing (workers={worker_count}, chunk_size={chunk_size}).")
         
         tasks = []
         for chunk in chunks:
@@ -2927,6 +2986,7 @@ class PairsManager:
             if completed == 1 or completed % 5 == 0 or completed == total_chunks:
                 print(f"Discovery progress: {completed}/{total_chunks} chunks completed.")
         
+        existing_db_keys_canonical = set(existing_db_keys or set())
         new_pairs_count = 0
         batch_idx = 0
         for batch_results in results_list:
@@ -2939,11 +2999,12 @@ class PairsManager:
                 s1, s2, hedge, hl, pval = res
                 try:
                     pair_set = frozenset([s1, s2])
+                    canonical_key = tuple(sorted((s1, s2)))
                     # Final duplicate check before touching DB (race condition protection)
                     if pair_set in self.active_pairs:
                         print(f"  ⚠️ Skipping duplicate (race condition): {s1}-{s2}")
                         continue
-                    if await db.active_pair_exists(s1, s2):
+                    if canonical_key in existing_db_keys_canonical:
                         print(f"  ⚠️ Skipping duplicate (already active in DB): {s1}-{s2}")
                         continue
 
@@ -2959,6 +3020,7 @@ class PairsManager:
                     except db.DuplicateActivePairError:
                         print(f"  ⚠️ Skipping duplicate in DB: {s1}-{s2}")
                         continue
+                    existing_db_keys_canonical.add(canonical_key)
                     
                     # === BETA CHECK BEFORE ADDING TO ACTIVE PAIRS ===
                     # Calculate beta to BTC to ensure pair is market-neutral
@@ -3727,6 +3789,19 @@ class PairsManager:
                     return True
         return False
 
+    def _find_symbol_owner_pair(self, symbol: str, exclude_pair=None) -> str:
+        """
+        Return owner pair name if symbol is currently used by another OPEN/TRADING pair.
+        Used to prevent false orphan cleanup on stale CLOSED pairs.
+        """
+        for pair_info in self.active_pairs.values():
+            if exclude_pair is not None and pair_info is exclude_pair:
+                continue
+            if pair_info.position_status != 0 or pair_info.is_trading:
+                if symbol in (pair_info.symbol1, pair_info.symbol2):
+                    return f"{pair_info.symbol1}-{pair_info.symbol2}"
+        return ''
+
     def count_active_positions(self, exclude_pair=None) -> int:
         """Count the number of currently open or being-opened pairs."""
         count = 0
@@ -3866,10 +3941,13 @@ class PairsManager:
                 if pair_info.position_status == 0:
                     return
 
-                print(f"EXECUTING CLOSE for {s1}-{s2} (reason: {close_reason})")
+                close_reason_tag = str(close_reason).strip().lower() if close_reason is not None else ''
+                if not close_reason_tag:
+                    close_reason_tag = 'unknown'
+                print(f"EXECUTING CLOSE for {s1}-{s2} (reason: {close_reason_tag})")
                 
                 # Store close reason IMMEDIATELY so external handlers can see it
-                pair_info.last_close_reason = close_reason or 'unknown'
+                pair_info.last_close_reason = close_reason_tag
                 
                 side1_close = 'SELL' if pair_info.position_status == 1 else 'BUY'
                 side2_close = 'BUY' if pair_info.position_status == 1 else 'SELL'
@@ -3878,7 +3956,7 @@ class PairsManager:
                 
                 # FAST PATH: For SL/TP triggered closes, one leg is already closed
                 # Close the other leg IMMEDIATELY, cancel orders AFTER
-                is_hardware_close = close_reason in ('hardware_sl', 'hardware_tp')
+                is_hardware_close = close_reason_tag in ('hardware_sl', 'hardware_tp')
                 
                 if is_hardware_close:
                     # One leg already closed by exchange - close the other one ASAP
@@ -4017,7 +4095,7 @@ class PairsManager:
                             await db.close_trade_record(
                                 saved_trade_id,
                                 status='CLOSED',
-                                close_reason=close_reason or 'unknown',
+                                close_reason=close_reason_tag,
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=net_pnl,
@@ -4036,7 +4114,7 @@ class PairsManager:
                         'hardware_sl': '🛡️ Hardware Stop Loss',
                         'hardware_tp': '🛡️ Hardware Take Profit',
                     }
-                    reason_text = HW_REASONS.get(close_reason, f'🛡️ Hardware {close_reason}')
+                    reason_text = HW_REASONS.get(close_reason_tag, f'🛡️ Hardware {close_reason_tag}')
                     
                     pnl_emoji = "🟢" if net_pnl > 0 else "🔴"
                     e1 = '🟢' if pnl1 >= 0 else '🔴'
@@ -4087,7 +4165,8 @@ class PairsManager:
                             print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
                     close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
                     
-                    full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
+                    full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n"
+                    full_msg += f"🏷️ Tag: <code>{close_reason_tag}</code>\n\n"
                     full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
                     full_msg += f"⏳ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
                     full_msg += f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
@@ -4099,7 +4178,7 @@ class PairsManager:
                     await self._notify(full_msg, reply_to)
                     
                     # State cleanup for hardware close
-                    self._update_pair_quality_penalty_on_close(pair_info, close_reason)
+                    self._update_pair_quality_penalty_on_close(pair_info, close_reason_tag)
                     self._update_quality_score_cache(pair_info)
                     pair_info.position_status = 0
                     pair_info.qty1 = 0
@@ -4107,7 +4186,7 @@ class PairsManager:
                     pair_info.entry_price1 = 0
                     pair_info.entry_price2 = 0
                     pair_info.current_trade_id = None
-                    self._apply_close_cooldown(pair_info, close_reason)
+                    self._apply_close_cooldown(pair_info, close_reason_tag)
                     
                     # Update exchange position cache
                     self._exchange_positions_cache.pop(s1, None)
@@ -4115,7 +4194,7 @@ class PairsManager:
                     self._exchange_position_count = len(self._exchange_positions_cache)
                     
                     # WAIT FOR CANDLE: pair-local same-candle guard
-                    self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'hardware_close')
+                    self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
                     
                     # Update DB (includes close_pnl + market neutrality metrics)
                     if pair_info.db_id:
@@ -4128,7 +4207,7 @@ class PairsManager:
                             'entry_price2': 0,
                             'close_time': int(time.time()),
                             'close_pnl': net_pnl,
-                            'close_reason': close_reason or 'unknown',
+                            'close_reason': close_reason_tag,
                             'pnl1': pnl1,
                             'pnl2': pnl2,
                             'fee1': _hw_fee1,
@@ -4220,7 +4299,7 @@ class PairsManager:
                         print(err_msg)
                         await self._notify(err_msg)
                     else:
-                        reason_text = CLOSE_REASONS.get(close_reason, '\u2753 Unknown') if close_reason else '\u2753 Unknown'
+                        reason_text = CLOSE_REASONS.get(close_reason_tag, '\u2753 Unknown')
                     
                         def get_price(order):
                             if 'avgPrice' in order and float(order['avgPrice']) > 0:
@@ -4306,7 +4385,7 @@ class PairsManager:
                             await db.close_trade_record(
                                 pair_info.current_trade_id,
                                 status='CLOSED',
-                                close_reason=close_reason or 'unknown',
+                                close_reason=close_reason_tag,
                                 close_price_1=close_price1,
                                 close_price_2=close_price2,
                                 pnl=net_pnl,
@@ -4323,8 +4402,8 @@ class PairsManager:
                         pair_info.qty1 = 0
                         pair_info.qty2 = 0
                         pair_info.close_handled = True  # Mark as handled to prevent duplicate notification
-                        pair_info.last_close_reason = close_reason or 'unknown'
-                        self._apply_close_cooldown(pair_info, close_reason)
+                        pair_info.last_close_reason = close_reason_tag
+                        self._apply_close_cooldown(pair_info, close_reason_tag)
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                         
@@ -4349,10 +4428,11 @@ class PairsManager:
                                 if not sym:
                                     continue
                                 if sym in orders_by_sym:
-                                    order_type = o.get('type', '') or o.get('orderType', '')
-                                    if 'STOP' in order_type.upper():
+                                    order_type = str(o.get('type') or o.get('orderType') or '')
+                                    order_type_up = order_type.upper()
+                                    if 'STOP' in order_type_up:
                                         orders_by_sym[sym].append(('SL', o.get('algoId')))
-                                    elif 'TAKE_PROFIT' in order_type.upper():
+                                    elif 'TAKE_PROFIT' in order_type_up:
                                         orders_by_sym[sym].append(('TP', o.get('algoId')))
                                     else:
                                         orders_by_sym[sym].append((order_type or 'ORDER', o.get('algoId')))
@@ -4414,7 +4494,8 @@ class PairsManager:
                             except Exception as e:
                                 print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
                         close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
-                        full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n\n"
+                        full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n"
+                        full_msg += f"🏷️ Tag: <code>{close_reason_tag}</code>\n\n"
                         full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
                         full_msg += f"⏳ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
                         full_msg += f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
@@ -4428,7 +4509,7 @@ class PairsManager:
                         await self._notify(full_msg, reply_to)
                         
                         # Update DB with close details + market neutrality metrics
-                        self._update_pair_quality_penalty_on_close(pair_info, close_reason)
+                        self._update_pair_quality_penalty_on_close(pair_info, close_reason_tag)
                         self._update_quality_score_cache(pair_info)
                         if pair_info.db_id:
                             await db.update_pair({
@@ -4440,7 +4521,7 @@ class PairsManager:
                                 'entry_price2': 0,
                                 'close_time': int(time.time()),
                                 'close_pnl': net_pnl,
-                                'close_reason': close_reason or 'unknown',
+                                'close_reason': close_reason_tag,
                                 'pnl1': pnl1,
                                 'pnl2': pnl2,
                                 'fee1': _norm_fee1,
@@ -4452,12 +4533,12 @@ class PairsManager:
                         
                         # AUTO-ADD to best_pairs.json on successful TP only
                         # BUG-7 FIX: Don't add pairs from forced closes (circuit, beta_drift, etc.)
-                        if close_reason in ('z_tp', 'hardware_tp'):
+                        if close_reason_tag in ('z_tp', 'hardware_tp'):
                             self._add_to_best_pairs(s1, s2)
                         
                         # WAIT FOR CANDLE: re-entry block is ALWAYS pair-local.
                         # Only this closed pair is blocked; other pairs may still open.
-                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'close')
+                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
                         
                         # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
                         print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
@@ -4472,7 +4553,7 @@ class PairsManager:
                                 await db.close_trade_record(
                                     pair_info.current_trade_id,
                                     status='CLOSED_ERROR',
-                                    close_reason=close_reason or 'close_error',
+                                    close_reason=close_reason_tag,
                                 )
                                 pair_info.current_trade_id = None
                             except Exception as trade_close_err:
@@ -4483,14 +4564,18 @@ class PairsManager:
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                         pair_info.close_handled = True
-                        pair_info.last_close_reason = close_reason or 'unknown'
-                        self._apply_close_cooldown(pair_info, close_reason)
-                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'close_error')
+                        pair_info.last_close_reason = close_reason_tag
+                        self._apply_close_cooldown(pair_info, close_reason_tag)
+                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
                         self._exchange_positions_cache.pop(s1, None)
                         self._exchange_positions_cache.pop(s2, None)
                         self._exchange_position_count = len(self._exchange_positions_cache)
                         # Send error notification to TG
-                        err_msg = f"⚠️ Close error {s1}-{s2}: {e}\nPosition closed on exchange but notification failed."
+                        err_msg = (
+                            f"⚠️ Close error {s1}-{s2} [tag={close_reason_tag}]: "
+                            f"{type(e).__name__}: {e}\n"
+                            f"Position closed on exchange but notification failed."
+                        )
                         reply_to = await self._resolve_reply_to_message_id(pair_info)
                         await self._notify(err_msg, reply_to)
                     except Exception:

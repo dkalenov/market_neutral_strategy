@@ -180,6 +180,10 @@ class ConfigInfo:
     idle_timeout_hours: float  # Remove idle pairs older than X hours (default 48)
     # Realtime markPrice load control
     markprice_max_symbols: int              # Max symbols in markPrice realtime subscription (default 120)
+    # Discovery performance controls (for weak CPUs)
+    discovery_shards: int                   # Split full discovery into N shards across cycles (default 4)
+    discovery_max_pairs_per_cycle: int      # Max non-priority pairs per discovery cycle (default 12000)
+    refresh_warmup_concurrency: int         # History warmup concurrency after symbol refresh (default 8)
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -434,6 +438,10 @@ async def load_config():
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '24',      # Remove idle pairs older than X hours
             'markprice_max_symbols': '200',
+            # Discovery performance controls
+            'discovery_shards': '4',
+            'discovery_max_pairs_per_cycle': '12000',
+            'refresh_warmup_concurrency': '8',
         }
 
 

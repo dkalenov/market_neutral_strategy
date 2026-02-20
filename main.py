@@ -21,6 +21,7 @@ client: binance.Futures
 
 all_symbols: dict[str, binance.SymbolFutures] = {}
 websockets_list: list[binance.futures.WebsocketAsync] = []
+main_kline_wss: list[binance.futures.WebsocketAsync] = []
 userdata_ws: binance.futures.WebsocketAsync
 pairs_manager: pairs_trading.PairsManager
 
@@ -42,6 +43,7 @@ _ws_last_user_msg_ts: float = 0.0
 _ws_error_ts: deque = deque(maxlen=512)
 _ws_recover_lock: asyncio.Lock | None = None
 _ws_last_recover_ts: float = 0.0
+_main_kline_reload_lock: asyncio.Lock | None = None
 
 
 def _configure_console_encoding():
@@ -221,6 +223,7 @@ async def main():
     global all_symbols
     global _main_timeframe_global
     global _ws_recover_lock
+    global _main_kline_reload_lock
 
     startup_marks: list[tuple[str, float]] = []
     startup_profile = os.getenv('STARTUP_PROFILE', 'true').strip().lower() not in ('0', 'false', 'no')
@@ -340,6 +343,8 @@ async def main():
         _main_timeframe_global = timeframe
         if _ws_recover_lock is None:
             _ws_recover_lock = asyncio.Lock()
+        if _main_kline_reload_lock is None:
+            _main_kline_reload_lock = asyncio.Lock()
         
         # Robust window_size logic:
         # 1. Check if user provided a valid override
@@ -569,6 +574,58 @@ async def load_symbols_loop():
             if pairs_manager:
                 pairs_manager.all_symbols = new_symbols
                 print(f"✅ pairs_manager.all_symbols updated ({len(new_symbols)} symbols)")
+                # CRITICAL: refresh MAIN kline subscriptions to the new symbol universe.
+                # Without this, bot can stay on stale streams until full WS reconnect.
+                try:
+                    refresh_ws_symbols = set(new_symbols.keys())
+                    for pair_info in pairs_manager.active_pairs.values():
+                        if getattr(pair_info, 'position_status', 0) != 0 or getattr(pair_info, 'is_trading', False):
+                            refresh_ws_symbols.add(pair_info.symbol1)
+                            refresh_ws_symbols.add(pair_info.symbol2)
+                    if 'BTCUSDT' in all_symbols:
+                        refresh_ws_symbols.add('BTCUSDT')
+                    await _rebuild_main_kline_subscriptions(
+                        sorted(refresh_ws_symbols),
+                        _main_timeframe_global,
+                        reason='symbol_refresh'
+                    )
+                except Exception as ws_refresh_err:
+                    print(f"⚠️ Could not rebuild MAIN kline WS after refresh: {ws_refresh_err}")
+                # Refresh path: warm up history for refreshed universe in background
+                # and run a fast priority discovery without waiting for next candle close.
+                try:
+                    refresh_symbols = sorted(new_symbols.keys())
+                    refresh_warmup_conc = int(getattr(conf, 'refresh_warmup_concurrency', 8) or 8)
+                    if pairs_manager._warmup_task is None or pairs_manager._warmup_task.done():
+                        pairs_manager.start_background_warmup(
+                            refresh_symbols,
+                            concurrency=refresh_warmup_conc,
+                            run_discovery=False
+                        )
+                        print(
+                            f"⚡ Refresh warmup scheduled for {len(refresh_symbols)} symbols "
+                            f"(concurrency={refresh_warmup_conc}, discovery=off)."
+                        )
+
+                    async def _post_refresh_priority_discovery(wait_task):
+                        try:
+                            if wait_task is not None:
+                                await wait_task
+                        except Exception as warm_err:
+                            print(f"⚠️ Refresh warmup failed before priority discovery: {warm_err}")
+                        try:
+                            if pairs_manager and (pairs_manager._discovery_task is None or pairs_manager._discovery_task.done()):
+                                pairs_manager._last_discovery_time = time_mod.time()
+                                pairs_manager._discovery_task = pairs_manager.loop.create_task(
+                                    pairs_manager._discover_new_pairs(priority_only=True)
+                                )
+                                print("⚡ Post-refresh priority discovery scheduled.")
+                        except Exception as disc_err:
+                            print(f"⚠️ Could not schedule post-refresh priority discovery: {disc_err}")
+
+                    pairs_manager.loop.create_task(_post_refresh_priority_discovery(pairs_manager._warmup_task))
+                except Exception as refresh_bg_err:
+                    print(f"⚠️ Could not schedule post-refresh warmup/discovery: {refresh_bg_err}")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -607,6 +664,74 @@ def _timeframe_to_seconds(tf: str) -> int:
         except Exception:
             return 86400
     return 3600
+
+
+async def _rebuild_main_kline_subscriptions(symbols: list[str], timeframe: str, reason: str = "runtime") -> bool:
+    """
+    Rebuild only MAIN timeframe kline subscriptions (discovery/validation stream).
+    MarkPrice and user-data streams are managed separately.
+    """
+    global websockets_list
+    global main_kline_wss
+    global _ws_last_main_msg_ts
+    global _main_kline_reload_lock
+
+    if not client:
+        return False
+
+    if _main_kline_reload_lock is None:
+        _main_kline_reload_lock = asyncio.Lock()
+
+    async with _main_kline_reload_lock:
+        requested = sorted({s for s in (symbols or []) if s in all_symbols})
+        if not requested:
+            print(f"⚠️ MAIN kline rebuild skipped ({reason}): no symbols.")
+            return False
+
+        streams = [f"{s.lower()}@kline_{timeframe}" for s in requested]
+        kline_chunk_size = 80
+        chunks = [streams[i:i + kline_chunk_size] for i in range(0, len(streams), kline_chunk_size)]
+
+        new_main_wss: list[binance.futures.WebsocketAsync] = []
+        try:
+            for chunk in chunks:
+                ws = await client.websocket(chunk, on_message=ws_msg_main, on_error=ws_error)
+                new_main_wss.append(ws)
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            for ws in new_main_wss:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            print(f"⚠️ MAIN kline rebuild failed ({reason}): {e}")
+            return False
+
+        old_main = list(main_kline_wss)
+        main_kline_wss = new_main_wss
+
+        for ws in old_main:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            try:
+                websockets_list.remove(ws)
+            except ValueError:
+                pass
+
+        for ws in new_main_wss:
+            if ws not in websockets_list:
+                websockets_list.append(ws)
+
+        if pairs_manager:
+            pairs_manager._subscribed_main_symbols = set(requested)
+        _ws_last_main_msg_ts = time_mod.time()
+        print(
+            f"✅ MAIN kline WS rebuilt ({reason}): {len(requested)} symbols, "
+            f"{len(new_main_wss)} connections."
+        )
+        return True
 
 
 async def _recover_ws_stack(reason: str):
@@ -702,6 +827,7 @@ async def ws_health_watchdog_loop():
 # Connect to websockets
 async def connect_ws(timeframe='1h'):
     global websockets_list
+    global main_kline_wss
     global userdata_ws
     global pairs_manager
     global _ws_last_main_msg_ts
@@ -800,25 +926,12 @@ async def connect_ws(timeframe='1h'):
                 run_discovery=False
             )
 
-    # MAIN TIMEFRAME: for discovery (cointegration tests)
-    main_streams = [f"{symbol.lower()}@kline_{timeframe}" for symbol in target_symbols]
-    
     print(f"Single TF Mode: {timeframe}")
 
-    # Start websockets for MAIN timeframe (slightly smaller chunks for better stability)
-    kline_chunk_size = 80
-    streams_list = [main_streams[i:i + kline_chunk_size] for i in range(0, len(main_streams), kline_chunk_size)]
-
-    for i, stream_list in enumerate(streams_list):
-        try:
-            ws = await client.websocket(stream_list, on_message=ws_msg_main, on_error=ws_error)
-            websockets_list.append(ws)
-            await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"Error subscribing to main TF chunk {i+1}: {e}")
+    # MAIN TIMEFRAME: for discovery (cointegration tests)
+    await _rebuild_main_kline_subscriptions(target_symbols, timeframe, reason='startup')
     t_main_ws = time_mod.perf_counter()
-
-    print(f"Connected to main TF kline websockets ({len(websockets_list)} connections).")
+    print(f"Connected to main TF kline websockets ({len(main_kline_wss)} connections).")
 
     # Userdata websocket
     try:
@@ -938,6 +1051,7 @@ async def connect_ws(timeframe='1h'):
 # Disconnect from websockets
 async def disconnect_ws():
     global websockets_list
+    global main_kline_wss
     global userdata_ws
     print("Disconnecting from websockets...")
     for ws in websockets_list:
@@ -951,6 +1065,7 @@ async def disconnect_ws():
     except:
         pass
     websockets_list.clear()
+    main_kline_wss.clear()
     userdata_ws = None
 
 
@@ -1169,7 +1284,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = o.get('type', '') or o.get('origType', '')
+                                o_type = str(o.get('type') or o.get('origType') or '')
                                 
                                 if 'STOP' in o_type:
                                     close_type = '🛡️ Hardware SL'
@@ -1222,7 +1337,9 @@ async def ws_user_msg(ws, msg):
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                     e1 = '🟢' if pnl1 >= 0 else '🔴'
                     e2 = '🟢' if pnl2 >= 0 else '🔴'
-                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
+                    close_tag = (stored_reason or 'external').strip().lower()
+                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n"
+                                f"🏷️ Tag: <code>{close_tag}</code>\n\n"
                                 f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
                                 f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
                                 f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
@@ -1464,7 +1581,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = o.get('type', '') or o.get('origType', '')
+                                o_type = str(o.get('type') or o.get('origType') or '')
                                 
                                 if 'STOP' in o_type:
                                     close_type = '🛡️ Hardware SL'
@@ -1521,7 +1638,9 @@ async def ws_user_msg(ws, msg):
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                     e1 = '🟢' if pnl1 >= 0 else '🔴'
                     e2 = '🟢' if pnl2 >= 0 else '🔴'
-                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
+                    close_tag = (stored_reason or 'external').strip().lower()
+                    done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n"
+                                f"🏷️ Tag: <code>{close_tag}</code>\n\n"
                                 f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
                                 f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
                                 f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
