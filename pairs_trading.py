@@ -5329,9 +5329,17 @@ class PairsManager:
                     if pair_info.pending_signal is None or pair_info.pending_since is None:
                         continue
 
-                    elapsed = time.time() - pair_info.pending_since
+                    now_ts = time.time()
+                    elapsed = now_ts - pair_info.pending_since
                     if elapsed < confirm_sec:
                         continue
+
+                    def _log_pending_reject(message: str, cooldown_sec: int = 15):
+                        key = f"_last_pending_reject_log_{message}"
+                        prev = float(getattr(pair_info, key, 0.0) or 0.0)
+                        if now_ts - prev >= cooldown_sec:
+                            setattr(pair_info, key, now_ts)
+                            print(f"⏭️ Pending rejected {pair_info.symbol1}-{pair_info.symbol2}: {message}")
 
                     # Primary: realtime z from markPrice. Fallback for candle-origin signals.
                     price1 = self.last_prices.get(pair_info.symbol1)
@@ -5344,12 +5352,14 @@ class PairsManager:
 
                     processed_pending.append(pair_info)
                     if np.isnan(current_z):
+                        _log_pending_reject("no realtime z-score")
                         continue
 
                     # Must remain inside entry window and keep original direction.
                     if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
                         streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0)
                         if streak_bars < coint_stability_min_bars:
+                            _log_pending_reject(f"coint_streak={streak_bars} < min={coint_stability_min_bars}")
                             continue
                         expected_bars = utils.expected_reversion_bars(
                             abs_z_now=abs(float(current_z)),
@@ -5363,6 +5373,15 @@ class PairsManager:
                         ready_candidates.append((score, updated_at, pair_info, current_z))
                     elif abs(current_z) >= z_entry_max:
                         print(f"⚠️ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
+                    else:
+                        if current_z * pair_info.pending_signal <= 0:
+                            _log_pending_reject(
+                                f"signal direction flipped (pending={pair_info.pending_signal:+.2f}, now={current_z:+.2f})"
+                            )
+                        elif abs(current_z) < z_entry:
+                            _log_pending_reject(f"|z| dropped below z_entry ({abs(current_z):.2f} < {z_entry:.2f})")
+                        else:
+                            _log_pending_reject("outside entry window")
 
                 # Reset matured pending signals after evaluation cycle.
                 for pair_info in processed_pending:
@@ -5384,11 +5403,13 @@ class PairsManager:
                     if free_slots <= 0:
                         break
                     if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
+                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: can_open_new_position=False")
                         continue
 
                     # Check cooldown from failed leverage/trade
                     fail_until = getattr(pair_info, '_leverage_fail_until', 0)
                     if fail_until and time.time() < fail_until:
+                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: leverage_fail_cooldown")
                         continue
 
                     # Check cooldown after stop-loss close
@@ -5400,6 +5421,7 @@ class PairsManager:
 
                     # Check if pair is waiting for next candle close
                     if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
+                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: wait_for_next_candle")
                         continue
 
                     direction = 1 if current_z < 0 else -1
@@ -5443,4 +5465,3 @@ class PairsManager:
         if self._signal_confirmation_task is None:
             self._signal_confirmation_task = self.loop.create_task(self._signal_confirmation_loop())
             print("🔄 Started real-time signal confirmation loop") 
-
