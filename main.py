@@ -299,21 +299,31 @@ async def main():
     global tg_channel_global, tg_admins_global
     tg_channel_global = os.getenv('TG_CHANNEL', '').strip()
     tg_admins_global = tg_admins
+    loop = asyncio.get_running_loop()
+    tg_task = None
+    if tg_token:
+        try:
+            # Start TG control plane before exchange bootstrap, so emergency controls are available.
+            tg_ready = await tg.init_bot()
+            if tg_ready:
+                tg.attach_runtime(session, None, None)
+                tg_task = loop.create_task(tg.run(session, None, None))
+                print("TG control channel started before exchange checks.")
+        except Exception as e:
+            print(f"⚠️ Early TG startup failed: {e}")
 
     # Create Binance client
     client = binance.Futures(api_key=api_key,
                              secret_key=api_secret,
                              asynced=True,
                              testnet=ini_config.getboolean('BOT', 'testnet'))
+    tg.attach_runtime(session, client, None)
     
     # CRITICAL: Sync time with server to avoid -1021 timestamp errors.
     try:
         await client._sync_time_async()
     except Exception as e:
         print(f"⚠️ Initial time sync failed: {e}")
-    
-    # Init pairs manager
-    loop = asyncio.get_running_loop()
     
     # Default values
     timeframe = conf.timeframe if conf.timeframe else '1h'
@@ -445,11 +455,9 @@ async def main():
         config_info=conf
     )
 
-    # CRITICAL: Initialize TG bot FIRST so notifications work during reconciliation
-    await tg.init_bot()
-
     # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
     await pairs_manager.initialize()
+    tg.attach_runtime(session, client, pairs_manager)
 
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
@@ -458,8 +466,11 @@ async def main():
     
     loop.create_task(connect_ws(timeframe))
     
-    # Run Telegram bot
-    await tg.run(session, client, pairs_manager)
+    # Run Telegram bot (if already running early, just wait on it).
+    if tg_task:
+        await tg_task
+    else:
+        await tg.run(session, client, pairs_manager)
 
 
 # Service to refresh all trading pairs every hour

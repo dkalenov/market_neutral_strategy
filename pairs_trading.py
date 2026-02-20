@@ -109,11 +109,13 @@ class PairInfo:
     entry_phase_label: str = ''
     entry_expected_hours: float = 0.0
     entry_expected_max_hours: float = 0.0
+    entry_coint_streak_bars: int = 0
     entry_rank_score: float = 0.0
     entry_phase_score: float = 0.0
     entry_et_score: float = 0.0
     entry_quality_score: float = 0.0
     entry_diag_ready: bool = False
+    coint_streak_bars: int = 0
 
 class PairsManager:
     """
@@ -968,6 +970,7 @@ class PairsManager:
 
                     externally_closed_pairs.append({
                         'pair': f"{s1}-{s2}",
+                        'dir': 'LONG' if pair_info.position_status == 1 else ('SHORT' if pair_info.position_status == -1 else '?'),
                         'pnl': net_pnl if pnl_loaded else None
                     })
                     
@@ -1058,11 +1061,12 @@ class PairsManager:
 
                 preview = externally_closed_pairs[:12]
                 for item in preview:
+                    pair_caption = f"{item['pair']} ({item.get('dir', '?')})"
                     if item['pnl'] is None:
-                        lines.append(f"â€¢ {item['pair']}: n/a")
+                        lines.append(f"â€¢ {pair_caption}: n/a")
                     else:
                         e = "ðŸŸ¢" if item['pnl'] >= 0 else "ðŸ”´"
-                        lines.append(f"â€¢ {item['pair']}: {e} {item['pnl']:+.2f} USDT")
+                        lines.append(f"â€¢ {pair_caption}: {e} {item['pnl']:+.2f} USDT")
                 if len(externally_closed_pairs) > len(preview):
                     lines.append(f"... and {len(externally_closed_pairs) - len(preview)} more")
 
@@ -1680,6 +1684,7 @@ class PairsManager:
 
                     externally_closed_now.append({
                         'pair': f"{s1}-{s2}",
+                        'dir': 'LONG' if pair_info.position_status == 1 else ('SHORT' if pair_info.position_status == -1 else '?'),
                         'pnl': net_pnl if pnl_loaded else None
                     })
                     print(f"âš¡ External close detected: {s1}-{s2}")
@@ -1932,11 +1937,12 @@ class PairsManager:
                     lines.append(f"â„¹ï¸ PnL unavailable for {unknown_count} pair(s).")
 
                 for item in externally_closed_now[:12]:
+                    pair_caption = f"{item['pair']} ({item.get('dir', '?')})"
                     if item['pnl'] is None:
-                        lines.append(f"â€¢ {item['pair']}: n/a")
+                        lines.append(f"â€¢ {pair_caption}: n/a")
                     else:
                         e = "ðŸŸ¢" if item['pnl'] >= 0 else "ðŸ”´"
-                        lines.append(f"â€¢ {item['pair']}: {e} {item['pnl']:+.2f} USDT")
+                        lines.append(f"â€¢ {pair_caption}: {e} {item['pnl']:+.2f} USDT")
                 if len(externally_closed_now) > 12:
                     lines.append(f"... and {len(externally_closed_now) - 12} more")
 
@@ -2125,7 +2131,10 @@ class PairsManager:
         """
         current_pairs = list(self.active_pairs.items())
 
-        for pair_set, pair_info in current_pairs:
+        for idx, (pair_set, pair_info) in enumerate(current_pairs):
+            if idx and idx % 12 == 0:
+                # Cooperative yield: keeps TG callbacks responsive under heavy pair scans.
+                await asyncio.sleep(0)
             if pair_info.is_trading:
                 continue
                 
@@ -2150,6 +2159,10 @@ class PairsManager:
                 # Dynamic recalculation of cointegration (with configurable p-value threshold)
                 p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
                 flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold, strict_hl=False)
+                if flag == 1:
+                    pair_info.coint_streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0) + 1
+                else:
+                    pair_info.coint_streak_bars = 0
 
                 # === MARKET NEUTRALITY CHECK ===
                 # Calculate beta to BTC to ensure pair is market-neutral
@@ -2206,6 +2219,14 @@ class PairsManager:
                     print(f"âš ï¸ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                     
                     if pair_info.position_status != 0:
+                        # If any leg is already absent on exchange, treat this as external-close flow.
+                        # Avoid sending a conflicting Broken Correlation close.
+                        leg1_live = abs(float((self._exchange_positions_cache or {}).get(s1, 0.0) or 0.0)) > 0
+                        leg2_live = abs(float((self._exchange_positions_cache or {}).get(s2, 0.0) or 0.0)) > 0
+                        if not (leg1_live and leg2_live):
+                            print(f"â„¹ï¸ Skip broken_coint close for {s1}-{s2}: exchange legs not fully open ({leg1_live=}, {leg2_live=})")
+                            continue
+
                         # GRACE PERIOD 1: Skip broken_coint closures during warmup
                         # After bot restart, data may not be fully loaded yet
                         grace_elapsed = time.time() - self._init_complete_time
@@ -2434,7 +2455,9 @@ class PairsManager:
         try:
             capital = self.config.capital if self.config and self.config.capital else 1000.0
             max_notional_pct = self.config.max_notional_pct if self.config and self.config.max_notional_pct else 0.1
-            min_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
+            max_order_bump = getattr(self.config, 'max_order_bump', None)
+            if max_order_bump in (None, '', 0):
+                max_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
             hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
             hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
 
@@ -2442,7 +2465,7 @@ class PairsManager:
             print(
                 f"Discovery prefilter params: capital={float(capital):.2f}, "
                 f"max_notional_pct={float(max_notional_pct):.4f}, "
-                f"pair_budget=${pair_budget:.2f}, min_order_bump={float(min_order_bump):.2f}"
+                f"pair_budget=${pair_budget:.2f}, max_order_bump={float(max_order_bump):.2f}"
             )
             # Maximum share one leg can receive under configured hedge bounds.
             max_leg_share = max(
@@ -2461,10 +2484,10 @@ class PairsManager:
                 if required_min <= 0:
                     filtered_ready.append(s)
                     continue
-                # At execution, trade is skipped if bump exceeds min_order_bump:
-                # required_min / calc_notional > min_order_bump  -> skip
-                # So minimally viable calc_notional is required_min / min_order_bump.
-                min_viable_calc = required_min / float(min_order_bump)
+                # At execution, trade is skipped if bump exceeds max_order_bump:
+                # required_min / calc_notional > max_order_bump  -> skip
+                # So minimally viable calc_notional is required_min / max_order_bump.
+                min_viable_calc = required_min / float(max_order_bump)
                 if max_leg_notional + 1e-9 < min_viable_calc:
                     dropped_symbols.append((s, required_min, min_viable_calc))
                 else:
@@ -2473,7 +2496,7 @@ class PairsManager:
             if dropped_symbols:
                 print(
                     f"⛔ Discovery prefilter: dropped {len(dropped_symbols)} symbols by minNotional "
-                    f"(max leg ${max_leg_notional:.2f}, bump<= {min_order_bump}x)"
+                    f"(max leg ${max_leg_notional:.2f}, bump<= {max_order_bump}x)"
                 )
                 for s, required_min, min_viable in dropped_symbols[:20]:
                     print(
@@ -4058,11 +4081,13 @@ class PairsManager:
             calculated_notional1 = qty1_rounded * s1_price
             calculated_notional2 = qty2_rounded * s2_price
             
-            # Get min_order_bump threshold from config (default 1.5)
-            min_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
+            # Get max_order_bump threshold from config (default 1.5)
+            max_order_bump = getattr(self.config, 'max_order_bump', None)
+            if max_order_bump in (None, '', 0):
+                max_order_bump = getattr(self.config, 'min_order_bump', 1.5) or 1.5
             
             # Check if we should skip trade due to size constraints
-            if utils.should_skip_trade(min_notional1, calculated_notional1, min_order_bump):
+            if utils.should_skip_trade(min_notional1, calculated_notional1, max_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s1} below min notional with excessive bump required")
                 cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
                 pair_info.pending_signal = None
@@ -4074,7 +4099,7 @@ class PairsManager:
                 pair_info.is_trading = False
                 return
             
-            if utils.should_skip_trade(min_notional2, calculated_notional2, min_order_bump):
+            if utils.should_skip_trade(min_notional2, calculated_notional2, max_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s2} below min notional with excessive bump required")
                 cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
                 pair_info.pending_signal = None
@@ -4331,18 +4356,19 @@ class PairsManager:
                     if getattr(pair_info, 'entry_diag_ready', False):
                         phase_label = getattr(pair_info, 'entry_phase_label', '') or 'n/a'
                         et_hours = float(getattr(pair_info, 'entry_expected_hours', 0.0) or 0.0)
-                        et_max_hours = float(getattr(pair_info, 'entry_expected_max_hours', 0.0) or 0.0)
-                        rank_score = float(getattr(pair_info, 'entry_rank_score', 0.0) or 0.0)
-                        phase_score = float(getattr(pair_info, 'entry_phase_score', 0.0) or 0.0)
-                        et_score = float(getattr(pair_info, 'entry_et_score', 0.0) or 0.0)
-                        quality_score = float(getattr(pair_info, 'entry_quality_score', 0.0) or 0.0)
-                        et_txt = f"{et_hours:.1f}h / {et_max_hours:.1f}h" if et_max_hours > 0 else "off"
+                        coint_streak_bars = int(getattr(pair_info, 'entry_coint_streak_bars', 0) or 0)
+                        tf_hours = self._timeframe_seconds_local() / 3600.0
+                        coint_streak_hours = coint_streak_bars * tf_hours if tf_hours > 0 else 0.0
+                        hl_hours = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+                        coint_vs_hl = (coint_streak_hours / hl_hours) if hl_hours > 0 else 0.0
+                        et_target_abs_z = float(getattr(self.config, 'entry_et_target_abs_z', 0.5) or 0.5)
+                        et_vs_hl = (et_hours / hl_hours) if hl_hours > 0 else 0.0
+                        et_txt = f"{et_hours:.1f}h (~{et_vs_hl:.2f}x HL, to |Z|≤{et_target_abs_z:.2f})" if et_hours > 0 else "n/a"
                     else:
                         phase_label = 'n/a'
-                        rank_score = 0.0
-                        phase_score = 0.0
-                        et_score = 0.0
-                        quality_score = 0.0
+                        coint_streak_bars = 0
+                        coint_streak_hours = 0.0
+                        coint_vs_hl = 0.0
                         et_txt = "n/a"
 
                     success_msg = (f"ðŸš€ <b>Trade OPENED:</b> {s1}-{s2}\n"
@@ -4354,8 +4380,8 @@ class PairsManager:
                                    f"âš–ï¸ Hedge: {pair_info.hedge_ratio:.4f} | Z: {pair_info.entry_z_score:.2f}\n"
                                    f"ðŸ“Š Beta: {pair_info.beta_btc:.3f} | p-value: {pair_info.last_pvalue:.4f}\n"
                                    f"â³ Half-life: {self._format_half_life(pair_info.half_life)}\n"
-                                   f"ðŸ§  Phase: {phase_label} | E[T]: {et_txt}\n"
-                                   f"ðŸ† Entry score: {rank_score:.3f} (phase {phase_score:.3f}, ET {et_score:.3f}, quality {quality_score:.3f})")
+                                   f"ðŸ§  Phase: {phase_label} | E[Tâ†’|Z| target]: {et_txt}\n"
+                                   f"ðŸ” Coint stability: {coint_streak_bars} bars ({coint_streak_hours:.1f}h, {coint_vs_hl:.2f}x HL)")
                     pair_info.entry_diag_ready = False
                     print(success_msg.replace('<b>', '').replace('</b>', ''))
                     # Save msg_id for reply threading on close
@@ -4673,6 +4699,8 @@ class PairsManager:
             'hl_max_bars': np.nan,
             'expected_hours': np.nan,
             'expected_max_hours': np.nan,
+            'coint_streak_bars': 0,
+            'coint_stability_min_bars': 0,
             'phase_toward_vel_last': np.nan,   # >0 means moving toward mean
             'phase_toward_vel_mean': np.nan,   # average velocity toward mean
             'phase_toward_ratio': np.nan,      # share of steps toward mean
@@ -4735,6 +4763,16 @@ class PairsManager:
             return False, -1.0, metrics
         if half_life < hl_min_bars or half_life > hl_max_bars:
             metrics['reason'] = 'hl_out_of_band'
+            return False, -1.0, metrics
+
+        # ---- 1a) Cointegration persistence gate (avoid opening on fragile one-bar coint) ----
+        coint_streak = int(getattr(pair_info, 'coint_streak_bars', 0) or 0)
+        coint_min_bars = int(getattr(self.config, 'coint_stability_min_bars', 3) or 3)
+        coint_min_bars = max(1, min(coint_min_bars, 200))
+        metrics['coint_streak_bars'] = coint_streak
+        metrics['coint_stability_min_bars'] = coint_min_bars
+        if coint_streak < coint_min_bars:
+            metrics['reason'] = 'coint_not_stable'
             return False, -1.0, metrics
 
         # ---- 1b) Expected reversion time (soft gate + score; avoids over-filtering) ----
@@ -4830,6 +4868,8 @@ class PairsManager:
         hl_max = metrics.get('hl_max_bars', np.nan)
         eh = metrics.get('expected_hours', np.nan)
         emh = metrics.get('expected_max_hours', np.nan)
+        coint_streak = int(metrics.get('coint_streak_bars', 0) or 0)
+        coint_min = int(metrics.get('coint_stability_min_bars', 0) or 0)
         tv_last = metrics.get('phase_toward_vel_last', np.nan)
         tv_mean = metrics.get('phase_toward_vel_mean', np.nan)
         tv_ratio = metrics.get('phase_toward_ratio', np.nan)
@@ -4848,7 +4888,7 @@ class PairsManager:
         es_txt = f"{es:.3f}" if np.isfinite(es) else "nan"
         qs_txt = f"{qs:.3f}" if np.isfinite(qs) else "nan"
         return (
-            f"reason={reason}, hl={hl_txt} in {hl_rng_txt}, E[T]={et_txt}, "
+            f"reason={reason}, hl={hl_txt} in {hl_rng_txt}, coint_streak={coint_streak}/{coint_min}, E[T]={et_txt}, "
             f"toward(last/mean)={tv_last_txt}/{tv_mean_txt}, toward_ratio={tv_ratio_txt}, "
             f"|z|_slope={sl_txt}, scores(p/e/q)={ps_txt}/{es_txt}/{qs_txt}"
         )
@@ -5226,7 +5266,9 @@ class PairsManager:
                 ready_candidates = []
                 processed_pending = []
 
-                for pair_info in list(self.active_pairs.values()):
+                for idx, pair_info in enumerate(list(self.active_pairs.values())):
+                    if idx and idx % 24 == 0:
+                        await asyncio.sleep(0)
                     if pair_info.position_status != 0 or pair_info.is_trading:
                         continue
                     if pair_info.pending_signal is None or pair_info.pending_since is None:
@@ -5331,6 +5373,7 @@ class PairsManager:
                     pair_info.entry_phase_label = self._entry_phase_label(viability)
                     pair_info.entry_expected_hours = float(viability.get('expected_hours', 0.0) or 0.0)
                     pair_info.entry_expected_max_hours = float(viability.get('expected_max_hours', 0.0) or 0.0)
+                    pair_info.entry_coint_streak_bars = int(viability.get('coint_streak_bars', 0) or 0)
                     pair_info.entry_rank_score = float(final_rank)
                     pair_info.entry_phase_score = float(phase_score)
                     pair_info.entry_et_score = float(et_score)

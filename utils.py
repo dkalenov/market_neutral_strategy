@@ -372,14 +372,14 @@ def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) 
     return sl_price, tp_price, sl_pct, tp_pct
 
 
-def should_skip_trade(min_notional: float, calculated_notional: float, min_order_bump: float = 1.5) -> bool:
+def should_skip_trade(min_notional: float, calculated_notional: float, max_order_bump: float = 1.5) -> bool:
     """
     Check if trade should be skipped due to minimum order requirements.
     
     Args:
         min_notional: Minimum notional required by exchange
         calculated_notional: Notional calculated by strategy
-        min_order_bump: Maximum allowed increase ratio (default 1.5x)
+        max_order_bump: Maximum allowed increase ratio (default 1.5x)
     
     Returns:
         True if trade should be skipped, False otherwise
@@ -391,8 +391,8 @@ def should_skip_trade(min_notional: float, calculated_notional: float, min_order
         return True  # Invalid notional
     
     bump_ratio = min_notional / calculated_notional
-    if bump_ratio > min_order_bump:
-        print(f"SKIP: Order bump {bump_ratio:.2f}x exceeds threshold {min_order_bump}x")
+    if bump_ratio > max_order_bump:
+        print(f"SKIP: Order bump {bump_ratio:.2f}x exceeds threshold {max_order_bump}x")
         return True
     
     return False  # Small adjustment is acceptable
