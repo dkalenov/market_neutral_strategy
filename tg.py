@@ -52,11 +52,11 @@ tg_admins = []
 def _repair_mojibake_text(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
-    if not any(ch in text for ch in ("ð", "â", "Î", "Ã", "Â")):
+    if not any(ch in text for ch in ("\u00f0", "\u00e2", "\u00ce", "\u00c3", "\u00c2")):
         return text
 
     def _score(s: str) -> int:
-        bad = sum(s.count(x) for x in ("ð", "â", "Î", "Ã", "Â", "ï¸", "â†"))
+        bad = sum(s.count(x) for x in ("\u00f0", "\u00e2", "\u00ce", "\u00c3", "\u00c2", "\u00ef\u00b8", "\u00e2\u2020"))
         return -bad
 
     candidates = [text]

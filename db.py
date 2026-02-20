@@ -222,7 +222,7 @@ async def connect(host, port, user, password, db_name):
 async def run_migrations(engine):
     """Automatically adds missing columns to tables"""
     migrations = [
-        # Table pairs â€” new columns
+        # Table pairs — new columns
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS position_status INTEGER DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty2 FLOAT DEFAULT 0.0;",
@@ -239,12 +239,12 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS pnl2 FLOAT DEFAULT 0.0;",
-        # Pairs â€” market neutrality metrics (persisted for analysis & restart recovery)
+        # Pairs — market neutrality metrics (persisted for analysis & restart recovery)
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS last_pvalue FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_z_score FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;",
-        # Trades â€” extended metadata for post-trade analysis
+        # Trades — extended metadata for post-trade analysis
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hedge_ratio FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS beta_btc FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pvalue FLOAT DEFAULT 0.0;",
@@ -253,7 +253,7 @@ async def run_migrations(engine):
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS fee2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(100) DEFAULT '';",
-        # Pair history â€” structured analytics fields
+        # Pair history — structured analytics fields
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS pair_id INTEGER;",
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS trade_id INTEGER;",
         "ALTER TABLE pair_history ADD COLUMN IF NOT EXISTS z_score FLOAT DEFAULT 0.0;",
@@ -287,7 +287,7 @@ async def run_migrations(engine):
             created_at BIGINT DEFAULT 0
         );
         """,
-        # Table config â€” increase value length
+        # Table config — increase value length
         "ALTER TABLE config ALTER COLUMN value TYPE TEXT;",
         # Performance indexes (safe, idempotent)
         "CREATE INDEX IF NOT EXISTS idx_pairs_is_archived ON pairs (is_archived);",
@@ -318,7 +318,7 @@ async def run_migrations(engine):
                 sql_head = sql.strip().split('\n', 1)[0]
                 if len(sql_head) > 120:
                     sql_head = sql_head[:120] + "..."
-                print(f"âš ï¸ Migration skipped/failed: {sql_head} | {e}")
+                print(f"⚠️ Migration skipped/failed: {sql_head} | {e}")
                 if 'idx_pairs_unique_active' in sql:
                     print("CRITICAL: unique active-pair index was NOT created. Active pair duplicates may exist and break trade accounting.")
 
@@ -428,8 +428,8 @@ async def load_config():
             'entry_et_target_abs_z': '0.5',
             'coint_stability_min_bars': '3',
             # Hedge Ratio Bounds (market neutrality)
-            'hedge_min': '0.3',              # Min |hedge| â€” below this positions are too unbalanced
-            'hedge_max': '3.0',              # Max |hedge| â€” above this positions are too unbalanced
+            'hedge_min': '0.3',              # Min |hedge| — below this positions are too unbalanced
+            'hedge_max': '3.0',              # Max |hedge| — above this positions are too unbalanced
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
             'idle_timeout_hours': '24',      # Remove idle pairs older than X hours
@@ -456,7 +456,7 @@ async def load_config():
                         await s.execute(update(Config).where(Config.key == key).values(value=default_val))
                         await s.commit()
             except Exception as e:
-                print(f"âš ï¸ Config default init failed for key '{key}': {e}")
+                print(f"⚠️ Config default init failed for key '{key}': {e}")
         # Load all configuration from DB
         async with Session() as session:
             result = (await session.execute(select(Config))).scalars().all()

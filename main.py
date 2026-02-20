@@ -67,69 +67,31 @@ def _configure_console_encoding():
 
 def _fix_mojibake_text(s: str) -> str:
     """
-    Repair UTF-8 text decoded as latin1/cp1252.
-    Works on mixed strings by decoding only byte-like segments.
+    Best-effort repair for UTF-8 text decoded as latin1/cp1252.
     """
     if not isinstance(s, str) or not s:
         return s
-    if not any(ch in s for ch in ("ð", "â", "Î", "Ð", "Ñ", "Ã")):
+    if not any(ch in s for ch in ("\u00f0", "\u00e2", "\u00ce", "\u00d0", "\u00d1", "\u00c3")):
         return s
 
-    cp1252_map = {
-        0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
-        0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
-        0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92,
-        0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
-        0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C,
-        0x017E: 0x9E, 0x0178: 0x9F,
-    }
+    def _score(text: str) -> int:
+        bad = sum(text.count(x) for x in ("\u00f0", "\u00e2", "\u00ce", "\u00c3", "\u00c2", "\u00ef\u00b8", "\u00e2\u2020"))
+        return -bad
 
-    def char_to_byte(ch: str):
-        code = ord(ch)
-        if code <= 0xFF:
-            return code
-        return cp1252_map.get(code)
+    candidates = [s]
+    for enc in ("latin-1", "cp1252"):
+        cur = s
+        for _ in range(2):
+            try:
+                nxt = cur.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            except Exception:
+                break
+            if nxt == cur:
+                break
+            candidates.append(nxt)
+            cur = nxt
 
-    def decode_chunk(raw_chars: list[str], raw_bytes: bytearray) -> str:
-        if not raw_chars:
-            return ""
-        try:
-            fixed = bytes(raw_bytes).decode("utf-8")
-            # Avoid replacing with gibberish placeholders.
-            if fixed and "\ufffd" not in fixed:
-                return fixed
-        except Exception:
-            pass
-        return "".join(raw_chars)
-
-    out_parts: list[str] = []
-    chunk_chars: list[str] = []
-    chunk_bytes = bytearray()
-    changed = False
-
-    for ch in s:
-        b = char_to_byte(ch)
-        if b is None:
-            if chunk_chars:
-                decoded = decode_chunk(chunk_chars, chunk_bytes)
-                if decoded != "".join(chunk_chars):
-                    changed = True
-                out_parts.append(decoded)
-                chunk_chars = []
-                chunk_bytes = bytearray()
-            out_parts.append(ch)
-            continue
-        chunk_chars.append(ch)
-        chunk_bytes.append(b)
-
-    if chunk_chars:
-        decoded = decode_chunk(chunk_chars, chunk_bytes)
-        if decoded != "".join(chunk_chars):
-            changed = True
-        out_parts.append(decoded)
-
-    fixed_s = "".join(out_parts)
-    return fixed_s if changed else s
+    return max(candidates, key=_score)
 
 
 def _install_print_mojibake_fix():
@@ -144,7 +106,7 @@ async def send_tg_notification(message, reply_to_message_id=None, reply_markup=N
     if isinstance(message, str):
         message = _fix_mojibake_text(message)
     if not tg.bot:
-        print("âš ï¸ TG: bot not initialized")
+        print("⚠️ TG: bot not initialized")
         return None
     
     msg_id = None
@@ -157,7 +119,7 @@ async def send_tg_notification(message, reply_to_message_id=None, reply_markup=N
                 reply_markup=reply_markup
             )
             msg_id = sent.message_id
-            print(f"ðŸ“¨ TG sent to channel, msg_id={msg_id}, reply_to={reply_to_message_id}")
+            print(f"📨 TG sent to channel, msg_id={msg_id}, reply_to={reply_to_message_id}")
         except Exception as e:
             print(f"Error sending TG to channel: {e}")
     elif tg_admins_global:
@@ -171,11 +133,11 @@ async def send_tg_notification(message, reply_to_message_id=None, reply_markup=N
                 )
                 if msg_id is None:
                     msg_id = sent.message_id
-                print(f"ðŸ“¨ TG sent to {admin_id}, msg_id={msg_id}, reply_to={reply_to_message_id}")
+                print(f"📨 TG sent to {admin_id}, msg_id={msg_id}, reply_to={reply_to_message_id}")
             except Exception as e:
                 print(f"Error sending TG to {admin_id}: {e}")
     else:
-        print("âš ï¸ TG: no channel or admins configured")
+        print("⚠️ TG: no channel or admins configured")
     
     return msg_id
 
@@ -262,6 +224,7 @@ async def main():
 
     startup_marks: list[tuple[str, float]] = []
     startup_profile = os.getenv('STARTUP_PROFILE', 'true').strip().lower() not in ('0', 'false', 'no')
+    bg_tasks: list[asyncio.Task] = []
 
     def _mark(stage: str):
         if startup_profile:
@@ -354,175 +317,201 @@ async def main():
             print(f"⚠️ Early TG startup failed: {e}")
     _mark('tg_early_started')
 
-    # Create Binance client
-    client = binance.Futures(api_key=api_key,
-                             secret_key=api_secret,
-                             asynced=True,
-                             testnet=ini_config.getboolean('BOT', 'testnet'))
-    tg.attach_runtime(session, client, None)
-    _mark('client_created')
-    
-    # CRITICAL: Sync time with server to avoid -1021 timestamp errors.
     try:
-        await client._sync_time_async()
-    except Exception as e:
-        print(f"⚠️ Initial time sync failed: {e}")
-    _mark('time_synced')
-    
-    # Init pairs manager
-    
-    # Default values
-    timeframe = conf.timeframe if conf.timeframe else '1h'
-    _main_timeframe_global = timeframe
-    if _ws_recover_lock is None:
-        _ws_recover_lock = asyncio.Lock()
-    
-    # Robust window_size logic:
-    # 1. Check if user provided a valid override
-    use_manual_window = False
-    window_size_val = 0
-    
-    if conf.window_size:
-        raw_val = str(conf.window_size).strip().lower()
-        if raw_val not in ('', 'none', 'null', '0', 'default', 'auto'):
-            try:
-                window_size_val = int(raw_val)
-                if window_size_val > 0:
-                    use_manual_window = True
-            except ValueError:
-                print(f"âš ï¸ Invalid window_size '{conf.window_size}' in config. Using auto-calculation.")
-
-    if use_manual_window:
-        window_size = window_size_val
-        print(f"âš™ï¸ Using manual window_size: {window_size}")
-    else:
-        # Auto-selection of window size based on timeframe
-        if timeframe == '1m':
-            window_size = 720  # 12 hours
-        elif timeframe == '5m':
-            window_size = 576  # 2 days
-        elif timeframe == '15m':
-            window_size = 480  # 5 days
-        elif timeframe == '1h':
-            window_size = 336  # 2 weeks
-        elif timeframe == '4h':
-            window_size = 180  # 30 days
-        elif timeframe == '1d':
-            window_size = 90   # 90 days
-        else:
-            window_size = 336  # Default as for 1h
-        print(f"âš™ï¸ Auto-calculated window_size: {window_size} (for {timeframe})")
-    
-    
-    # 1. Load symbols (with error handling for bad filter data from Binance)
-    print("Initial loading of market symbols...")
-    try:
-        all_symbols = await client.load_symbols()
-    except ValueError as e:
-        # Fallback: Manual loading with skipping problematic symbols
-        print(f"âš ï¸ Standard load failed ({e}). Using safe loader...")
-        raw_info = await client.exchange_info()
-        all_symbols = {}
-        for s_data in raw_info['symbols']:
-            try:
-                # Check for zero stepSize before parsing
-                skip = False
-                for f in s_data.get('filters', []):
-                    for k, v in f.items():
-                        if k in ('stepSize', 'tickSize', 'minQty') and (v == '0' or v == '0.0'):
-                            skip = True
-                            break
-                if skip:
-                    continue
-                sym_obj = binance.SymbolFutures(s_data)
-                all_symbols[sym_obj.symbol] = sym_obj
-            except Exception:
-                continue  # Skip problematic symbols
-    print(f"Loaded {len(all_symbols)} symbols.")
-    _mark('symbols_loaded')
-    
-    # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
-    max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
-    blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
-    
-    try:
-        print(f"ðŸ“ˆ Filtering top {max_symbols} symbols by 24h volume...")
-        tickers = await client.ticker_24hr_price_change()
+        # Create Binance client
+        client = binance.Futures(api_key=api_key,
+                                 secret_key=api_secret,
+                                 asynced=True,
+                                 testnet=ini_config.getboolean('BOT', 'testnet'))
+        tg.attach_runtime(session, client, None)
+        _mark('client_created')
         
-        # Filter to USDT pairs with volume, exclude blacklist
-        valid_tickers = []
-        for t in tickers:
-            sym = t.get('symbol', '')
-            if sym.endswith('USDT') and sym not in blacklist and sym in all_symbols:
+        # CRITICAL: Sync time with server to avoid -1021 timestamp errors.
+        try:
+            await client._sync_time_async()
+        except Exception as e:
+            print(f"⚠️ Initial time sync failed: {e}")
+        _mark('time_synced')
+        
+        # Init pairs manager
+        
+        # Default values
+        timeframe = conf.timeframe if conf.timeframe else '1h'
+        _main_timeframe_global = timeframe
+        if _ws_recover_lock is None:
+            _ws_recover_lock = asyncio.Lock()
+        
+        # Robust window_size logic:
+        # 1. Check if user provided a valid override
+        use_manual_window = False
+        window_size_val = 0
+        
+        if conf.window_size:
+            raw_val = str(conf.window_size).strip().lower()
+            if raw_val not in ('', 'none', 'null', '0', 'default', 'auto'):
                 try:
-                    vol = float(t.get('quoteVolume', 0))
-                    valid_tickers.append((sym, vol))
-                except:
-                    continue
+                    window_size_val = int(raw_val)
+                    if window_size_val > 0:
+                        use_manual_window = True
+                except ValueError:
+                    print(f"⚠️ Invalid window_size '{conf.window_size}' in config. Using auto-calculation.")
+    
+        if use_manual_window:
+            window_size = window_size_val
+            print(f"⚙️ Using manual window_size: {window_size}")
+        else:
+            # Auto-selection of window size based on timeframe
+            if timeframe == '1m':
+                window_size = 720  # 12 hours
+            elif timeframe == '5m':
+                window_size = 576  # 2 days
+            elif timeframe == '15m':
+                window_size = 480  # 5 days
+            elif timeframe == '1h':
+                window_size = 336  # 2 weeks
+            elif timeframe == '4h':
+                window_size = 180  # 30 days
+            elif timeframe == '1d':
+                window_size = 90   # 90 days
+            else:
+                window_size = 336  # Default as for 1h
+            print(f"⚙️ Auto-calculated window_size: {window_size} (for {timeframe})")
         
-        # Sort by volume descending and keep top N
-        valid_tickers.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
         
-        # SAFETY: Always keep symbols that currently have open positions (DB or exchange)
-        protected_symbols = set()
+        # 1. Load symbols (with error handling for bad filter data from Binance)
+        print("Initial loading of market symbols...")
         try:
-            db_pairs = await db.get_all_pairs()
-            for p in db_pairs:
-                if getattr(p, 'position_status', 0) != 0:
-                    protected_symbols.add(p.symbol1)
-                    protected_symbols.add(p.symbol2)
-        except Exception as e:
-            print(f"Could not load protected symbols from DB: {e}")
+            all_symbols = await client.load_symbols()
+        except ValueError as e:
+            # Fallback: Manual loading with skipping problematic symbols
+            print(f"⚠️ Standard load failed ({e}). Using safe loader...")
+            raw_info = await client.exchange_info()
+            all_symbols = {}
+            for s_data in raw_info['symbols']:
+                try:
+                    # Check for zero stepSize before parsing
+                    skip = False
+                    for f in s_data.get('filters', []):
+                        for k, v in f.items():
+                            if k in ('stepSize', 'tickSize', 'minQty') and (v == '0' or v == '0.0'):
+                                skip = True
+                                break
+                    if skip:
+                        continue
+                    sym_obj = binance.SymbolFutures(s_data)
+                    all_symbols[sym_obj.symbol] = sym_obj
+                except Exception:
+                    continue  # Skip problematic symbols
+        print(f"Loaded {len(all_symbols)} symbols.")
+        _mark('symbols_loaded')
+        
+        # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
+        max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
+        blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
+        
         try:
-            exchange_positions = await client.get_position_risk()
-            for pos in exchange_positions:
-                if abs(float(pos.get('positionAmt', 0))) > 0:
-                    protected_symbols.add(pos.get('symbol', ''))
+            print(f"📈 Filtering top {max_symbols} symbols by 24h volume...")
+            tickers = await client.ticker_24hr_price_change()
+            
+            # Filter to USDT pairs with volume, exclude blacklist
+            valid_tickers = []
+            for t in tickers:
+                sym = t.get('symbol', '')
+                if sym.endswith('USDT') and sym not in blacklist and sym in all_symbols:
+                    try:
+                        vol = float(t.get('quoteVolume', 0))
+                        valid_tickers.append((sym, vol))
+                    except:
+                        continue
+            
+            # Sort by volume descending and keep top N
+            valid_tickers.sort(key=lambda x: x[1], reverse=True)
+            top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+            
+            # SAFETY: Always keep symbols that currently have open positions (DB or exchange)
+            protected_symbols = set()
+            try:
+                db_pairs = await db.get_all_pairs()
+                for p in db_pairs:
+                    if getattr(p, 'position_status', 0) != 0:
+                        protected_symbols.add(p.symbol1)
+                        protected_symbols.add(p.symbol2)
+            except Exception as e:
+                print(f"Could not load protected symbols from DB: {e}")
+            try:
+                exchange_positions = await client.get_position_risk()
+                for pos in exchange_positions:
+                    if abs(float(pos.get('positionAmt', 0))) > 0:
+                        protected_symbols.add(pos.get('symbol', ''))
+            except Exception as e:
+                print(f"Could not load protected symbols from exchange: {e}")
+            
+            top_symbols.update(s for s in protected_symbols if s in all_symbols)
+            
+            # Filter all_symbols to only include top volume symbols
+            filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
+            print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
+            all_symbols = filtered_symbols
         except Exception as e:
-            print(f"Could not load protected symbols from exchange: {e}")
+            print(f"⚠️ Volume filter failed ({e}). Using all symbols.")
+        _mark('volume_filter_done')
         
-        top_symbols.update(s for s in protected_symbols if s in all_symbols)
+        # 2. Create pairs manager AFTER loading symbols
+        pairs_manager = pairs_trading.PairsManager(
+            client, 
+            loop, 
+            all_symbols, 
+            timeframe=timeframe, 
+            min_data_points=window_size,
+            notify_callback=send_tg_notification,
+            config_info=conf
+        )
+    
+        # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
+        await pairs_manager.initialize()
+        tg.attach_runtime(session, client, pairs_manager)
+        _mark('pairs_manager_initialized')
+    
+        # 3. Start background symbol updates
+        bg_tasks.append(loop.create_task(load_symbols_loop()))
+        bg_tasks.append(loop.create_task(sync_exchange_time_loop()))
+        bg_tasks.append(loop.create_task(ws_health_watchdog_loop()))
         
-        # Filter all_symbols to only include top volume symbols
-        filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
-        print(f"âœ… Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
-        all_symbols = filtered_symbols
-    except Exception as e:
-        print(f"âš ï¸ Volume filter failed ({e}). Using all symbols.")
-    _mark('volume_filter_done')
-    
-    # 2. Create pairs manager AFTER loading symbols
-    pairs_manager = pairs_trading.PairsManager(
-        client, 
-        loop, 
-        all_symbols, 
-        timeframe=timeframe, 
-        min_data_points=window_size,
-        notify_callback=send_tg_notification,
-        config_info=conf
-    )
-
-    # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
-    await pairs_manager.initialize()
-    tg.attach_runtime(session, client, pairs_manager)
-    _mark('pairs_manager_initialized')
-
-    # 3. Start background symbol updates
-    loop.create_task(load_symbols_loop())
-    loop.create_task(sync_exchange_time_loop())
-    loop.create_task(ws_health_watchdog_loop())
-    
-    loop.create_task(connect_ws(timeframe))
-    _mark('background_tasks_started')
-    _print_startup_profile('main_ready')
-    
-    # Run Telegram bot
-    if tg_task:
-        await tg_task
-    else:
-        await tg.run(session, client, pairs_manager)
-
+        bg_tasks.append(loop.create_task(connect_ws(timeframe)))
+        _mark('background_tasks_started')
+        _print_startup_profile('main_ready')
+        
+        # Run Telegram bot
+        if tg_task:
+            await tg_task
+        else:
+            await tg.run(session, client, pairs_manager)
+    finally:
+        for t in bg_tasks:
+            if t and not t.done():
+                t.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+        try:
+            await disconnect_ws()
+        except Exception:
+            pass
+        try:
+            if tg_task and not tg_task.done():
+                tg_task.cancel()
+                await asyncio.gather(tg_task, return_exceptions=True)
+        except Exception:
+            pass
+        try:
+            if client:
+                await client.close()
+        except Exception:
+            pass
+        try:
+            if tg.bot and getattr(tg.bot, "session", None):
+                await tg.bot.session.close()
+        except Exception:
+            pass
 
 # Service to refresh all trading pairs every hour
 async def load_symbols_loop():
@@ -570,16 +559,16 @@ async def load_symbols_loop():
                 
                 top_symbols.update(s for s in protected_symbols if s in new_symbols)
                 filtered_symbols = {s: obj for s, obj in new_symbols.items() if s in top_symbols}
-                print(f"âœ… Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
+                print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
                 new_symbols = filtered_symbols
             except Exception as e:
-                print(f"âš ï¸ Volume filter failed during refresh ({e}). Using all symbols.")
+                print(f"⚠️ Volume filter failed during refresh ({e}). Using all symbols.")
             
             # Update BOTH global and pairs_manager references
             all_symbols = new_symbols
             if pairs_manager:
                 pairs_manager.all_symbols = new_symbols
-                print(f"âœ… pairs_manager.all_symbols updated ({len(new_symbols)} symbols)")
+                print(f"✅ pairs_manager.all_symbols updated ({len(new_symbols)} symbols)")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -920,7 +909,7 @@ async def connect_ws(timeframe='1h'):
                         dynamic_mark_wss.append(ws)
                         websockets_list.append(ws)
                 except Exception as e:
-                    print(f"âš ï¸ Failed to rebuild markPrice streams (requested={len(requested_symbols)}, subscribed={len(desired_symbols)}): {e}")
+                    print(f"⚠️ Failed to rebuild markPrice streams (requested={len(requested_symbols)}, subscribed={len(desired_symbols)}): {e}")
         
         # Set the callback on pairs_manager so it can subscribe new pairs
         pairs_manager._subscribe_mark_callback = subscribe_new_marks
@@ -930,7 +919,7 @@ async def connect_ws(timeframe='1h'):
             await subscribe_new_marks(sorted(active_symbols))
             print(f"Connected to markPrice websocket (requested={len(active_symbols)}, cap={mark_max_symbols}).")
         else:
-            print("â„¹ï¸ No active pairs at startup - markPrice will be subscribed dynamically.")
+            print("ℹ️ No active pairs at startup - markPrice will be subscribed dynamically.")
         
         # Heavy warmup+discovery is moved to background to avoid blocking startup
         pairs_manager.start_background_warmup(target_symbols, concurrency=20)
@@ -1023,13 +1012,13 @@ async def ws_user_msg(ws, msg):
     
     # DEBUG: Log all userdata events
     if event_type in ('ACCOUNT_UPDATE', 'ORDER_TRADE_UPDATE', 'ALGO_UPDATE'):
-        print(f"ðŸ“¡ UserData WS: {event_type} received")
+        print(f"📡 UserData WS: {event_type} received")
     
     # Check for ACCOUNT_UPDATE (position changes - including manual closes)
     if event_type == 'ACCOUNT_UPDATE':
         global recently_handled_close_symbols
         positions = msg.get('a', {}).get('P', [])
-        print(f"ðŸ“¡ ACCOUNT_UPDATE: {len(positions)} positions in update")
+        print(f"📡 ACCOUNT_UPDATE: {len(positions)} positions in update")
 
         # Cleanup stale suppression entries.
         now_ts_global = time_mod.time()
@@ -1112,7 +1101,7 @@ async def ws_user_msg(ws, msg):
                                      'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
                                      'btc_shock', 'desync', 'orphan_restart', 'stale_symbols', 'audit_fail')
                 if getattr(pair_info, 'close_handled', False) and stored_reason in bot_close_reasons:
-                    print(f"â„¹ï¸ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping external notification")
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping external notification")
                     now_mark = time_mod.time()
                     recently_handled_close_symbols[s1] = now_mark
                     recently_handled_close_symbols[s2] = now_mark
@@ -1121,7 +1110,7 @@ async def ws_user_msg(ws, msg):
                     continue
                 
                 # Both legs closed together - fetch actual PnL and cleanup
-                print(f"âš¡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
+                print(f"⚡ Both legs of {s1}-{s2} closed externally. Fetching PnL...")
                 try:
                     await asyncio.gather(
                         client.cancel_open_orders(s1),
@@ -1142,8 +1131,8 @@ async def ws_user_msg(ws, msg):
                         _fetch_account_trades_window_main(s2, start_ms, max_records=3000)
                     )
                     
-                    print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
-                    print(f"ðŸ“Š Trades for {s2}: {len(trades2)} entries")
+                    print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                    print(f"📊 Trades for {s2}: {len(trades2)} entries")
                     
                     pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
                     pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
@@ -1156,14 +1145,14 @@ async def ws_user_msg(ws, msg):
                     net_pnl = total_pnl - total_fees
                     
                     # Determine close reason
-                    close_type = 'â“ Unknown'
-                    close_hint = '\nðŸ’¡ Check exchange for details'
+                    close_type = '❓ Unknown'
+                    close_hint = '\n💡 Check exchange for details'
                     
                     stored_reason = getattr(pair_info, 'last_close_reason', '')
                     if stored_reason and stored_reason in CLOSE_REASONS:
                         close_type = CLOSE_REASONS[stored_reason]
                         close_hint = ''
-                        print(f"ðŸ“‹ Using stored reason: {stored_reason} -> {close_type}")
+                        print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
                     else:
                         try:
                             orders1, orders2 = await asyncio.gather(
@@ -1183,27 +1172,27 @@ async def ws_user_msg(ws, msg):
                                 o_type = o.get('type', '') or o.get('origType', '')
                                 
                                 if 'STOP' in o_type:
-                                    close_type = 'ðŸ›¡ï¸ Hardware SL'
+                                    close_type = '🛡️ Hardware SL'
                                 elif 'TAKE_PROFIT' in o_type:
-                                    close_type = 'ðŸ›¡ï¸ Hardware TP'
+                                    close_type = '🛡️ Hardware TP'
                                 elif o_type == 'MARKET':
-                                    close_type = 'ðŸ‘¤ Manual Market' if not o.get('reduceOnly') else 'ðŸ¤– Bot Close'
+                                    close_type = '👤 Manual Market' if not o.get('reduceOnly') else '🤖 Bot Close'
                                 elif o_type == 'LIMIT':
-                                    close_type = 'ðŸ“Š Limit Order'
+                                    close_type = '📊 Limit Order'
                                 elif 'TRAILING' in o_type:
-                                    close_type = 'ðŸ“ˆ Trailing Stop'
+                                    close_type = '📈 Trailing Stop'
                                 else:
-                                    close_type = f'âš¡ {o_type}'
-                                print(f"ðŸ“‹ Detected: {o_type} -> {close_type}")
+                                    close_type = f'⚡ {o_type}'
+                                print(f"📋 Detected: {o_type} -> {close_type}")
                             else:
-                                close_type = 'âš¡ External Close'
+                                close_type = '⚡ External Close'
                                 close_hint = ' (no orders found)'
-                                print(f"âš ï¸ No orders for {s1}/{s2}")
+                                print(f"⚠️ No orders for {s1}/{s2}")
                         except Exception as e:
-                            print(f"âš ï¸ Query error: {e}")
-                            close_type = 'âš¡ External'
+                            print(f"⚠️ Query error: {e}")
+                            close_type = '⚡ External'
                     
-                    pnl_emoji = 'ðŸŸ¢' if net_pnl >= 0 else 'ðŸ”´'
+                    pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
                     try:
                         p1 = pairs_manager.last_prices.get(s1, 0)
                         p2 = pairs_manager.last_prices.get(s2, 0)
@@ -1231,14 +1220,14 @@ async def ws_user_msg(ws, msg):
                     else:
                         close_hl = 'N/A'
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
-                    e1 = 'ðŸŸ¢' if pnl1 >= 0 else 'ðŸ”´'
-                    e2 = 'ðŸŸ¢' if pnl2 >= 0 else 'ðŸ”´'
+                    e1 = '🟢' if pnl1 >= 0 else '🔴'
+                    e2 = '🟢' if pnl2 >= 0 else '🔴'
                     done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
-                                f"ðŸ“Š Z: {zscore:+.2f} | Î²: {beta:.3f} | p: {close_pval:.4f}\n"
-                                f"â³ HL: {close_hl} | Hedge: {hedge:.4f}\n"
-                                f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
+                                f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
+                                f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
                                 f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
-                                f"ðŸ’¸ Fees: {total_fees:.4f} USDT{close_hint}")
+                                f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                     
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await send_tg_notification(done_msg, reply_to)
@@ -1286,10 +1275,10 @@ async def ws_user_msg(ws, msg):
                             )
                             await _persist_pair_executions_main(pair_info, trades1, trades2, phase='EXTERNAL_CLOSE_WS')
                         except Exception as trade_err:
-                            print(f"âš ï¸ Trade update failed for {s1}-{s2}: {trade_err}")
+                            print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
                         pair_info.current_trade_id = None
                 except Exception as e:
-                    print(f"âš ï¸ Cleanup error: {e}")
+                    print(f"⚠️ Cleanup error: {e}")
                     import traceback
                     traceback.print_exc()
                     pair_info.is_trading = False
@@ -1299,7 +1288,7 @@ async def ws_user_msg(ws, msg):
                 if getattr(pair_info, 'close_handled', False) and stored_reason in ('manual', 'z_tp', 'z_sl', 'circuit', 'broken_coint', 
                         'hardware_sl', 'hardware_tp', 'beta_drift', 'beta_critical',
                         'btc_shock', 'desync', 'orphan_restart', 'stale_symbols', 'audit_fail'):
-                    print(f"â„¹ï¸ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping single-leg handler")
+                    print(f"ℹ️ {s1}-{s2} close already handled by bot (reason: {stored_reason}), skipping single-leg handler")
                     now_mark = time_mod.time()
                     recently_handled_close_symbols[s1] = now_mark
                     recently_handled_close_symbols[s2] = now_mark
@@ -1307,7 +1296,7 @@ async def ws_user_msg(ws, msg):
                     continue
                 
                 # External close - user manually closed one position
-                print(f"âš¡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol} IMMEDIATELY...")
+                print(f"⚡ External close detected: {symbol} in pair {s1}-{s2}. Closing {other_symbol} IMMEDIATELY...")
                 pair_info.last_close_reason = 'manual_partial'
                 try:
                     close_exec_note = ""
@@ -1327,7 +1316,7 @@ async def ws_user_msg(ws, msg):
                                 quantity=abs(other_amt),
                                 reduceOnly='true'
                             )
-                            print(f"âœ… Closed remaining leg {other_symbol} (qty={abs(other_amt)}, side={close_side}, reduceOnly=true)")
+                            print(f"✅ Closed remaining leg {other_symbol} (qty={abs(other_amt)}, side={close_side}, reduceOnly=true)")
                         except Exception as close_err:
                             err_txt = str(close_err)
                             if "-2022" in err_txt or "ReduceOnly Order is rejected" in err_txt:
@@ -1337,8 +1326,8 @@ async def ws_user_msg(ws, msg):
                                 verify_amt = float(verify_pos.get('positionAmt', 0))
                                 if verify_amt == 0:
                                     pair_info.last_close_reason = 'external'
-                                    close_exec_note = "â„¹ï¸ Remaining leg was already closed on exchange."
-                                    print(f"â„¹ï¸ {other_symbol} already closed after reduceOnly reject (-2022).")
+                                    close_exec_note = "ℹ️ Remaining leg was already closed on exchange."
+                                    print(f"ℹ️ {other_symbol} already closed after reduceOnly reject (-2022).")
                                 else:
                                     verify_side = 'SELL' if verify_amt > 0 else 'BUY'
                                     await client.new_order(
@@ -1347,15 +1336,15 @@ async def ws_user_msg(ws, msg):
                                         type='MARKET',
                                         quantity=abs(verify_amt)
                                     )
-                                    close_exec_note = "â„¹ï¸ reduceOnly rejected, closed with fallback MARKET order."
-                                    print(f"âš ï¸ reduceOnly rejected for {other_symbol}; fallback MARKET close succeeded.")
+                                    close_exec_note = "ℹ️ reduceOnly rejected, closed with fallback MARKET order."
+                                    print(f"⚠️ reduceOnly rejected for {other_symbol}; fallback MARKET close succeeded.")
                             else:
-                                close_exec_note = f"âš ï¸ Could not close remaining leg: {close_err}"
-                                print(f"âš ï¸ Failed to close remaining leg {other_symbol}: {close_err}")
+                                close_exec_note = f"⚠️ Could not close remaining leg: {close_err}"
+                                print(f"⚠️ Failed to close remaining leg {other_symbol}: {close_err}")
                     else:
                         pair_info.last_close_reason = 'external'
-                        close_exec_note = "â„¹ï¸ Remaining leg was already closed on exchange."
-                        print(f"â„¹ï¸ Remaining leg {other_symbol} already at zero position.")
+                        close_exec_note = "ℹ️ Remaining leg was already closed on exchange."
+                        print(f"ℹ️ Remaining leg {other_symbol} already at zero position.")
                     
                     # THEN cancel remaining algo/SL/TP orders (non-critical, can be slower)
                     try:
@@ -1365,7 +1354,7 @@ async def ws_user_msg(ws, msg):
                             return_exceptions=True
                         )
                     except Exception as cancel_err:
-                        print(f"âš ï¸ Cancel orders error (non-critical): {cancel_err}")
+                        print(f"⚠️ Cancel orders error (non-critical): {cancel_err}")
                     
                     await asyncio.sleep(1)
                     
@@ -1374,7 +1363,7 @@ async def ws_user_msg(ws, msg):
                     verify_pos = verify_data[0] if verify_data else {}
                     remaining_amt = float(verify_pos.get('positionAmt', 0))
                     if remaining_amt != 0:
-                        warn_msg = (f"ðŸš¨ <b>External close handling incomplete</b>\n\n"
+                        warn_msg = (f"🚨 <b>External close handling incomplete</b>\n\n"
                                     f"Pair: {s1}/{s2}\n"
                                     f"Closed leg: {symbol}\n"
                                     f"Remaining leg still OPEN: {other_symbol}\n"
@@ -1393,8 +1382,8 @@ async def ws_user_msg(ws, msg):
                         _fetch_account_trades_window_main(s2, start_ms, max_records=3000)
                     )
                     
-                    print(f"ðŸ“Š Trades for {s1}: {len(trades1)} entries")
-                    print(f"ðŸ“Š Trades for {s2}: {len(trades2)} entries")
+                    print(f"📊 Trades for {s1}: {len(trades1)} entries")
+                    print(f"📊 Trades for {s2}: {len(trades2)} entries")
                     
                     pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades1)
                     pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades2)
@@ -1406,7 +1395,7 @@ async def ws_user_msg(ws, msg):
                     total_fees = fee1 + fee2
                     net_pnl = total_pnl - total_fees
                     
-                    pnl_emoji = "ðŸŸ¢" if net_pnl >= 0 else "ðŸ”´"
+                    pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
                     
                     # Update memory state
                     pair_info.position_status = 0
@@ -1448,17 +1437,17 @@ async def ws_user_msg(ws, msg):
                             )
                             await _persist_pair_executions_main(pair_info, trades1, trades2, phase='MANUAL_PARTIAL_CLOSE_WS')
                         except Exception as trade_err:
-                            print(f"âš ï¸ Trade update failed for {s1}-{s2}: {trade_err}")
+                            print(f"⚠️ Trade update failed for {s1}-{s2}: {trade_err}")
                         pair_info.current_trade_id = None
                     
-                    close_type = 'â“ Unknown'
+                    close_type = '❓ Unknown'
                     close_hint = ''
                     if close_exec_note:
                         close_hint = f"\n{close_exec_note}"
                     
                     if stored_reason and stored_reason in CLOSE_REASONS:
                         close_type = CLOSE_REASONS[stored_reason]
-                        print(f"ðŸ“‹ Using stored reason: {stored_reason} -> {close_type}")
+                        print(f"📋 Using stored reason: {stored_reason} -> {close_type}")
                     else:
                         try:
                             orders1, orders2 = await asyncio.gather(
@@ -1478,31 +1467,31 @@ async def ws_user_msg(ws, msg):
                                 o_type = o.get('type', '') or o.get('origType', '')
                                 
                                 if 'STOP' in o_type:
-                                    close_type = 'ðŸ›¡ï¸ Hardware SL'
+                                    close_type = '🛡️ Hardware SL'
                                 elif 'TAKE_PROFIT' in o_type:
-                                    close_type = 'ðŸ›¡ï¸ Hardware TP'
+                                    close_type = '🛡️ Hardware TP'
                                 elif o_type == 'MARKET':
                                     if o.get('reduceOnly', False):
-                                        close_type = 'ðŸ¤– Bot Close (reason unknown)'
+                                        close_type = '🤖 Bot Close (reason unknown)'
                                     else:
-                                        close_type = 'ðŸ‘¤ Manual Market Order'
+                                        close_type = '👤 Manual Market Order'
                                 elif o_type == 'LIMIT':
-                                    close_type = 'ðŸ“Š Limit Order Filled'
+                                    close_type = '📊 Limit Order Filled'
                                 elif 'TRAILING' in o_type:
-                                    close_type = 'ðŸ“ˆ Trailing Stop'
+                                    close_type = '📈 Trailing Stop'
                                 else:
-                                    close_type = f'âš¡ Order: {o_type}'
-                                print(f"ðŸ“‹ Detected from orders: {o_type} -> {close_type}")
+                                    close_type = f'⚡ Order: {o_type}'
+                                print(f"📋 Detected from orders: {o_type} -> {close_type}")
                             else:
-                                close_type = 'âš¡ External Close'
+                                close_type = '⚡ External Close'
                                 close_hint += ' (no matching orders)'
-                                print(f"âš ï¸ No recent orders found for {s1}/{s2}")
+                                print(f"⚠️ No recent orders found for {s1}/{s2}")
                         except Exception as e:
-                            print(f"âš ï¸ Could not query orders: {e}")
-                            close_type = 'âš¡ External Close'
+                            print(f"⚠️ Could not query orders: {e}")
+                            close_type = '⚡ External Close'
                             close_hint += ' (query failed)'
                     
-                    pnl_emoji = 'ðŸŸ¢' if net_pnl >= 0 else 'ðŸ”´'
+                    pnl_emoji = '🟢' if net_pnl >= 0 else '🔴'
                     try:
                         p1 = pairs_manager.last_prices.get(s1, 0)
                         p2 = pairs_manager.last_prices.get(s2, 0)
@@ -1530,14 +1519,14 @@ async def ws_user_msg(ws, msg):
                     else:
                         close_hl = 'N/A'
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
-                    e1 = 'ðŸŸ¢' if pnl1 >= 0 else 'ðŸ”´'
-                    e2 = 'ðŸŸ¢' if pnl2 >= 0 else 'ðŸ”´'
+                    e1 = '🟢' if pnl1 >= 0 else '🔴'
+                    e2 = '🟢' if pnl2 >= 0 else '🔴'
                     done_msg = (f"{close_type}: <b>{s1}/{s2}</b>\n\n"
-                                f"ðŸ“Š Z: {zscore:+.2f} | Î²: {beta:.3f} | p: {close_pval:.4f}\n"
-                                f"â³ HL: {close_hl} | Hedge: {hedge:.4f}\n"
-                                f"ðŸ’µ PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                                f"📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {close_pval:.4f}\n"
+                                f"⏳ HL: {close_hl} | Hedge: {hedge:.4f}\n"
+                                f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
                                 f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
-                                f"ðŸ’¸ Fees: {total_fees:.4f} USDT{close_hint}")
+                                f"💸 Fees: {total_fees:.4f} USDT{close_hint}")
                     reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                     await send_tg_notification(done_msg, reply_to)
                     now_mark = time_mod.time()
@@ -1545,7 +1534,7 @@ async def ws_user_msg(ws, msg):
                     recently_handled_close_symbols[s2] = now_mark
                     
                 except Exception as e:
-                    print(f"âš ï¸ External close handling error for {s1}-{s2}: {e}")
+                    print(f"⚠️ External close handling error for {s1}-{s2}: {e}")
                     import traceback
                     traceback.print_exc()
                     pair_info.is_trading = False
@@ -1586,7 +1575,7 @@ async def ws_user_msg(ws, msg):
                         continue
                     untracked_close_alerts[symbol] = now_ts
 
-                    msg_txt = (f"âš¡ <b>UNTRACKED POSITION CLOSED</b>\n\n"
+                    msg_txt = (f"⚡ <b>UNTRACKED POSITION CLOSED</b>\n\n"
                                f"Symbol: <b>{symbol}</b>\n"
                                f"Notice: This position was closed but was NOT tracked by the bot's active_pairs list.\n"
                                f"Cause: Manual close or DB sync issue.")
@@ -1604,18 +1593,18 @@ async def ws_user_msg(ws, msg):
         
         # Check if this is a filled SL/TP order (hardware stop triggered)
         if status == 'FILLED' and order_type in ('STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
-            print(f"ðŸŽ¯ Hardware SL/TP triggered: {symbol} {order_type} FILLED")
+            print(f"🎯 Hardware SL/TP triggered: {symbol} {order_type} FILLED")
             
             # Notify pairs_manager to close the other leg
             if pairs_manager:
                 try:
                     await pairs_manager.handle_sl_tp_triggered(symbol, order_type)
                 except Exception as e:
-                    print(f"âš ï¸ Error handling SL/TP trigger: {e}")
+                    print(f"⚠️ Error handling SL/TP trigger: {e}")
         
         # CANCELED order - notify user and trigger cleanup
         elif status == 'CANCELED' and order_type in ('STOP', 'TAKE_PROFIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
-            print(f"âš ï¸ SL/TP CANCELED: {symbol} {order_type} by user/system")
+            print(f"⚠️ SL/TP CANCELED: {symbol} {order_type} by user/system")
             
             # Find which pair this order belongs to
             if pairs_manager:
@@ -1626,18 +1615,18 @@ async def ws_user_msg(ws, msg):
                         # Skip if pair is already being processed for closure
                         # (e.g. bulk close on exchange cancels orders then closes positions)
                         if getattr(pair_info, 'is_trading', False):
-                            print(f"â„¹ï¸ {s1}-{s2} already being processed, skipping cancel handler")
+                            print(f"ℹ️ {s1}-{s2} already being processed, skipping cancel handler")
                             break
                         
                         # Notify user about manual order cancellation
-                        cancel_msg = (f"âš ï¸ <b>Order CANCELED:</b> {symbol}\n"
+                        cancel_msg = (f"⚠️ <b>Order CANCELED:</b> {symbol}\n"
                                       f"Type: {order_type}\n"
                                       f"Pair: {s1}-{s2}\n"
-                                      f"â³ Checking pair integrity...")
+                                      f"⏳ Checking pair integrity...")
                         try:
                             await send_tg_notification(cancel_msg)
                         except Exception as e:
-                            print(f"âš ï¸ TG notify error: {e}")
+                            print(f"⚠️ TG notify error: {e}")
                         
                         # Try restoring protection immediately (1 retry), then fallback to leg sync.
                         try:
@@ -1645,7 +1634,7 @@ async def ws_user_msg(ws, msg):
                             if not restored:
                                 await pairs_manager._check_leg_synchronization()
                         except Exception as e:
-                            print(f"âš ï¸ Leg sync error after cancel: {e}")
+                            print(f"⚠️ Leg sync error after cancel: {e}")
                         break
     
     # Check for ALGO_UPDATE (algo order triggered/finished - SL/TP via algo endpoint)
@@ -1656,7 +1645,7 @@ async def ws_user_msg(ws, msg):
         algo_symbol = algo_data.get('s', '')     # Symbol (Binance field: "s")
         algo_type = algo_data.get('o', '')       # Order Type (Binance field: "o"): STOP, TAKE_PROFIT, etc.
         
-        print(f"ðŸ“¡ ALGO_UPDATE: {algo_symbol} {algo_type} {algo_status} (algoId={algo_id})")
+        print(f"📡 ALGO_UPDATE: {algo_symbol} {algo_type} {algo_status} (algoId={algo_id})")
         
         if algo_status in ('TRIGGERING', 'TRIGGERED') and pairs_manager:
             # Check if this algoId is tracked
@@ -1669,7 +1658,7 @@ async def ws_user_msg(ws, msg):
                 is_tp = 'TAKE_PROFIT' in order_type.upper() if order_type else False
                 tp_or_sl = 'TP' if is_tp else 'SL'
                 
-                print(f"ðŸŽ¯ Algo {tp_or_sl} triggered: {symbol} (algoId={algo_id})")
+                print(f"🎯 Algo {tp_or_sl} triggered: {symbol} (algoId={algo_id})")
                 
                 try:
                     await pairs_manager.handle_sl_tp_triggered(symbol, order_type)
@@ -1680,25 +1669,25 @@ async def ws_user_msg(ws, msg):
                                      if info.get('pair_key') == pair_key]
                         for aid in to_remove:
                             del pairs_manager.algo_orders[aid]
-                        print(f"ðŸ—‘ï¸ Cleaned up {len(to_remove)} algo order mappings for pair")
+                        print(f"🗑️ Cleaned up {len(to_remove)} algo order mappings for pair")
                 except Exception as e:
-                    print(f"âš ï¸ Error handling algo SL/TP trigger: {e}")
+                    print(f"⚠️ Error handling algo SL/TP trigger: {e}")
                     import traceback
                     traceback.print_exc()
             else:
-                print(f"â„¹ï¸ Algo order {algo_id} not tracked (may be from previous session)")
+                print(f"ℹ️ Algo order {algo_id} not tracked (may be from previous session)")
                 # Fallback: try to match by symbol
                 if algo_status == 'TRIGGERING':
                     try:
                         await pairs_manager.handle_sl_tp_triggered(algo_symbol, algo_type)
                     except Exception as e:
-                        print(f"âš ï¸ Fallback algo handler error: {e}")
+                        print(f"⚠️ Fallback algo handler error: {e}")
         
         elif algo_status == 'CANCELED' and pairs_manager:
             # Remove from tracking
             if algo_id in pairs_manager.algo_orders:
                 del pairs_manager.algo_orders[algo_id]
-                print(f"ðŸ—‘ï¸ Removed canceled algo order {algo_id} from tracking")
+                print(f"🗑️ Removed canceled algo order {algo_id} from tracking")
 
 
 if __name__ == '__main__':
@@ -1709,4 +1698,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped by user.")
-
