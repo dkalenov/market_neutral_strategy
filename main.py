@@ -65,6 +65,8 @@ def _configure_console_encoding():
         pass
 
 
+
+
 _CP1252_UNICODE_TO_BYTE = {
     0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
     0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
@@ -117,11 +119,6 @@ def _install_print_mojibake_fix():
         fixed_args = [(_fix_mojibake_text(a) if isinstance(a, str) else a) for a in args]
         _orig_print(*fixed_args, **kwargs)
     builtins.print = _fixed_print
-
-def _order_type_text(order) -> str:
-    if not isinstance(order, dict):
-        return ''
-    return str(order.get('type') or order.get('origType') or order.get('orderType') or '').upper()
 
 async def send_tg_notification(message, reply_to_message_id=None, reply_markup=None):
     """Send notification to TG channel or admins. Returns message_id for reply threading."""
@@ -243,10 +240,33 @@ async def main():
     global all_symbols
     global _main_timeframe_global
     global _ws_recover_lock
+
+    startup_marks: list[tuple[str, float]] = []
+    startup_profile = os.getenv('STARTUP_PROFILE', 'true').strip().lower() not in ('0', 'false', 'no')
+
+    def _mark(stage: str):
+        if startup_profile:
+            startup_marks.append((stage, time_mod.perf_counter()))
+
+    def _print_startup_profile(final_stage: str):
+        if not startup_profile:
+            return
+        _mark(final_stage)
+        if len(startup_marks) < 2:
+            return
+        print("=== STARTUP PROFILE ===")
+        prev_name, prev_ts = startup_marks[0]
+        for name, ts in startup_marks[1:]:
+            print(f"  {prev_name} -> {name}: {ts - prev_ts:.2f}s")
+            prev_name, prev_ts = name, ts
+        print(f"  TOTAL: {startup_marks[-1][1] - startup_marks[0][1]:.2f}s")
+        print("=======================")
+    _mark('start')
     
     # Load environment variables from .env file
     _configure_console_encoding()
     load_dotenv()
+    _mark('env_loaded')
     
     # Connect to DB
     ini_config = configparser.ConfigParser()
@@ -259,9 +279,11 @@ async def main():
         password=ini_config['DB']['password'],
         db_name=ini_config['DB']['db_name']
     )
+    _mark('db_connected')
 
     # Load config from DB
     conf = await db.load_config()
+    _mark('config_loaded')
     # Non-destructive integrity audit (warn-only). Helps detect historical DB drift early.
     try:
         integrity = await db.audit_data_integrity(sample_limit=10)
@@ -303,7 +325,7 @@ async def main():
     tg_task = None
     if tg_token:
         try:
-            # Start TG control plane before exchange bootstrap, so emergency controls are available.
+            # Bring control channel online before heavy exchange bootstrap.
             tg_ready = await tg.init_bot()
             if tg_ready:
                 tg.attach_runtime(session, None, None)
@@ -311,6 +333,7 @@ async def main():
                 print("TG control channel started before exchange checks.")
         except Exception as e:
             print(f"⚠️ Early TG startup failed: {e}")
+    _mark('tg_early_started')
 
     # Create Binance client
     client = binance.Futures(api_key=api_key,
@@ -318,12 +341,16 @@ async def main():
                              asynced=True,
                              testnet=ini_config.getboolean('BOT', 'testnet'))
     tg.attach_runtime(session, client, None)
+    _mark('client_created')
     
     # CRITICAL: Sync time with server to avoid -1021 timestamp errors.
     try:
         await client._sync_time_async()
     except Exception as e:
         print(f"⚠️ Initial time sync failed: {e}")
+    _mark('time_synced')
+    
+    # Init pairs manager
     
     # Default values
     timeframe = conf.timeframe if conf.timeframe else '1h'
@@ -393,6 +420,7 @@ async def main():
             except Exception:
                 continue  # Skip problematic symbols
     print(f"Loaded {len(all_symbols)} symbols.")
+    _mark('symbols_loaded')
     
     # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
     max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
@@ -443,6 +471,7 @@ async def main():
         all_symbols = filtered_symbols
     except Exception as e:
         print(f"âš ï¸ Volume filter failed ({e}). Using all symbols.")
+    _mark('volume_filter_done')
     
     # 2. Create pairs manager AFTER loading symbols
     pairs_manager = pairs_trading.PairsManager(
@@ -458,6 +487,7 @@ async def main():
     # CRITICAL: Initialize pairs manager (loads DB state + reconciles with exchange)
     await pairs_manager.initialize()
     tg.attach_runtime(session, client, pairs_manager)
+    _mark('pairs_manager_initialized')
 
     # 3. Start background symbol updates
     loop.create_task(load_symbols_loop())
@@ -465,8 +495,10 @@ async def main():
     loop.create_task(ws_health_watchdog_loop())
     
     loop.create_task(connect_ws(timeframe))
+    _mark('background_tasks_started')
+    _print_startup_profile('main_ready')
     
-    # Run Telegram bot (if already running early, just wait on it).
+    # Run Telegram bot
     if tg_task:
         await tg_task
     else:
@@ -668,6 +700,7 @@ async def connect_ws(timeframe='1h'):
     global _ws_last_mark_msg_ts
     global _ws_last_user_msg_ts
 
+    ws_t0 = time_mod.perf_counter()
     print("Connecting to websockets...")
     now_ts = time_mod.time()
     _ws_last_main_msg_ts = now_ts
@@ -679,6 +712,7 @@ async def connect_ws(timeframe='1h'):
     
     # Load config for blacklist
     conf = await db.load_config()
+    t_cfg = time_mod.perf_counter()
 
     # Get blacklist from DB (which already contains defaults if initialized)
     FULL_BLACKLIST = set()
@@ -730,6 +764,7 @@ async def connect_ws(timeframe='1h'):
 
     # 2. Add symbols from DB (ONLY pairs with open positions)
     db_pairs = await db.get_all_pairs()
+    t_db_pairs = time_mod.perf_counter()
     active_db_count = 0
     for p in db_pairs:
         if p.position_status != 0:  # Only add if position is open
@@ -773,6 +808,7 @@ async def connect_ws(timeframe='1h'):
             await asyncio.sleep(0.1)
         except Exception as e:
             print(f"Error subscribing to main TF chunk {i+1}: {e}")
+    t_main_ws = time_mod.perf_counter()
 
     print(f"Connected to main TF kline websockets ({len(websockets_list)} connections).")
 
@@ -782,6 +818,7 @@ async def connect_ws(timeframe='1h'):
         print("Connected to userdata websocket.")
     except Exception as e:
         print(f"Could not connect to userdata stream: {e}")
+    t_user_ws = time_mod.perf_counter()
     
     # Start real-time signal confirmation loop
     if pairs_manager:
@@ -878,6 +915,16 @@ async def connect_ws(timeframe='1h'):
         
         # Heavy warmup+discovery is moved to background to avoid blocking startup
         pairs_manager.start_background_warmup(target_symbols, concurrency=20)
+    t_done = time_mod.perf_counter()
+    print(
+        f"WS startup profile: "
+        f"config={t_cfg - ws_t0:.2f}s, "
+        f"db_pairs={t_db_pairs - t_cfg:.2f}s, "
+        f"main_ws={t_main_ws - t_db_pairs:.2f}s, "
+        f"userdata_ws={t_user_ws - t_main_ws:.2f}s, "
+        f"tail={t_done - t_user_ws:.2f}s, "
+        f"total={t_done - ws_t0:.2f}s"
+    )
 
 
 # Disconnect from websockets
@@ -1114,7 +1161,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = _order_type_text(o)
+                                o_type = o.get('type', '') or o.get('origType', '')
                                 
                                 if 'STOP' in o_type:
                                     close_type = 'ðŸ›¡ï¸ Hardware SL'
@@ -1409,7 +1456,7 @@ async def ws_user_msg(ws, msg):
                             if recent_orders:
                                 recent_orders.sort(key=lambda x: x.get('updateTime', 0), reverse=True)
                                 o = recent_orders[0]
-                                o_type = _order_type_text(o)
+                                o_type = o.get('type', '') or o.get('origType', '')
                                 
                                 if 'STOP' in o_type:
                                     close_type = 'ðŸ›¡ï¸ Hardware SL'

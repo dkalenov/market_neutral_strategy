@@ -170,16 +170,8 @@ class ConfigInfo:
     beta_critical: float    # Force-close if |beta| > this, regardless of PnL (default 1.0)
     signal_confirm_sec: int # Signal confirmation time in seconds (default 10)
     trade_mode: bool        # If True, allow opening new positions (default True)
-    # Entry Viability Filter (phase-only, half-life band reused from hl_min_days/hl_max_days)
-    entry_et_target_abs_z: float      # Target |Z| for expected reversion estimate (default 0.5)
-    entry_et_max_hours: float         # Soft expected-time cap in hours (default 24; <=0 disables)
-    entry_et_max_hl_mult: float       # Soft cap as multiple of half-life (default 2.2)
-    entry_phase_window_bars: int      # Bars for local phase estimation (default 6)
-    entry_phase_min_toward_velocity: float  # Minimum average velocity toward mean (default 0.004)
-    entry_phase_min_toward_ratio: float     # Minimum share of steps toward mean in phase window (default 0.55)
-    entry_phase_max_away_velocity: float  # Max allowed "away from mean" velocity (default 0.03)
-    entry_phase_max_abs_slope: float  # Max allowed slope of |Z| (default 0.05)
-    coint_stability_min_bars: int    # Minimum consecutive bars with valid cointegration before entry (default 3)
+    entry_et_target_abs_z: float  # Target |Z| for E[T] estimate in open alert (default 0.5)
+    coint_stability_min_bars: int  # Minimum consecutive coint bars before entry (default 3)
     # Hedge Ratio Bounds (market neutrality)
     hedge_min: float        # Minimum |hedge_ratio| for pair acceptance (default 0.3)
     hedge_max: float        # Maximum |hedge_ratio| for pair acceptance (default 3.0)
@@ -316,11 +308,6 @@ async def run_migrations(engine):
         "WHERE is_archived = FALSE;",
         # Cleanup deprecated config keys
         "DELETE FROM config WHERE key = 'test_pairs';",
-        # Config key rename: min_order_bump -> max_order_bump
-        "INSERT INTO config(key, value) "
-        "SELECT 'max_order_bump', value FROM config WHERE key = 'min_order_bump' "
-        "AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'max_order_bump');",
-        "DELETE FROM config WHERE key = 'min_order_bump';",
     ]
     
     async with engine.begin() as conn:
@@ -424,11 +411,11 @@ async def load_config():
             'p_value_threshold': '0.05',
             'max_order_bump': '1.5',
             # Position Management (Phase 2)
-            'max_active_pairs': '5',
+            'max_active_pairs': '3',
             'test_mode': 'false',
             'priority_pairs_file': 'best_pairs.json',
             # Symbol Filtering
-            'max_symbols': '150',
+            'max_symbols': '300',
             'tg_channel': '',
             # Half-Life Limits (in days) - optimized for 1h/4h TFs
             'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
@@ -438,38 +425,17 @@ async def load_config():
             'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
-            # Entry viability filter defaults (balanced baseline for 1h).
-            #
-            # Recommended 4h preset (if moving to 4h timeframe):
-            #   hl_min_days = 0.5
-            #   hl_max_days = 4.0
-            #   entry_et_target_abs_z = 0.5
-            #   entry_et_max_hours = 36
-            #   entry_et_max_hl_mult = 2.0
-            #   entry_phase_window_bars = 6
-            #   entry_phase_min_toward_velocity = 0.003
-            #   entry_phase_min_toward_ratio = 0.55
-            #   entry_phase_max_away_velocity = 0.025
-            #   entry_phase_max_abs_slope = 0.04
-            # Rationale: 4h bars are slower/noisier, so velocity/slope thresholds are slightly tighter,
-            # while ET cap is longer in hours.
             'entry_et_target_abs_z': '0.5',
-            'entry_et_max_hours': '24',
-            'entry_et_max_hl_mult': '2.2',
-            'entry_phase_window_bars': '6',
-            'entry_phase_min_toward_velocity': '0.004',
-            'entry_phase_min_toward_ratio': '0.55',
-            'entry_phase_max_away_velocity': '0.03',
-            'entry_phase_max_abs_slope': '0.05',
             'coint_stability_min_bars': '3',
             # Hedge Ratio Bounds (market neutrality)
             'hedge_min': '0.3',              # Min |hedge| â€” below this positions are too unbalanced
             'hedge_max': '3.0',              # Max |hedge| â€” above this positions are too unbalanced
             # Idle Pair Management
             'max_idle_pairs': '150',         # Maximum idle pairs without positions
-            'idle_timeout_hours': '48',      # Remove idle pairs older than X hours
-            'markprice_max_symbols': '450',
+            'idle_timeout_hours': '24',      # Remove idle pairs older than X hours
+            'markprice_max_symbols': '200',
         }
+
 
         # Ensure all expected config keys exist in DB and have defaults if empty
         for key in ConfigInfo.__annotations__.keys():
@@ -495,9 +461,6 @@ async def load_config():
         async with Session() as session:
             result = (await session.execute(select(Config))).scalars().all()
             data = {row.key: row.value for row in result}
-            # Backward compatibility for DBs not migrated yet.
-            if (not data.get('max_order_bump')) and data.get('min_order_bump'):
-                data['max_order_bump'] = data['min_order_bump']
             return ConfigInfo(data)
     except Exception as e:
         print(f"Config load failed: {e}")
@@ -508,8 +471,6 @@ async def config_update(**kwargs):
     # Update configuration parameters in DB
     async with Session() as s:
         for key, value in kwargs.items():
-            if key == 'min_order_bump':
-                key = 'max_order_bump'
             # Convert to string for DB storage
             db_value = str(value) if value is not None else None
             await s.execute(update(Config).where(Config.key == key).values(value=db_value))

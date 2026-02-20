@@ -14,6 +14,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
     ReplyKeyboardMarkup, KeyboardButton)
 
 
+
 # Initialize bot and dispatcher
 bot: Bot = None  # Will be initialized in run()
 dp = Dispatcher()
@@ -21,20 +22,17 @@ close_ops_lock = asyncio.Lock()
 session = None
 client = None
 pairs_manager = None
-TG_DEBUG_LOGS = os.getenv('TG_DEBUG_LOGS', 'false').strip().lower() in ('1', 'true', 'yes')
 
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, Message):
-            if TG_DEBUG_LOGS:
-                print(f"TG: Received message from {event.from_user.id} (@{event.from_user.username}): {event.text}")
+            print(f"TG: Received message from {event.from_user.id} (@{event.from_user.username}): {event.text}")
             if event.from_user.id not in tg_admins:
                 print(f"TG: Unauthorized access from {event.from_user.id}")
                 await event.answer(f"Unauthorized. Your ID: {event.from_user.id}")
                 return
         elif isinstance(event, CallbackQuery):
-            if TG_DEBUG_LOGS:
-                print(f"TG: Received callback from {event.from_user.id} (@{event.from_user.username}): {event.data}")
+            print(f"TG: Received callback from {event.from_user.id} (@{event.from_user.username}): {event.data}")
             if event.from_user.id not in tg_admins:
                 print(f"TG: Unauthorized access from {event.from_user.id}")
                 await event.answer("Unauthorized", show_alert=True)
@@ -100,7 +98,7 @@ async def init_bot():
 
 
 def attach_runtime(_session=None, _client=None, _pairs_manager=None):
-    """Attach/update runtime dependencies from main thread."""
+    """Attach runtime dependencies from main."""
     global session
     global client
     global pairs_manager
@@ -108,7 +106,6 @@ def attach_runtime(_session=None, _client=None, _pairs_manager=None):
         session = _session
     if _client is not None:
         client = _client
-    # Explicitly allow None to be set at startup, then replaced later.
     pairs_manager = _pairs_manager
 
 
@@ -199,13 +196,6 @@ async def safe_callback_answer(callback: CallbackQuery, text: str = None, show_a
         print(f"TG: callback answer failed: {e}")
 
 
-async def get_runtime_config():
-    """Prefer in-memory config to avoid DB round-trips on every TG button click."""
-    if pairs_manager and getattr(pairs_manager, 'config', None):
-        return pairs_manager.config
-    return await db.load_config()
-
-
 async def route_menu_button(message: Message, state: FSMContext) -> bool:
     """
     Return True if message was a menu button and has been routed.
@@ -280,8 +270,6 @@ async def start_callback(callback: CallbackQuery, state: FSMContext):
 async def open_trades(message: Message | CallbackQuery, state: FSMContext):
     await state.set_state(States.trades)
     text = "📊 <b>Open Trades:</b>"
-    if isinstance(message, CallbackQuery):
-        await safe_callback_answer(message, "Loading stats...")
     
     if pairs_manager:
         try:
@@ -382,10 +370,8 @@ async def open_trades(message: Message | CallbackQuery, state: FSMContext):
 @dp.message(F.text == "Settings")
 @dp.callback_query(F.data == "settings")
 async def settings(message: Message, state: FSMContext):
-    if isinstance(message, CallbackQuery):
-        await safe_callback_answer(message)
     # Load config from DB
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     # Set state
     await state.set_state(States.settings)
     # Get test mode status
@@ -438,8 +424,7 @@ async def settings(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "strategy_settings")
 async def strategy_settings_menu(callback: CallbackQuery, state: FSMContext):
-    await safe_callback_answer(callback)
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     tf = getattr(conf, 'timeframe', None) or '1h'
     win = getattr(conf, 'window_size', None)
     win_txt = str(win) if win not in (None, '', 'none', 'None') else 'auto'
@@ -472,7 +457,7 @@ async def set_window(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "set_half_life")
 async def set_half_life(callback: CallbackQuery, state: FSMContext):
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
     hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
     await state.set_state(States.settings)
@@ -486,7 +471,7 @@ async def set_half_life(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "set_hedge_bounds")
 async def set_hedge_bounds(callback: CallbackQuery, state: FSMContext):
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     hedge_min = getattr(conf, 'hedge_min', 0.3) or 0.3
     hedge_max = getattr(conf, 'hedge_max', 3.0) or 3.0
     await state.set_state(States.settings)
@@ -504,8 +489,7 @@ async def set_hedge_bounds(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "risk_settings")
 async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
-    await safe_callback_answer(callback)
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     capital = getattr(conf, 'capital', 1000) or 1000
     leverage = getattr(conf, 'leverage', 20) or 20
     max_notional = getattr(conf, 'max_notional_pct', 0.1) or 0.1
@@ -524,17 +508,8 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     beta_critical = getattr(conf, 'beta_critical', 1.0) or 1.0
     cb_pct = getattr(conf, 'circuit_breaker_pct', 0.20) or 0.20
     p_val = getattr(conf, 'p_value_threshold', 0.05) or 0.05
-    bump = getattr(conf, 'max_order_bump', None)
-    if bump in (None, '', 0):
-        bump = getattr(conf, 'min_order_bump', 1.5) or 1.5
+    bump = getattr(conf, 'max_order_bump', 1.5) or 1.5
     et_target = getattr(conf, 'entry_et_target_abs_z', 0.5) or 0.5
-    et_hours = getattr(conf, 'entry_et_max_hours', 24.0) or 24.0
-    et_hl_mult = getattr(conf, 'entry_et_max_hl_mult', 2.2) or 2.2
-    epw = int(getattr(conf, 'entry_phase_window_bars', 6) or 6)
-    epminv = getattr(conf, 'entry_phase_min_toward_velocity', 0.004) or 0.004
-    epminr = getattr(conf, 'entry_phase_min_toward_ratio', 0.55) or 0.55
-    epv = getattr(conf, 'entry_phase_max_away_velocity', 0.03) or 0.03
-    eps = getattr(conf, 'entry_phase_max_abs_slope', 0.05) or 0.05
     coint_stability = int(getattr(conf, 'coint_stability_min_bars', 3) or 3)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -552,19 +527,12 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
          InlineKeyboardButton(text=f"β Critical: {beta_critical}", callback_data="set_beta_critical_risk")],
         [InlineKeyboardButton(text=f"🚨 Circuit Breaker: {cb_pct*100:.0f}% notional", callback_data="set_circuit_breaker")],
         [InlineKeyboardButton(text=f"🧪 P-Value Threshold: {p_val}", callback_data="set_p_value")],
+        [InlineKeyboardButton(text=f"🎯 E[T] target |Z|: {et_target}", callback_data="set_entry_et_target_abs_z")],
+        [InlineKeyboardButton(text=f"🔁 Coint stability bars: {coint_stability}", callback_data="set_coint_stability_min_bars")],
         [InlineKeyboardButton(text=f"📏 Max Order Bump: {bump}x", callback_data="set_max_bump")],
-        [InlineKeyboardButton(text=f"⏱️ ET Max: {et_hours:.0f}h", callback_data="set_entry_et_max_hours"),
-         InlineKeyboardButton(text=f"×HL: {et_hl_mult:.2f}", callback_data="set_entry_et_max_hl_mult")],
-        [InlineKeyboardButton(text=f"🎯 ET Target |Z|: {et_target:.2f}", callback_data="set_entry_et_target_abs_z")],
-        [InlineKeyboardButton(text=f"🧭 Phase Window: {epw}", callback_data="set_entry_phase_window_bars")],
-        [InlineKeyboardButton(text=f"🔁 Coint Stability: {coint_stability} bars", callback_data="set_coint_stability_min_bars")],
-        [InlineKeyboardButton(text=f"➡️ Min Toward Vel: {epminv:.3f}", callback_data="set_entry_phase_min_toward_velocity"),
-         InlineKeyboardButton(text=f"📊 Min Toward Ratio: {epminr:.2f}", callback_data="set_entry_phase_min_toward_ratio")],
-        [InlineKeyboardButton(text=f"↘️ Away Vel: {epv:.3f}", callback_data="set_entry_phase_max_away_velocity"),
-         InlineKeyboardButton(text=f"📉 |Z| Slope: {eps:.3f}", callback_data="set_entry_phase_max_abs_slope")],
         [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
         [InlineKeyboardButton(text=f"🗑️ Max Idle: {max_idle}", callback_data="set_max_idle"),
-         InlineKeyboardButton(text=f"⏰ Idle Timeout: {idle_timeout}h", callback_data="set_idle_timeout")],
+         InlineKeyboardButton(text=f"⏰ Timeout: {idle_timeout}h", callback_data="set_idle_timeout")],
         [InlineKeyboardButton(text="Back", callback_data="settings")]
     ])
     await answer(callback, "Risk Management Settings:\n\n"
@@ -573,13 +541,12 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
                            f"<b>Max Pairs</b>: {max_pairs} concurrent trades.\n"
                            f"<b>β Entry Filter</b>: reject idle pairs if |β| >= {beta_threshold}\n"
                            f"<b>β Alert/Critical</b>: {beta_alert_threshold} / {beta_critical}\n"
-                           f"<b>Entry ET (soft)</b>: target |Z| {et_target:.2f}, cap {et_hours:.0f}h, ×HL {et_hl_mult:.2f}\n"
-                           f"<b>Coint Stability</b>: at least {coint_stability} consecutive valid bars before entry\n"
-                           f"<b>Entry Phase Filter</b>: window {epw}, toward≥{epminv:.3f}, ratio≥{epminr:.2f}\n"
+                           f"<b>E[T] target |Z|</b>: {et_target}\n"
+                           f"<b>Coint stability bars</b>: {coint_stability}\n"
                            f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.\n\n"
                            f"<b>Idle Pair Cleanup:</b>\n"
                            f"  • Max idle pairs: {max_idle}\n"
-                           f"  • Idle timeout: {idle_timeout}h (remove inactive/no-position pairs only)", reply_markup=keyboard)
+                           f"  • Timeout: {idle_timeout}h", reply_markup=keyboard)
 
 @dp.callback_query(F.data == "set_capital")
 async def set_capital_cb(callback: CallbackQuery, state: FSMContext):
@@ -667,7 +634,7 @@ async def set_idle_timeout_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "toggle_trade_mode")
 async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     current = getattr(conf, 'trade_mode', True)
     if isinstance(current, str):
         current = current.lower() in ('true', '1', 'yes')
@@ -690,7 +657,7 @@ async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "toggle_test_mode")
 async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     current = getattr(conf, 'test_mode', False)
     if isinstance(current, str):
         current = current.lower() in ('true', '1', 'yes')
@@ -711,8 +678,7 @@ async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
 # === HARDWARE SL/TP MENU ===
 @dp.callback_query(F.data == "hardware_sltp")
 async def hardware_sltp_menu(callback: CallbackQuery, state: FSMContext):
-    await safe_callback_answer(callback)
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     sl_atr = getattr(conf, 'sl_atr_mult', 2.5) or 2.5
     sl_min = getattr(conf, 'sl_min_pct', 0.10) or 0.10
     sl_max = getattr(conf, 'sl_max_pct', 0.30) or 0.30
@@ -777,7 +743,7 @@ async def set_tp_max_cb(callback: CallbackQuery, state: FSMContext):
 async def set_circuit_breaker_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="circuit_breaker_pct")
-    conf = await get_runtime_config()
+    conf = await db.load_config()
     lev = conf.leverage if conf.leverage else 20
     await answer(callback, 
         f"Enter Circuit Breaker as % of <b>notional</b> (total position size).\n\n"
@@ -793,65 +759,23 @@ async def set_p_value_cb(callback: CallbackQuery, state: FSMContext):
     await state.update_data(waiting_for="p_value_threshold")
     await answer(callback, "Enter P-Value threshold (e.g., 0.05). Pair closes if p-value > this:")
 
-@dp.callback_query(F.data == "set_max_bump")
-async def set_max_bump_cb(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "set_entry_et_target_abs_z")
+async def set_entry_et_target_abs_z_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
-    await state.update_data(waiting_for="max_order_bump")
-    await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
-
-@dp.callback_query(F.data == "set_entry_phase_window_bars")
-async def set_entry_phase_window_bars_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_phase_window_bars")
-    await answer(callback, "Enter phase estimation window in bars (recommended 5-8):")
+    await state.update_data(waiting_for="entry_et_target_abs_z")
+    await answer(callback, "Enter E[T] target |Z| (e.g., 0.5). Must be > 0 and < z_entry.")
 
 @dp.callback_query(F.data == "set_coint_stability_min_bars")
 async def set_coint_stability_min_bars_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="coint_stability_min_bars")
-    await answer(callback, "Enter minimum consecutive cointegrated bars before entry (recommended 3-8):")
+    await answer(callback, "Enter minimum consecutive cointegration bars before entry (e.g., 3):")
 
-@dp.callback_query(F.data == "set_entry_et_target_abs_z")
-async def set_entry_et_target_abs_z_cb(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "set_max_bump")
+async def set_max_bump_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_et_target_abs_z")
-    await answer(callback, "Enter ET target |Z| (recommended 0.4-0.8, e.g., 0.5):")
-
-@dp.callback_query(F.data == "set_entry_et_max_hours")
-async def set_entry_et_max_hours_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_et_max_hours")
-    await answer(callback, "Enter ET soft max hours (e.g., 24). Use 0 to disable ET filter:")
-
-@dp.callback_query(F.data == "set_entry_et_max_hl_mult")
-async def set_entry_et_max_hl_mult_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_et_max_hl_mult")
-    await answer(callback, "Enter ET cap as half-life multiplier (recommended 1.8-3.0, e.g., 2.2):")
-
-@dp.callback_query(F.data == "set_entry_phase_min_toward_velocity")
-async def set_entry_phase_min_toward_velocity_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_phase_min_toward_velocity")
-    await answer(callback, "Enter minimum average velocity toward mean (recommended 0.002-0.010, e.g., 0.004):")
-
-@dp.callback_query(F.data == "set_entry_phase_min_toward_ratio")
-async def set_entry_phase_min_toward_ratio_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_phase_min_toward_ratio")
-    await answer(callback, "Enter minimum share of steps toward mean in phase window (0-1, recommended 0.50-0.70):")
-
-@dp.callback_query(F.data == "set_entry_phase_max_away_velocity")
-async def set_entry_phase_max_away_velocity_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_phase_max_away_velocity")
-    await answer(callback, "Enter max allowed away-from-mean velocity (recommended 0.02-0.06, e.g., 0.03):")
-
-@dp.callback_query(F.data == "set_entry_phase_max_abs_slope")
-async def set_entry_phase_max_abs_slope_cb(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(States.settings)
-    await state.update_data(waiting_for="entry_phase_max_abs_slope")
-    await answer(callback, "Enter max allowed slope of |Z| trend (recommended 0.03-0.08, e.g., 0.05):")
+    await state.update_data(waiting_for="max_order_bump")
+    await answer(callback, "Enter Max Order Bump ratio (e.g., 1.5 means 50% max increase):")
 
 @dp.callback_query(F.data == "set_beta_critical")
 async def set_beta_critical_cb(callback: CallbackQuery, state: FSMContext):
@@ -1015,6 +939,23 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             await db.config_update(p_value_threshold=val)
             await answer(message, f"P-Value Threshold: <b>{val}</b>")
 
+        elif waiting_for == "entry_et_target_abs_z":
+            val = float(value)
+            z_entry = float(getattr(await db.load_config(), 'z_entry', 1.9) or 1.9)
+            if val <= 0 or val >= z_entry:
+                await answer(message, f"Value must be > 0 and < z_entry ({z_entry}).")
+                return
+            await db.config_update(entry_et_target_abs_z=val)
+            await answer(message, f"E[T] target |Z|: <b>{val}</b>")
+
+        elif waiting_for == "coint_stability_min_bars":
+            val = int(value)
+            if val < 1 or val > 50:
+                await answer(message, "Value must be between 1 and 50.")
+                return
+            await db.config_update(coint_stability_min_bars=val)
+            await answer(message, f"Coint stability min bars: <b>{val}</b>")
+
         elif waiting_for == "max_order_bump":
             val = float(value)
             if val < 1 or val > 10:
@@ -1022,81 +963,6 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             await db.config_update(max_order_bump=val)
             await answer(message, f"Max Order Bump: <b>{val}x</b>")
-
-        elif waiting_for == "entry_phase_window_bars":
-            val = int(value)
-            if val < 3 or val > 100:
-                await answer(message, "Value must be between 3 and 100 bars.")
-                return
-            await db.config_update(entry_phase_window_bars=val)
-            await answer(message, f"Entry phase window: <b>{val}</b> bars")
-
-        elif waiting_for == "coint_stability_min_bars":
-            val = int(value)
-            if val < 1 or val > 200:
-                await answer(message, "Value must be between 1 and 200 bars.")
-                return
-            await db.config_update(coint_stability_min_bars=val)
-            await answer(message, f"Cointegration stability gate: <b>{val}</b> bars")
-
-        elif waiting_for == "entry_et_target_abs_z":
-            val = float(value)
-            if val <= 0 or val > 5:
-                await answer(message, "Value must be between 0 and 5.")
-                return
-            await db.config_update(entry_et_target_abs_z=val)
-            await answer(message, f"ET target |Z|: <b>{val:.2f}</b>")
-
-        elif waiting_for == "entry_et_max_hours":
-            val = float(value)
-            if val < 0 or val > 240:
-                await answer(message, "Value must be between 0 and 240 hours.")
-                return
-            await db.config_update(entry_et_max_hours=val)
-            if val == 0:
-                await answer(message, "ET filter: <b>disabled</b>")
-            else:
-                await answer(message, f"ET soft max: <b>{val:.1f}h</b>")
-
-        elif waiting_for == "entry_et_max_hl_mult":
-            val = float(value)
-            if val <= 0 or val > 10:
-                await answer(message, "Value must be between 0 and 10.")
-                return
-            await db.config_update(entry_et_max_hl_mult=val)
-            await answer(message, f"ET max as half-life multiplier: <b>{val:.2f}x</b>")
-
-        elif waiting_for == "entry_phase_min_toward_velocity":
-            val = float(value)
-            if val <= 0 or val > 1:
-                await answer(message, "Value must be between 0 and 1.")
-                return
-            await db.config_update(entry_phase_min_toward_velocity=val)
-            await answer(message, f"Entry min toward velocity: <b>{val:.3f}</b>")
-
-        elif waiting_for == "entry_phase_min_toward_ratio":
-            val = float(value)
-            if val <= 0 or val > 1:
-                await answer(message, "Value must be between 0 and 1.")
-                return
-            await db.config_update(entry_phase_min_toward_ratio=val)
-            await answer(message, f"Entry min toward ratio: <b>{val:.2f}</b>")
-
-        elif waiting_for == "entry_phase_max_away_velocity":
-            val = float(value)
-            if val <= 0 or val > 1:
-                await answer(message, "Value must be between 0 and 1.")
-                return
-            await db.config_update(entry_phase_max_away_velocity=val)
-            await answer(message, f"Entry max away velocity: <b>{val:.3f}</b>")
-
-        elif waiting_for == "entry_phase_max_abs_slope":
-            val = float(value)
-            if val <= 0 or val > 1:
-                await answer(message, "Value must be between 0 and 1.")
-                return
-            await db.config_update(entry_phase_max_abs_slope=val)
-            await answer(message, f"Entry max |Z| slope: <b>{val:.3f}</b>")
             
         elif waiting_for == "half_life":
             # Parse "min-max" format
@@ -1355,7 +1221,7 @@ async def close_positions_menu(event: Message | CallbackQuery, state: FSMContext
 
 @dp.callback_query(F.data.startswith("close_pair_confirm:"))
 async def close_pair_confirm_handler(callback: CallbackQuery, state: FSMContext):
-    """Ask for confirmation before closing a specific pair."""
+    """Ask confirmation before closing one pair."""
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Invalid pair data", show_alert=True)
@@ -1375,7 +1241,7 @@ async def close_pair_confirm_handler(callback: CallbackQuery, state: FSMContext)
 
 @dp.callback_query(F.data.startswith("close_pair_yes:"))
 async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
-    """Close a specific pair position after user confirmation."""
+    """Close a specific pair position."""
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("Invalid pair data", show_alert=True)
@@ -1474,10 +1340,7 @@ async def send_startup_message():
     """
     for admin_id in tg_admins:
         try:
-            await bot.send_message(
-                admin_id,
-                "Bot control channel is online.\nTrading bootstrap is running in background."
-            )
+            await bot.send_message(admin_id, "Bot started successfully!")
         except Exception as e:
             print(f"Could not send startup message to admin {admin_id}: {e}")
 

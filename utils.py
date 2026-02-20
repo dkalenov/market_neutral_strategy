@@ -8,6 +8,7 @@ CAPITAL = 1_000_000.0
 MAX_NOTIONAL_PER_PAIR = 0.1
 VOL_LOOKBACK = 60
 
+
 # Timeframe to candles per day mapping
 CANDLES_PER_DAY = {
     '1m':  1440,
@@ -111,39 +112,6 @@ def calculate_z_last(spread):
     if sd == 0 or np.isnan(sd):
         return np.nan
     return float((s.iloc[-1] - m) / sd)
-
-def expected_reversion_bars(abs_z_now: float, abs_z_target: float, half_life_bars: float):
-    """
-    Estimate expected bars to revert from |z_now| to |z_target| under OU/AR(1) decay.
-
-    Uses relation phi = exp(-ln(2)/half_life), and:
-        E[T] ~= ln(|z_target|/|z_now|) / ln(phi)
-
-    Returns:
-        float bars to target, 0.0 if already at/inside target, np.inf if invalid/non-mean-reverting.
-    """
-    try:
-        z0 = float(abs(abs_z_now))
-        zt = float(abs(abs_z_target))
-        hl = float(half_life_bars)
-        if not np.isfinite(z0) or not np.isfinite(zt) or not np.isfinite(hl):
-            return np.inf
-        if zt <= 0:
-            zt = 1e-6
-        if z0 <= zt:
-            return 0.0
-        if hl <= 0:
-            return np.inf
-        phi = math.exp(-math.log(2.0) / hl)
-        # Require stationary decay.
-        if phi <= 0 or phi >= 1:
-            return np.inf
-        bars = math.log(zt / z0) / math.log(phi)
-        if not np.isfinite(bars):
-            return np.inf
-        return float(max(0.0, bars))
-    except Exception:
-        return np.inf
 
 def calculate_pair_beta(pair_r, market_r):
     if pair_r is None or market_r is None:
@@ -394,5 +362,28 @@ def should_skip_trade(min_notional: float, calculated_notional: float, max_order
     if bump_ratio > max_order_bump:
         print(f"SKIP: Order bump {bump_ratio:.2f}x exceeds threshold {max_order_bump}x")
         return True
-    
+
     return False  # Small adjustment is acceptable
+
+
+def expected_reversion_bars(abs_z_now: float, abs_z_target: float, half_life_bars: float) -> float:
+    """
+    Estimate bars needed for |Z| to decay to target under OU-style half-life dynamics.
+
+    Uses: |Z_t| ~= |Z_0| * 0.5^(t / HL)  ->  t = HL * log2(|Z_0| / |Z_target|).
+    Returns 0 when already at/below target or invalid inputs.
+    """
+    try:
+        z0 = float(abs_z_now)
+        zt = float(abs_z_target)
+        hl = float(half_life_bars)
+    except Exception:
+        return 0.0
+
+    if z0 <= 0 or zt <= 0 or hl <= 0 or z0 <= zt:
+        return 0.0
+
+    try:
+        return float(hl * (math.log(z0 / zt, 2)))
+    except Exception:
+        return 0.0
