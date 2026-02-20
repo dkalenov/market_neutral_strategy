@@ -426,7 +426,7 @@ async def load_config():
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
             'entry_et_target_abs_z': '0.5',
-            'coint_stability_min_bars': '3',
+            'coint_stability_min_bars': '2',
             # Hedge Ratio Bounds (market neutrality)
             'hedge_min': '0.3',              # Min |hedge| — below this positions are too unbalanced
             'hedge_max': '3.0',              # Max |hedge| — above this positions are too unbalanced
@@ -437,30 +437,28 @@ async def load_config():
         }
 
 
-        # Ensure all expected config keys exist in DB and have defaults if empty
-        for key in ConfigInfo.__annotations__.keys():
-            try:
-                async with Session() as s:
-                    # Check if key exists
-                    result = await s.execute(select(Config).where(Config.key == key))
-                    existing = result.scalar_one_or_none()
-                    
-                    default_val = DEFAULTS.get(key, None)
-                    
-                    if existing is None:
-                        # Insert new
-                        s.add(Config(key=key, value=default_val))
-                        await s.commit()
-                    elif (existing.value is None or existing.value == "") and default_val is not None:
-                        # Update existing empty/null value with default
-                        await s.execute(update(Config).where(Config.key == key).values(value=default_val))
-                        await s.commit()
-            except Exception as e:
-                print(f"⚠️ Config default init failed for key '{key}': {e}")
-        # Load all configuration from DB
-        async with Session() as session:
-            result = (await session.execute(select(Config))).scalars().all()
-            data = {row.key: row.value for row in result}
+        # Ensure all expected config keys exist in DB and have defaults if empty.
+        # Use one session/commit to avoid excessive connection churn.
+        async with Session() as s:
+            existing_rows = (await s.execute(select(Config))).scalars().all()
+            existing_map = {row.key: row for row in existing_rows}
+            changed = False
+
+            for key in ConfigInfo.__annotations__.keys():
+                default_val = DEFAULTS.get(key, None)
+                existing = existing_map.get(key)
+                if existing is None:
+                    s.add(Config(key=key, value=default_val))
+                    changed = True
+                elif (existing.value is None or existing.value == "") and default_val is not None:
+                    existing.value = default_val
+                    changed = True
+
+            if changed:
+                await s.commit()
+
+            rows = (await s.execute(select(Config))).scalars().all()
+            data = {row.key: row.value for row in rows}
             return ConfigInfo(data)
     except Exception as e:
         print(f"Config load failed: {e}")
@@ -645,6 +643,12 @@ async def get_last_open_trade_for_pair(pair_id):
         return trade.scalar_one_or_none()
 
 
+async def get_pair_by_id(pair_id: int):
+    async with Session() as s:
+        row = await s.execute(select(Pairs).where(Pairs.id == pair_id))
+        return row.scalar_one_or_none()
+
+
 async def add_trade(trade):
     async with Session() as s:
         s.add(trade)
@@ -771,4 +775,3 @@ async def get_closed_trade_stats_by_pair(since_ms: int | None = None):
                 'last_close_time': int(r.last_close_time or 0),
             })
         return out
-

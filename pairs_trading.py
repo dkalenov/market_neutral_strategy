@@ -233,6 +233,15 @@ class PairsManager:
         # best_pairs v2 refresh controls
         self._best_pairs_refresh_lock = asyncio.Lock()
         self._best_pairs_last_refresh = 0.0
+        # Main-TF progress heartbeat (to prove bot is processing closed candles).
+        self._progress_last_log_ts = 0.0
+        self._progress_kline_added = 0
+        self._progress_analysis_runs = 0
+        self._progress_coint_evals = 0
+        self._progress_last_symbol = ''
+        self._progress_last_kline_open_ts = 0
+        self._progress_last_pair = ''
+        self._progress_last_pair_ts = 0
 
     async def initialize(self):
         """
@@ -919,6 +928,11 @@ class PairsManager:
                         # Update DB to reflect reality
                         if s1_open and s2_open:
                             pairs_to_fix.append((pair_info, 'open_db', open_on_exchange.get(s1), open_on_exchange.get(s2)))
+                        else:
+                            orphan_symbol = s1 if s1_open else s2
+                            orphan_pos = open_on_exchange.get(orphan_symbol)
+                            if orphan_pos:
+                                pairs_to_fix.append((pair_info, 'close_orphan_leg_keep_closed', orphan_symbol, orphan_pos))
             
             # Apply fixes
             externally_closed_pairs = []
@@ -1025,6 +1039,92 @@ class PairsManager:
                             })
                         
                         print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} marked as OPEN in DB (synced from exchange)")
+
+                elif action == 'close_orphan_leg_keep_closed' and len(fix) >= 4:
+                    orphan_symbol = fix[2]
+                    orphan_pos = fix[3] or {}
+                    orphan_qty = abs(float(orphan_pos.get('qty', 0) or 0))
+                    orphan_side = orphan_pos.get('side', 'LONG')
+                    if orphan_qty <= 0:
+                        continue
+
+                    close_side = 'SELL' if orphan_side == 'LONG' else 'BUY'
+                    pnl_loaded = False
+                    orphan_pnl = 0.0
+                    orphan_fee = 0.0
+                    net_pnl = 0.0
+
+                    try:
+                        await self.client.cancel_open_orders(orphan_symbol)
+                    except Exception:
+                        pass
+
+                    await self._close_leg_reduce_only(
+                        symbol=orphan_symbol,
+                        side=close_side,
+                        quantity=orphan_qty
+                    )
+
+                    try:
+                        start_ms = self._trade_window_start_ms(pair_info, default_lookback_sec=3600, buffer_sec=180)
+                        orphan_trades = await self._fetch_account_trades_window(orphan_symbol, start_ms, max_records=300)
+                        orphan_pnl = sum(float(t.get('realizedPnl', 0)) for t in orphan_trades)
+                        orphan_fee = sum(float(t.get('commission', 0)) for t in orphan_trades)
+                        net_pnl = orphan_pnl - orphan_fee
+                        pnl_loaded = len(orphan_trades) > 0
+                    except Exception as pnl_err:
+                        print(f"  ⚠️ Could not fetch orphan-leg close PnL for {orphan_symbol}: {pnl_err}")
+
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+                    pair_info.is_trading = False
+                    self.mark_pair_wait_for_next_candle(pair_info, reason='orphan_restart')
+
+                    pnl1 = orphan_pnl if orphan_symbol == pair_info.symbol1 else 0.0
+                    pnl2 = orphan_pnl if orphan_symbol == pair_info.symbol2 else 0.0
+                    fee1 = orphan_fee if orphan_symbol == pair_info.symbol1 else 0.0
+                    fee2 = orphan_fee if orphan_symbol == pair_info.symbol2 else 0.0
+
+                    if pair_info.db_id:
+                        upd = {
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0,
+                            'close_time': int(time.time()),
+                            'close_reason': 'orphan_restart',
+                        }
+                        if pnl_loaded:
+                            upd.update({
+                                'close_pnl': net_pnl,
+                                'pnl1': pnl1,
+                                'pnl2': pnl2,
+                                'fee1': fee1,
+                                'fee2': fee2,
+                            })
+                        await db.update_pair(upd)
+
+                    if pair_info.current_trade_id:
+                        await db.close_trade_record(
+                            pair_info.current_trade_id,
+                            status='CLOSED_ORPHAN',
+                            close_reason='orphan_restart',
+                            pnl=net_pnl if pnl_loaded else None,
+                            fee1=fee1 if pnl_loaded else None,
+                            fee2=fee2 if pnl_loaded else None,
+                        )
+                        pair_info.current_trade_id = None
+
+                    externally_closed_pairs.append({
+                        'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                        'pnl': net_pnl if pnl_loaded else None
+                    })
+                    print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan leg {orphan_symbol} closed")
                 
                 elif action == 'close_db_with_pnl' and len(fix) >= 5:
                     # Mark as closed in DB with PnL info
@@ -1071,7 +1171,7 @@ class PairsManager:
                             )
                         pair_info.current_trade_id = None
                     
-                    print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan closed with PnL={total_pnl:.2f}")
+                    print(f"  ✅ Fixed: {pair_info.symbol1}-{pair_info.symbol2} orphan closed with PnL={net_pnl:.2f}")
 
             if externally_closed_pairs:
                 known = [x for x in externally_closed_pairs if x['pnl'] is not None]
@@ -1175,12 +1275,12 @@ class PairsManager:
             
             # Get all algo orders (using fixed endpoint /fapi/v1/openAlgoOrders)
             algo_orders = await self.client.get_algo_orders()
+            if isinstance(algo_orders, dict):
+                algo_orders = algo_orders.get('orders', [])
+            if not isinstance(algo_orders, list):
+                algo_orders = []
             if not algo_orders:
                 return
-            
-            # Handle case where response is dict with 'orders' key
-            if isinstance(algo_orders, dict) and 'orders' in algo_orders:
-                algo_orders = algo_orders['orders']
             
             # Group orders by symbol
             orders_by_symbol = {}
@@ -1638,12 +1738,66 @@ class PairsManager:
             
             externally_closed_now = []
             for pair_info in list(self.active_pairs.values()):
-                if pair_info.position_status == 0 or pair_info.is_trading:
+                if pair_info.is_trading:
                     continue
-                
-                    
+
                 leg1_open = pair_info.symbol1 in pos_by_symbol
                 leg2_open = pair_info.symbol2 in pos_by_symbol
+
+                if pair_info.position_status == 0:
+                    if leg1_open != leg2_open:
+                        orphan_symbol = pair_info.symbol1 if leg1_open else pair_info.symbol2
+                        orphan_amt = pos_by_symbol.get(orphan_symbol, 0)
+                        if orphan_amt != 0:
+                            print(f"⚠️ Orphan leg on CLOSED pair {pair_info.symbol1}-{pair_info.symbol2}: {orphan_symbol} amt={orphan_amt}. Closing...")
+                            try:
+                                await self.client.cancel_open_orders(pair_info.symbol1)
+                            except Exception:
+                                pass
+                            try:
+                                await self.client.cancel_open_orders(pair_info.symbol2)
+                            except Exception:
+                                pass
+                            try:
+                                close_side = 'SELL' if orphan_amt > 0 else 'BUY'
+                                await self._close_leg_reduce_only(
+                                    symbol=orphan_symbol,
+                                    side=close_side,
+                                    quantity=abs(orphan_amt)
+                                )
+                                self._exchange_positions_cache.pop(orphan_symbol, None)
+                                self._exchange_pnl_cache.pop(orphan_symbol, None)
+                                self._exchange_position_count = len(self._exchange_positions_cache)
+                                self.mark_pair_wait_for_next_candle(pair_info, reason='orphan_restart')
+                                if pair_info.current_trade_id:
+                                    try:
+                                        await db.close_trade_record(
+                                            pair_info.current_trade_id,
+                                            status='CLOSED_ORPHAN',
+                                            close_reason='orphan_restart',
+                                        )
+                                    except Exception:
+                                        pass
+                                    pair_info.current_trade_id = None
+                                if pair_info.db_id:
+                                    await db.update_pair({
+                                        'id': pair_info.db_id,
+                                        'position_status': 0,
+                                        'qty1': 0,
+                                        'qty2': 0,
+                                        'entry_price1': 0,
+                                        'entry_price2': 0,
+                                        'close_time': int(time.time()),
+                                        'close_reason': 'orphan_restart',
+                                    })
+                                await self._notify(
+                                    f"⚠️ <b>Orphan Leg Closed</b>\n"
+                                    f"Pair: <b>{pair_info.symbol1}/{pair_info.symbol2}</b>\n"
+                                    f"Closed leg: <b>{orphan_symbol}</b>"
+                                )
+                            except Exception as orphan_err:
+                                print(f"❌ Failed to close orphan leg {orphan_symbol}: {orphan_err}")
+                    continue
 
                 if not leg1_open and not leg2_open:
                     s1, s2 = pair_info.symbol1, pair_info.symbol2
@@ -1767,8 +1921,10 @@ class PairsManager:
                             # Check algo orders
                             try:
                                 algo_orders = await self.client.get_algo_orders()
-                                if isinstance(algo_orders, dict) and 'orders' in algo_orders:
+                                if isinstance(algo_orders, dict):
                                     algo_orders = algo_orders.get('orders', [])
+                                if not isinstance(algo_orders, list):
+                                    algo_orders = []
                                 triggered_algos = [a for a in algo_orders 
                                                    if a.get('symbol') == closed_leg 
                                                     and a.get('algoStatus') in ('TRIGGERED', 'FINISHED')]
@@ -1847,7 +2003,7 @@ class PairsManager:
                             pass
                         
                         # Fallback: recalculate from historical data if realtime failed
-                        if close_zscore == 0.0 and s1 in self.all_data and s2 in self.all_data:
+                        if close_zscore == 0.0 and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
                             try:
                                 _d1 = self.all_data[s1]
                                 _d2 = self.all_data[s2]
@@ -1868,7 +2024,7 @@ class PairsManager:
                         close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
                         
                         # Recalculate beta & p-value fresh if they're 0 (stale after restart)
-                        if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                        if (close_beta == 0 or close_pval == 0) and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
                             try:
                                 _d1 = self.all_data[s1]
                                 _d2 = self.all_data[s2]
@@ -1878,7 +2034,7 @@ class PairsManager:
                                     _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
                                     if close_pval == 0 and not np.isnan(_pval):
                                         close_pval = float(_pval)
-                                    if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                    if close_beta == 0 and isinstance(self.all_data, dict) and 'BTCUSDT' in self.all_data:
                                         _btc = self.all_data['BTCUSDT']
                                         if len(_btc.close) >= self.min_data_points:
                                             _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
@@ -1940,7 +2096,7 @@ class PairsManager:
                                     f"   {e2} {s2}: {pnl2:+.2f} USDT\n"
                                     f"💸 Fees: {total_fees:.4f} USDT")
                         print(done_msg.replace('<b>', '').replace('</b>', ''))
-                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        reply_to = await self._resolve_reply_to_message_id(pair_info)
                         await self._notify(done_msg, reply_to)
                         
                         # WAIT FOR CANDLE: pair-local same-candle guard
@@ -2158,8 +2314,46 @@ class PairsManager:
         )
 
         if added:
+            self._progress_kline_added += 1
+            self._progress_last_symbol = symbol
+            try:
+                self._progress_last_kline_open_ts = int(kline_data.get('t', 0) or 0)
+            except Exception:
+                self._progress_last_kline_open_ts = 0
             # Full analysis: discovery + signal check
             self.loop.create_task(self.run_analysis(symbol))
+            self._log_main_tf_progress()
+
+    def _log_main_tf_progress(self):
+        """Periodic heartbeat for closed-candle processing progress."""
+        now = time.time()
+        # Keep it low-noise and adaptive to timeframe.
+        tf = str(getattr(self, 'timeframe', '1h') or '1h').strip().lower()
+        if tf.endswith('d'):
+            min_interval_sec = 1800  # 30 min for daily TF
+        elif tf.endswith('4h'):
+            min_interval_sec = 600   # 10 min for 4h TF
+        elif tf.endswith('h'):
+            min_interval_sec = 300   # 5 min for hourly TFs
+        else:
+            min_interval_sec = 60    # keep 1 min for minute-based TFs
+        if now - self._progress_last_log_ts < min_interval_sec:
+            return
+        self._progress_last_log_ts = now
+        last_pair = self._progress_last_pair or "-"
+        last_pair_ts = self._progress_last_pair_ts or 0
+        last_symbol = self._progress_last_symbol or "-"
+        last_kline_ts = self._progress_last_kline_open_ts or 0
+        print(
+            f"🫀 Main-TF progress: closed_klines={self._progress_kline_added}/60s, "
+            f"analysis_runs={self._progress_analysis_runs}/60s, "
+            f"coint_evals={self._progress_coint_evals}/60s, "
+            f"last_symbol={last_symbol}, last_kline_open_ts={last_kline_ts}, "
+            f"last_pair={last_pair}, last_pair_ts={last_pair_ts}"
+        )
+        self._progress_kline_added = 0
+        self._progress_analysis_runs = 0
+        self._progress_coint_evals = 0
 
     # Legacy method for backward compatibility (single TF mode)
     async def add_kline(self, kline_data):
@@ -2190,6 +2384,7 @@ class PairsManager:
         """
         Runs analysis for pairs containing the updated symbol.
         """
+        self._progress_analysis_runs += 1
         # 1. Check signals for active pairs
         await self._check_signals_for_active_pairs(updated_symbol)
 
@@ -2225,6 +2420,18 @@ class PairsManager:
 
                 if data1.ts[-1] != data2.ts[-1]:
                     continue
+
+                # Evaluate coint metrics at most once per common closed candle for this pair.
+                # Without this guard, repeated ad-hoc checks on the same candle can distort
+                # coint_streak_bars semantics ("consecutive closed candles").
+                common_close_ts = int(data1.ts[-1])
+                last_eval_ts = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
+                if common_close_ts <= last_eval_ts:
+                    continue
+                pair_info._last_coint_eval_ts = common_close_ts
+                self._progress_coint_evals += 1
+                self._progress_last_pair = f"{s1}-{s2}"
+                self._progress_last_pair_ts = common_close_ts
 
                 log_prices1 = np.log(list(data1.close)[-self.min_data_points:])
                 log_prices2 = np.log(list(data2.close)[-self.min_data_points:])
@@ -2319,6 +2526,12 @@ class PairsManager:
                         
                         print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
                         # Don't send notification here - _execute_trade will send full close message with PnL
+                        if not getattr(pair_info, 'tg_message_id', 0):
+                            restored_reply = await self._resolve_reply_to_message_id(pair_info)
+                            if restored_reply:
+                                print(f"ℹ️ Restored missing tg_message_id for {s1}-{s2}: {restored_reply}")
+                            else:
+                                print(f"⚠️ tg_message_id missing for {s1}-{s2}; close alert may be non-threaded")
                         pair_info.close_handled = True
                         pair_info.is_trading = True
                         
@@ -2898,6 +3111,30 @@ class PairsManager:
                 print(f"Error in _notify: {e}")
         return None
 
+    async def _resolve_reply_to_message_id(self, pair_info: PairInfo):
+        """
+        Best-effort resolver for TG thread id.
+        Uses in-memory value first, then falls back to DB (important after restarts/sync drift).
+        """
+        tg_id = int(getattr(pair_info, 'tg_message_id', 0) or 0)
+        if tg_id > 0:
+            return tg_id
+
+        db_id = int(getattr(pair_info, 'db_id', 0) or 0)
+        if db_id <= 0:
+            return None
+
+        try:
+            db_pair = await db.get_pair_by_id(db_id)
+            db_tg_id = int(getattr(db_pair, 'tg_message_id', 0) or 0) if db_pair else 0
+            if db_tg_id > 0:
+                pair_info.tg_message_id = db_tg_id
+                return db_tg_id
+        except Exception as e:
+            print(f"⚠️ Failed to resolve tg_message_id from DB for pair_id={db_id}: {e}")
+
+        return None
+
     def _format_half_life(self, hl_hours: float) -> str:
         """Format half-life in human-readable format (e.g., '1d 6h' or '16h 48m')."""
         if hl_hours >= 24:
@@ -2984,6 +3221,17 @@ class PairsManager:
         else:
             penalty = max(0.0, penalty - 0.05)
         pair_info._recent_fail_penalty = penalty
+
+    def _apply_close_cooldown(self, pair_info: PairInfo, close_reason: str | None):
+        """Apply per-pair cooldown after stop-loss exits to prevent instant re-entry loops."""
+        reason = (close_reason or '').strip().lower()
+        if reason in {'z_sl', 'hardware_sl'}:
+            cooldown_sec = int(getattr(self.config, 'sl_reentry_cooldown_sec', 0) or 0)
+            if cooldown_sec <= 0:
+                cooldown_sec = int(getattr(self.config, 'close_retry_cooldown_sec', 30) or 30)
+            pair_info._close_cooldown_until = time.time() + max(1, cooldown_sec)
+        else:
+            pair_info._close_cooldown_until = 0.0
 
     async def _fetch_account_trades_window(
         self,
@@ -3442,7 +3690,7 @@ class PairsManager:
                 continue
             
             s1, s2 = pair_info.symbol1, pair_info.symbol2
-            if s1 in self.all_data and s2 in self.all_data:
+            if isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
                 await self._check_signals_for_active_pairs(s1)
                 analyzed += 1
                 
@@ -3816,7 +4064,7 @@ class PairsManager:
                     close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
                     
                     # Recalculate beta & p-value fresh if they're 0 (stale after restart)
-                    if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                    if (close_beta == 0 or close_pval == 0) and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
                         try:
                             _d1 = self.all_data[s1]
                             _d2 = self.all_data[s2]
@@ -3826,7 +4074,7 @@ class PairsManager:
                                 _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
                                 if close_pval == 0 and not np.isnan(_pval):
                                     close_pval = float(_pval)
-                                if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                if close_beta == 0 and isinstance(self.all_data, dict) and 'BTCUSDT' in self.all_data:
                                     _btc = self.all_data['BTCUSDT']
                                     if len(_btc.close) >= self.min_data_points:
                                         _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
@@ -3847,7 +4095,7 @@ class PairsManager:
                     full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
                     
                     print(full_msg.replace('<b>', '').replace('</b>', ''))
-                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                    reply_to = await self._resolve_reply_to_message_id(pair_info)
                     await self._notify(full_msg, reply_to)
                     
                     # State cleanup for hardware close
@@ -3859,6 +4107,7 @@ class PairsManager:
                     pair_info.entry_price1 = 0
                     pair_info.entry_price2 = 0
                     pair_info.current_trade_id = None
+                    self._apply_close_cooldown(pair_info, close_reason)
                     
                     # Update exchange position cache
                     self._exchange_positions_cache.pop(s1, None)
@@ -4075,6 +4324,7 @@ class PairsManager:
                         pair_info.qty2 = 0
                         pair_info.close_handled = True  # Mark as handled to prevent duplicate notification
                         pair_info.last_close_reason = close_reason or 'unknown'
+                        self._apply_close_cooldown(pair_info, close_reason)
                         pair_info.entry_price1 = 0
                         pair_info.entry_price2 = 0
                         
@@ -4087,23 +4337,32 @@ class PairsManager:
                         cleanup_status = []
                         try:
                             algo_orders = await self.client.get_algo_orders()
-                            
+                            if isinstance(algo_orders, dict):
+                                algo_orders = algo_orders.get('orders', [])
+                            if not isinstance(algo_orders, list):
+                                algo_orders = []
+
                             # Track which orders exist for each symbol
                             orders_by_sym = {s1: [], s2: []}
                             for o in algo_orders:
-                                sym = o['symbol']
+                                sym = o.get('symbol')
+                                if not sym:
+                                    continue
                                 if sym in orders_by_sym:
                                     order_type = o.get('type', '') or o.get('orderType', '')
                                     if 'STOP' in order_type.upper():
-                                        orders_by_sym[sym].append(('SL', o['algoId']))
+                                        orders_by_sym[sym].append(('SL', o.get('algoId')))
                                     elif 'TAKE_PROFIT' in order_type.upper():
-                                        orders_by_sym[sym].append(('TP', o['algoId']))
+                                        orders_by_sym[sym].append(('TP', o.get('algoId')))
                                     else:
-                                        orders_by_sym[sym].append((order_type or 'ORDER', o['algoId']))
+                                        orders_by_sym[sym].append((order_type or 'ORDER', o.get('algoId')))
                             
                             # Cancel each order and track result
                             for sym in [s1, s2]:
                                 for order_type, algo_id in orders_by_sym[sym]:
+                                    if algo_id is None:
+                                        cleanup_status.append(f"  ⚠️ {sym} {order_type} - missing algoId")
+                                        continue
                                     try:
                                         await self.client.cancel_algo_order(algoId=algo_id)
                                         cleanup_status.append(f"  ✅ {sym} {order_type} cancelled")
@@ -4133,7 +4392,7 @@ class PairsManager:
                         close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
                         
                         # Recalculate beta & p-value fresh if they're 0 (stale after restart)
-                        if (close_beta == 0 or close_pval == 0) and s1 in self.all_data and s2 in self.all_data:
+                        if (close_beta == 0 or close_pval == 0) and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
                             try:
                                 _d1 = self.all_data[s1]
                                 _d2 = self.all_data[s2]
@@ -4143,7 +4402,7 @@ class PairsManager:
                                     _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
                                     if close_pval == 0 and not np.isnan(_pval):
                                         close_pval = float(_pval)
-                                    if close_beta == 0 and 'BTCUSDT' in self.all_data:
+                                    if close_beta == 0 and isinstance(self.all_data, dict) and 'BTCUSDT' in self.all_data:
                                         _btc = self.all_data['BTCUSDT']
                                         if len(_btc.close) >= self.min_data_points:
                                             _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
@@ -4165,7 +4424,7 @@ class PairsManager:
                         
                         print(full_msg.replace('<b>', '').replace('</b>', ''))
                         # Reply to original open message if available
-                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        reply_to = await self._resolve_reply_to_message_id(pair_info)
                         await self._notify(full_msg, reply_to)
                         
                         # Update DB with close details + market neutrality metrics
@@ -4225,13 +4484,15 @@ class PairsManager:
                         pair_info.entry_price2 = 0
                         pair_info.close_handled = True
                         pair_info.last_close_reason = close_reason or 'unknown'
+                        self._apply_close_cooldown(pair_info, close_reason)
                         self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason or 'close_error')
                         self._exchange_positions_cache.pop(s1, None)
                         self._exchange_positions_cache.pop(s2, None)
                         self._exchange_position_count = len(self._exchange_positions_cache)
                         # Send error notification to TG
                         err_msg = f"⚠️ Close error {s1}-{s2}: {e}\nPosition closed on exchange but notification failed."
-                        await self._notify(err_msg)
+                        reply_to = await self._resolve_reply_to_message_id(pair_info)
+                        await self._notify(err_msg, reply_to)
                     except Exception:
                         pass
                 return
@@ -4578,6 +4839,28 @@ class PairsManager:
                             print(f"  Emergency rollback close executed for {sym} (qty={abs(amt)})")
                     except Exception as verify_err:
                         print(f"  WARNING: Rollback verification failed: {verify_err}")
+
+                    residual_legs = []
+                    try:
+                        post_verify_positions = await self.client.get_position_risk()
+                        for vp in post_verify_positions:
+                            sym = vp.get('symbol')
+                            if sym not in (s1, s2):
+                                continue
+                            amt = float(vp.get('positionAmt', 0))
+                            if amt != 0:
+                                residual_legs.append((sym, amt))
+                    except Exception as post_verify_err:
+                        print(f"  WARNING: Post-rollback verification failed: {post_verify_err}")
+                    if residual_legs:
+                        details = ", ".join([f"{sym}:{amt:+g}" for sym, amt in residual_legs])
+                        print(f"  CRITICAL: Residual legs remain after rollback for {s1}-{s2}: {details}")
+                        await self._notify(
+                            f"🚨 <b>Rollback residual detected</b>\n"
+                            f"Pair: <b>{s1}/{s2}</b>\n"
+                            f"Residual: <code>{details}</code>\n"
+                            f"Bot will retry cleanup via sync loop."
+                        )
                 
                     pair_info.position_status = 0
                     pair_info.is_trading = False
@@ -5316,7 +5599,7 @@ class PairsManager:
                         print(f"  ... and {len(details) - max_lines} more idle pairs")
                 z_entry = getattr(self.config, 'z_entry', 1.9) or 1.9
                 z_entry_max = getattr(self.config, 'z_entry_max', 2.5) or 2.5
-                coint_stability_min_bars = int(getattr(self.config, 'coint_stability_min_bars', 3) or 3)
+                coint_stability_min_bars = int(getattr(self.config, 'coint_stability_min_bars', 2) or 2)
                 entry_target_abs_z = float(getattr(self.config, 'entry_et_target_abs_z', 0.5) or 0.5)
                 candles_per_day = float(utils.CANDLES_PER_DAY.get(str(self.timeframe), 24) or 24)
                 bar_hours = 24.0 / candles_per_day if candles_per_day > 0 else 1.0
@@ -5359,7 +5642,13 @@ class PairsManager:
                     if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
                         streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0)
                         if streak_bars < coint_stability_min_bars:
-                            _log_pending_reject(f"coint_streak={streak_bars} < min={coint_stability_min_bars}")
+                            ts1 = int(self.all_data.get(pair_info.symbol1).ts[-1]) if self.all_data.get(pair_info.symbol1) and self.all_data.get(pair_info.symbol1).ts else 0
+                            ts2 = int(self.all_data.get(pair_info.symbol2).ts[-1]) if self.all_data.get(pair_info.symbol2) and self.all_data.get(pair_info.symbol2).ts else 0
+                            last_eval = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
+                            _log_pending_reject(
+                                f"coint_streak={streak_bars} < min={coint_stability_min_bars} "
+                                f"(last_eval_ts={last_eval}, s1_ts={ts1}, s2_ts={ts2})"
+                            )
                             continue
                         expected_bars = utils.expected_reversion_bars(
                             abs_z_now=abs(float(current_z)),
