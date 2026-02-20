@@ -1,5 +1,5 @@
 ﻿import time
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func, case
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
@@ -421,7 +421,7 @@ async def load_config():
             'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
             'hl_max_days': '2.0',    # Max 2 days (1h=48 candles, 4h=12 candles)
             'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
-            'beta_alert_threshold': '0.15',  # Alert if |beta| > this for open positions
+            'beta_alert_threshold': '0.3',  # Alert if |beta| > this for open positions
             'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': '10',      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
@@ -720,4 +720,55 @@ async def add_trade_executions(rows: list[dict]):
                     await s.commit()
                 except IntegrityError:
                     await s.rollback()
+
+
+async def get_closed_trade_stats_by_pair(since_ms: int | None = None):
+    """
+    Aggregate closed trade performance by pair (symbol1-symbol2).
+    Uses Trades as source of truth for realized PnL and close reasons.
+    """
+    async with Session() as s:
+        stmt = (
+            select(
+                Pairs.symbol1.label('symbol1'),
+                Pairs.symbol2.label('symbol2'),
+                func.count(Trades.id).label('trades'),
+                func.sum(func.coalesce(Trades.pnl, 0.0)).label('net_pnl'),
+                func.avg(func.coalesce(Trades.pnl, 0.0)).label('avg_pnl'),
+                func.sum(case((Trades.pnl > 0, 1), else_=0)).label('wins'),
+                func.sum(case((Trades.pnl > 0, Trades.pnl), else_=0.0)).label('sum_pos'),
+                func.sum(case((Trades.pnl < 0, -Trades.pnl), else_=0.0)).label('sum_neg_abs'),
+                func.sum(case((Trades.close_reason.in_(['z_tp', 'hardware_tp']), 1), else_=0)).label('tp_wins'),
+                func.sum(
+                    case(
+                        (Trades.close_reason.in_(['z_sl', 'hardware_sl', 'circuit', 'broken_coint', 'beta_critical', 'beta_drift']), 1),
+                        else_=0
+                    )
+                ).label('bad_closes'),
+                func.max(func.coalesce(Trades.close_time, 0)).label('last_close_time'),
+            )
+            .join(Pairs, Pairs.id == Trades.pair_id)
+            .where(Trades.status.like('CLOSED%'))
+            .group_by(Pairs.symbol1, Pairs.symbol2)
+        )
+        if since_ms is not None:
+            stmt = stmt.where(func.coalesce(Trades.close_time, 0) >= int(since_ms))
+
+        rows = (await s.execute(stmt)).all()
+        out = []
+        for r in rows:
+            out.append({
+                'symbol1': r.symbol1,
+                'symbol2': r.symbol2,
+                'trades': int(r.trades or 0),
+                'net_pnl': float(r.net_pnl or 0.0),
+                'avg_pnl': float(r.avg_pnl or 0.0),
+                'wins': int(r.wins or 0),
+                'sum_pos': float(r.sum_pos or 0.0),
+                'sum_neg_abs': float(r.sum_neg_abs or 0.0),
+                'tp_wins': int(r.tp_wins or 0),
+                'bad_closes': int(r.bad_closes or 0),
+                'last_close_time': int(r.last_close_time or 0),
+            })
+        return out
 

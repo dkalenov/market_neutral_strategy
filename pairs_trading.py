@@ -20,23 +20,51 @@ COINT_WINDOW = 200
 
 # Canonical close reason mapping (used in pairs_trading and main.py)
 CLOSE_REASONS = {
-    'z_tp': 'ðŸ’° Z-Score Take Profit',
-    'z_sl': 'ðŸ›‘ Z-Score Stop Loss',
-    'circuit': 'ðŸ”´ Circuit Breaker',
-    'broken_coint': 'ðŸš¨ Broken Correlation',
-    'hardware_sl': 'ðŸ›¡ï¸ Hardware SL',
-    'hardware_tp': 'ðŸ›¡ï¸ Hardware TP',
-    'manual': 'ðŸ‘¤ Manual Close',
-    'desync': 'âš ï¸ Leg Desync',
-    'beta_drift': 'ðŸ“‰ Beta Drift',
-    'beta_critical': 'ðŸš¨ Beta Critical',
-    'btc_shock': 'ðŸ’¥ BTC Market Shock',
-    'external': 'âš¡ External Close',
-    'orphan_restart': 'ðŸ”„ Orphan on Restart',
-    'stale_symbols': 'â³ Stale Symbols',
-    'manual_partial': 'ðŸ‘¤ Manual Close (1 leg)',
-    'audit_fail': 'ðŸ§¾ Trade Audit Safety Close',
+    'z_tp': '\U0001F4B0 Z-Score Take Profit',
+    'z_sl': '\U0001F6D1 Z-Score Stop Loss',
+    'circuit': '\U0001F534 Circuit Breaker',
+    'broken_coint': '\U0001F6A8 Broken Correlation',
+    'hardware_sl': '\U0001F6E1\ufe0f Hardware SL',
+    'hardware_tp': '\U0001F6E1\ufe0f Hardware TP',
+    'manual': '\U0001F464 Manual Close',
+    'desync': '\u26a0\ufe0f Leg Desync',
+    'beta_drift': '\U0001F4C9 Beta Drift',
+    'beta_critical': '\U0001F6A8 Beta Critical',
+    'btc_shock': '\U0001F4A5 BTC Market Shock',
+    'external': '\u26a1 External Close',
+    'orphan_restart': '\U0001F504 Orphan on Restart',
+    'stale_symbols': '\u23f3 Stale Symbols',
+    'manual_partial': '\U0001F464 Manual Close (1 leg)',
+    'audit_fail': '\U0001F9FE Trade Audit Safety Close',
 }
+
+
+def _repair_mojibake_text(text: str) -> str:
+    """Best-effort repair for UTF-8 text decoded as latin1/cp1252."""
+    if not isinstance(text, str) or not text:
+        return text
+    if not any(ch in text for ch in ("ð", "â", "Î", "Ã", "Â")):
+        return text
+
+    def _score(s: str) -> int:
+        bad = sum(s.count(x) for x in ("ð", "â", "Î", "Ã", "Â", "ï¸", "â†"))
+        return -bad
+
+    candidates = [text]
+    for enc in ("latin-1", "cp1252"):
+        cur = text
+        for _ in range(2):
+            try:
+                nxt = cur.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            except Exception:
+                break
+            if nxt == cur:
+                break
+            candidates.append(nxt)
+            cur = nxt
+
+    best = max(candidates, key=_score)
+    return best
 
 class Data:
     """
@@ -202,6 +230,9 @@ class PairsManager:
         self._warmup_task = None
         # Prevent recursive/parallel reconcile loops.
         self._reconcile_lock = asyncio.Lock()
+        # best_pairs v2 refresh controls
+        self._best_pairs_refresh_lock = asyncio.Lock()
+        self._best_pairs_last_refresh = 0.0
 
     async def initialize(self):
         """
@@ -228,6 +259,8 @@ class PairsManager:
         # Start periodic leg sync loop (BACKUP only - primary sync is via WebSocket)
         self._leg_sync_task = self.loop.create_task(self._periodic_leg_sync_loop())
         print("ðŸ”„ Started backup leg sync loop (every 30s, primary via WebSocket)")
+        # Do not rebuild best_pairs at startup: keep curated full positive history intact.
+        # Runtime refresh remains available (additive) after discovery/TP closes.
 
     async def _load_reentry_blocks_from_db(self):
         """Restore same-candle guard anchors from DB for restart-safe behavior."""
@@ -1974,17 +2007,13 @@ class PairsManager:
              
         if priority_file_path and os.path.exists(priority_file_path):
             try:
-                with open(priority_file_path, 'r') as f:
-                    file_pairs = json.load(f)
-                    if isinstance(file_pairs, list):
-                        for p_str in file_pairs:
-                            parts = p_str.split('-')
-                            if len(parts) == 2:
-                                s1, s2 = parts[0].strip(), parts[1].strip()
-                                # Only add if it's in the target list
-                                if s1 in symbols_to_load: priority_symbols.add(s1)
-                                if s2 in symbols_to_load: priority_symbols.add(s2)
-            except: pass
+                for s1, s2 in self._load_priority_pairs_list():
+                    if s1 in symbols_to_load:
+                        priority_symbols.add(s1)
+                    if s2 in symbols_to_load:
+                        priority_symbols.add(s2)
+            except Exception:
+                pass
             
         # Sort symbols: priority first, then others
         other_symbols = [s for s in symbols_to_load if s not in priority_symbols]
@@ -2037,7 +2066,7 @@ class PairsManager:
                 early_discovery_done = True
                 print(f"Early Discovery after warmup batch ({loaded_count}/{len(sorted_symbols)} symbols)...")
                 try:
-                    await self._discover_new_pairs()
+                    await self._discover_new_pairs(priority_only=True)
                 except Exception as e:
                     print(f"Early Discovery failed (continuing): {e}")
         
@@ -2472,11 +2501,12 @@ class PairsManager:
                         pair_info.is_trading = True
                         await self._execute_trade(pair_info, 0, close_reason='z_sl')
 
-    async def _discover_new_pairs(self):
+    async def _discover_new_pairs(self, priority_only: bool = False):
         """
         Finds new cointegrated pairs using parallel processing.
         """
-        print("Starting discovery process for new cointegrated pairs (PARALLEL)...")
+        mode = "PRIORITY-ONLY" if priority_only else "FULL"
+        print(f"Starting discovery process for new cointegrated pairs ({mode}, PARALLEL)...")
         start_time = time.time()
         
         ready_symbols = []
@@ -2589,37 +2619,56 @@ class PairsManager:
              priority_file_path = os.path.join(script_dir, priority_file_path)
 
         priority_pairs = []
+        priority_existing_checked = 0
+        # Symbols currently occupied by open positions (do not touch them for priority inspection).
+        occupied_symbols = set()
+        for _pi in self.active_pairs.values():
+            if getattr(_pi, 'position_status', 0) != 0:
+                occupied_symbols.add(_pi.symbol1)
+                occupied_symbols.add(_pi.symbol2)
+
         if priority_file_path and os.path.exists(priority_file_path):
             try:
-                with open(priority_file_path, 'r') as f:
-                    file_pairs = json.load(f)
-                    if isinstance(file_pairs, list):
-                        for p_str in file_pairs:
-                            parts = p_str.split('-')
-                            if len(parts) == 2:
-                                s1, s2 = parts[0].strip(), parts[1].strip()
-                                if s1 in ready_set and s2 in ready_set:
-                                    pair_set = frozenset([s1, s2])
-                                    if pair_set not in self.active_pairs and pair_set not in checked_pairs:
-                                        priority_pairs.append((s1, s2))
-                                        checked_pairs.add(pair_set)
-                
+                for s1, s2 in self._load_priority_pairs_list(ready_set=ready_set):
+                    # Hard rule from user: skip priority pair if any symbol is currently in an open trade.
+                    if s1 in occupied_symbols or s2 in occupied_symbols:
+                        continue
+
+                    pair_set = frozenset([s1, s2])
+                    # If pair already exists in memory (idle), force immediate inspection with top priority.
+                    if pair_set in self.active_pairs:
+                        pi = self.active_pairs.get(pair_set)
+                        if pi and getattr(pi, 'position_status', 0) == 0 and not getattr(pi, 'is_trading', False):
+                            # Keep TG responsive: schedule, do not await.
+                            self.loop.create_task(self._check_signals_for_active_pairs(s1))
+                            priority_existing_checked += 1
+                        continue
+
+                    if pair_set not in checked_pairs:
+                        priority_pairs.append((s1, s2))
+                        checked_pairs.add(pair_set)
+
                 if priority_pairs:
                     print(f"â­ Found {len(priority_pairs)} valid candidates from priority list.")
                     candidates_to_process.extend(priority_pairs)
+                if priority_existing_checked:
+                    print(f"â­ Priority inspection queued for {priority_existing_checked} existing idle pairs.")
             except Exception as e:
                 print(f"âš ï¸ Error loading priority pairs from {priority_file_path}: {e}")
         else:
              print(f"Info: Priority file not found at {priority_file_path}")
 
         # --- 2. Generate standard combinations ---
-        all_combinations = itertools.combinations(ready_symbols, 2)
         added_count = 0
-        for p in all_combinations:
-            pair_set = frozenset(p)
-            if pair_set not in self.active_pairs and pair_set not in checked_pairs:
-                candidates_to_process.append(p)
-                added_count += 1
+        if not priority_only:
+            all_combinations = itertools.combinations(ready_symbols, 2)
+            for p in all_combinations:
+                pair_set = frozenset(p)
+                if pair_set not in self.active_pairs and pair_set not in checked_pairs:
+                    candidates_to_process.append(p)
+                    added_count += 1
+        else:
+            print("Priority-only discovery: skipping non-priority pair combinations for fast startup.")
                 
         total_pairs = len(candidates_to_process)
         print(f"Total pairs to check: {total_pairs} (Priority: {len(priority_pairs)}, Others: {added_count})")
@@ -2822,11 +2871,15 @@ class PairsManager:
 
         elapsed = time.time() - start_time
         print(f"Discovery process finished in {elapsed:.2f}s. Found {new_pairs_count} new pairs.")
+        # Keep priority file fresh in background (throttled internally).
+        self.loop.create_task(self._refresh_best_pairs(force=False, reason='post_discovery'))
 
     async def _notify(self, message, reply_to_msg_id=None, reply_markup=None):
         """Sends a notification via the configured callback. Returns msg_id for reply threading."""
         if self.notify_callback:
             try:
+                if isinstance(message, str):
+                    message = _repair_mojibake_text(message)
                 return await self.notify_callback(message, reply_to_msg_id, reply_markup)
             except Exception as e:
                 print(f"Error in _notify: {e}")
@@ -3017,38 +3070,272 @@ class PairsManager:
             print(f"âš ï¸ Failed to set leverage for {symbol}: {e}")
             return False
 
+    def _priority_file_path(self) -> str:
+        priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
+        if priority_file_path and not os.path.isabs(priority_file_path):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            priority_file_path = os.path.join(script_dir, priority_file_path)
+        return priority_file_path or ''
+
+    def _load_priority_pairs_list(self, ready_set: set | None = None) -> list[tuple[str, str]]:
+        """
+        Load priority pairs from file.
+        Supports both formats:
+        - ["SYM1-SYM2", ...] (legacy)
+        - [{"pair":"SYM1-SYM2","score":...,...}, ...] (rich)
+        """
+        path = self._priority_file_path()
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except Exception:
+            return []
+
+        if not isinstance(raw, list):
+            return []
+
+        entries = raw
+        if raw and all(isinstance(x, dict) for x in raw):
+            entries = sorted(raw, key=lambda x: float(x.get('score', 0.0) or 0.0), reverse=True)
+
+        out: list[tuple[str, str]] = []
+        seen = set()
+        for item in entries:
+            pair_str = ''
+            if isinstance(item, str):
+                pair_str = item
+            elif isinstance(item, dict):
+                pair_str = str(item.get('pair', '') or '').strip()
+                if not pair_str:
+                    s1 = str(item.get('symbol1', '') or '').strip()
+                    s2 = str(item.get('symbol2', '') or '').strip()
+                    if s1 and s2:
+                        pair_str = f"{s1}-{s2}"
+            if '-' not in pair_str:
+                continue
+            s1, s2 = [x.strip().upper() for x in pair_str.split('-', 1)]
+            if not s1 or not s2:
+                continue
+            if ready_set is not None and (s1 not in ready_set or s2 not in ready_set):
+                continue
+            key = tuple(sorted((s1, s2)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((s1, s2))
+        return out
+
+    def _pair_priority_score(self, stat: dict, min_trades: int) -> float:
+        trades = int(stat.get('trades', 0) or 0)
+        if trades <= 0:
+            return -999.0
+        wins = int(stat.get('wins', 0) or 0)
+        tp_wins = int(stat.get('tp_wins', 0) or 0)
+        bad_closes = int(stat.get('bad_closes', 0) or 0)
+        net_pnl = float(stat.get('net_pnl', 0.0) or 0.0)
+        avg_pnl = float(stat.get('avg_pnl', 0.0) or 0.0)
+        sum_pos = float(stat.get('sum_pos', 0.0) or 0.0)
+        sum_neg_abs = float(stat.get('sum_neg_abs', 0.0) or 0.0)
+
+        winrate = wins / trades
+        tp_rate = tp_wins / trades
+        bad_rate = bad_closes / trades
+        pf = sum_pos / max(1e-9, sum_neg_abs)
+        pf_score = min(1.5, pf / 2.0)
+        pnl_score = max(0.0, math.tanh(net_pnl / 5.0))
+        avg_score = max(0.0, math.tanh(avg_pnl / 1.0))
+        confidence = min(1.0, trades / max(1.0, float(min_trades)))
+
+        score = (
+            0.30 * winrate +
+            0.20 * tp_rate +
+            0.20 * pf_score +
+            0.20 * pnl_score +
+            0.10 * avg_score
+        )
+        score = score * confidence - (0.25 * bad_rate)
+        if net_pnl <= 0 and trades < (min_trades + 2):
+            score -= 0.25
+        return float(score)
+
+    async def _refresh_best_pairs(self, force: bool = False, reason: str = ''):
+        """
+        Rebuild best_pairs.json from closed trade performance.
+        Promotes stable profitable pairs, demotes/removes degrading pairs.
+        """
+        now = time.time()
+        refresh_sec = 300.0  # throttle expensive rebuilds
+        if not force and (now - self._best_pairs_last_refresh) < refresh_sec:
+            return
+
+        async with self._best_pairs_refresh_lock:
+            now = time.time()
+            if not force and (now - self._best_pairs_last_refresh) < refresh_sec:
+                return
+            self._best_pairs_last_refresh = now
+
+            path = self._priority_file_path()
+            if not path:
+                return
+
+            try:
+                # Hysteresis for best_pairs stability:
+                # enter is stricter than keep/remove to prevent borderline flip-flop.
+                enter_min_trades = 4
+                enter_min_wins = 3
+                enter_min_winrate = 0.55
+                keep_min_trades_for_eval = 6
+                remove_max_winrate = 0.45
+                remove_if_net_nonpositive = True
+                if not hasattr(db, 'get_closed_trade_stats_by_pair'):
+                    print("⚠️ best_pairs refresh skipped: db.get_closed_trade_stats_by_pair is missing")
+                    return
+                stats = await db.get_closed_trade_stats_by_pair()
+                existing_entries = []
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            raw = json.load(f)
+                        if isinstance(raw, list):
+                            for x in raw:
+                                if isinstance(x, str) and '-' in x:
+                                    existing_entries.append({'pair': str(x).strip()})
+                                elif isinstance(x, dict):
+                                    p = str(x.get('pair', '') or '').strip()
+                                    if '-' in p:
+                                        item = dict(x)
+                                        item['pair'] = p
+                                        existing_entries.append(item)
+                    except Exception:
+                        existing_entries = []
+
+                def _canon(pair_str: str):
+                    parts = [p.strip().upper() for p in pair_str.split('-', 1)]
+                    if len(parts) != 2 or not parts[0] or not parts[1]:
+                        return None
+                    return tuple(sorted(parts))
+
+                ranked = []
+                stat_keys = set()
+                stat_by_key = {}
+                for st in stats:
+                    s1 = str(st.get('symbol1', '') or '').strip().upper()
+                    s2 = str(st.get('symbol2', '') or '').strip().upper()
+                    key = None
+                    if s1 and s2:
+                        key = tuple(sorted((s1, s2)))
+                        stat_keys.add(key)
+                        stat_by_key[key] = st
+                    trades = int(st.get('trades', 0) or 0)
+                    net_pnl = float(st.get('net_pnl', 0.0) or 0.0)
+                    wins = int(st.get('wins', 0) or 0)
+                    winrate = (wins / trades) if trades > 0 else 0.0
+                    score = self._pair_priority_score(st, min_trades=enter_min_trades)
+                    if (
+                        trades >= enter_min_trades
+                        and wins >= enter_min_wins
+                        and winrate >= enter_min_winrate
+                        and net_pnl > 0
+                        and score > 0
+                    ):
+                        ranked.append((score, st))
+
+                ranked.sort(key=lambda x: (-x[0], -float(x[1].get('net_pnl', 0.0) or 0.0), -int(x[1].get('trades', 0) or 0)))
+                payload = []
+                for score, item in ranked:
+                    trades = int(item.get('trades', 0) or 0)
+                    wins = int(item.get('wins', 0) or 0)
+                    tp_wins = int(item.get('tp_wins', 0) or 0)
+                    bad = int(item.get('bad_closes', 0) or 0)
+                    sum_pos = float(item.get('sum_pos', 0.0) or 0.0)
+                    sum_neg_abs = float(item.get('sum_neg_abs', 0.0) or 0.0)
+                    pf = sum_pos / max(1e-9, sum_neg_abs)
+                    payload.append({
+                        'pair': f"{item['symbol1']}-{item['symbol2']}",
+                        'score': round(float(score), 6),
+                        'trade_count': trades,
+                        'net_pnl': round(float(item.get('net_pnl', 0.0) or 0.0), 8),
+                        'avg_pnl': round(float(item.get('avg_pnl', 0.0) or 0.0), 8),
+                        'win_rate': round((wins / trades) if trades > 0 else 0.0, 6),
+                        'tp_rate': round((tp_wins / trades) if trades > 0 else 0.0, 6),
+                        'bad_rate': round((bad / trades) if trades > 0 else 0.0, 6),
+                        'profit_factor': round(float(pf), 6),
+                        'last_close_time': int(item.get('last_close_time', 0) or 0),
+                        'source': 'bot_performance',
+                    })
+
+                # Preserve existing entries that are not yet present in runtime stats (manual/seed/history).
+                # If a pair already has runtime stats, keep it in best_pairs only when it passes strict quality gates.
+                existing_by_key = {}
+                for entry in existing_entries:
+                    p = str(entry.get('pair', '') or '').strip()
+                    ck = _canon(p)
+                    if ck is None:
+                        continue
+                    if ck in stat_by_key:
+                        st = stat_by_key.get(ck) or {}
+                        trades = int(st.get('trades', 0) or 0)
+                        wins = int(st.get('wins', 0) or 0)
+                        net_pnl = float(st.get('net_pnl', 0.0) or 0.0)
+                        winrate = (wins / trades) if trades > 0 else 0.0
+                        # Remove only when we have enough data and clearly degraded behavior.
+                        enough_data_to_judge = trades >= keep_min_trades_for_eval
+                        degraded = (
+                            (remove_if_net_nonpositive and net_pnl <= 0)
+                            or (winrate < remove_max_winrate)
+                        )
+                        if enough_data_to_judge and degraded:
+                            continue
+                    # Keep full existing object (score/metrics), only ensure pair field exists.
+                    existing_by_key[ck] = entry if isinstance(entry, dict) else {'pair': p, 'source': 'manual_seed'}
+
+                # Keep ranked order first, then append remaining preserved entries.
+                merged = []
+                seen = set()
+                for item in payload:
+                    pair_txt = item.get('pair', '') if isinstance(item, dict) else str(item)
+                    ck = _canon(pair_txt)
+                    if ck is None or ck in seen:
+                        continue
+                    seen.add(ck)
+                    merged.append(item)
+                for ck, item in existing_by_key.items():
+                    if ck in seen:
+                        continue
+                    seen.add(ck)
+                    merged.append(item)
+                payload = merged
+
+                # Safety: never wipe priority list if rebuild produced nothing.
+                if not payload and existing_entries:
+                    payload = existing_entries
+                    print("⚠️ best_pairs rebuild produced empty list, preserving existing file entries.")
+
+                os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+                tmp_path = f"{path}.tmp"
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp_path, path)
+
+                preview = ", ".join([(x.get('pair', '') if isinstance(x, dict) else str(x)) for x in payload[:5]]) if payload else "empty"
+                print(
+                    f"Updated best_pairs.json ({reason or 'periodic'}): "
+                    f"{len(payload)} pairs, from {len(stats)} tracked pairs. Top: {preview}"
+                )
+            except Exception as e:
+                print(f"âš ï¸ Could not rebuild best_pairs.json: {e}")
+
     def _add_to_best_pairs(self, symbol1: str, symbol2: str):
         """
-        Add a successfully traded pair to best_pairs.json for priority loading.
-        Only adds if the pair doesn't already exist.
+        Legacy trigger kept for compatibility.
+        Now schedules full best_pairs rebuild from performance stats.
         """
         try:
-            priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
-            if priority_file_path and not os.path.isabs(priority_file_path):
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                priority_file_path = os.path.join(script_dir, priority_file_path)
-            
-            if not priority_file_path:
-                return
-            
-            # Load existing pairs
-            existing_pairs = []
-            if os.path.exists(priority_file_path):
-                with open(priority_file_path, 'r') as f:
-                    existing_pairs = json.load(f)
-            
-            # Create pair string
-            pair_str = f"{symbol1}-{symbol2}"
-            pair_str_rev = f"{symbol2}-{symbol1}"
-            
-            # Check if already exists
-            if pair_str not in existing_pairs and pair_str_rev not in existing_pairs:
-                existing_pairs.append(pair_str)
-                with open(priority_file_path, 'w') as f:
-                    json.dump(existing_pairs, f, indent=2)
-                print(f"âœ… Added {pair_str} to best_pairs.json")
+            self.loop.create_task(self._refresh_best_pairs(force=True, reason=f"tp_close:{symbol1}-{symbol2}"))
         except Exception as e:
-            print(f"âš ï¸ Could not add to best_pairs: {e}")
+            print(f"âš ï¸ Could not schedule best_pairs refresh: {e}")
 
     def _timeframe_seconds_local(self) -> int:
         tf = (self.timeframe or '1h').strip().lower()
@@ -3671,24 +3958,7 @@ class PairsManager:
                         print(err_msg)
                         await self._notify(err_msg)
                     else:
-                        # Close reason mapping
-                        CLOSE_REASONS = {
-                            'z_tp': 'ðŸ’° Z-Score Take Profit',
-                            'z_sl': 'ðŸ›‘ Z-Score Stop Loss',
-                            'circuit': 'ðŸ”´ Circuit Breaker',
-                            'broken_coint': 'ðŸš¨ Broken Correlation',
-                            'hardware_sl': 'ðŸ›¡ï¸ Hardware Stop Loss',
-                            'hardware_tp': 'ðŸ›¡ï¸ Hardware Take Profit',
-                            'manual': 'ðŸ‘¤ Manual Close',
-                            'desync': 'âš ï¸ Leg Desync',
-                            'beta_drift': 'ðŸ“‰ Beta Drift',
-                            'beta_critical': 'ðŸš¨ Beta Critical',
-                            'external': 'âš¡ External Close',
-                            'orphan_restart': 'ðŸ”„ Orphan on Restart',
-                            'stale_symbols': 'â³ Stale Symbols',
-                            'audit_fail': 'ðŸ§¾ Trade Audit Safety Close',
-                        }
-                        reason_text = CLOSE_REASONS.get(close_reason, 'â“ Unknown') if close_reason else 'â“ Unknown'
+                        reason_text = CLOSE_REASONS.get(close_reason, '\u2753 Unknown') if close_reason else '\u2753 Unknown'
                     
                         def get_price(order):
                             if 'avgPrice' in order and float(order['avgPrice']) > 0:

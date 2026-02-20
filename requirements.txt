@@ -7,3 +7,5 @@ requests
 sqlalchemy
 asyncpg
 aiogram
+python-dotenv
+websocket-client

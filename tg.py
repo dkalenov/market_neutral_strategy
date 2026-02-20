@@ -48,6 +48,31 @@ config.read('market_neutral/config.ini')
 # Parse admin list
 tg_admins = []
 
+
+def _repair_mojibake_text(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    if not any(ch in text for ch in ("ð", "â", "Î", "Ã", "Â")):
+        return text
+
+    def _score(s: str) -> int:
+        bad = sum(s.count(x) for x in ("ð", "â", "Î", "Ã", "Â", "ï¸", "â†"))
+        return -bad
+
+    candidates = [text]
+    for enc in ("latin-1", "cp1252"):
+        cur = text
+        for _ in range(2):
+            try:
+                nxt = cur.encode(enc, errors="strict").decode("utf-8", errors="strict")
+            except Exception:
+                break
+            if nxt == cur:
+                break
+            candidates.append(nxt)
+            cur = nxt
+    return max(candidates, key=_score)
+
 # Function to run the bot
 async def init_bot():
     """Initialize TG bot (call this BEFORE pairs_manager.initialize for notifications to work)."""
@@ -174,6 +199,8 @@ class States(StatesGroup):
 
 # Helper function to answer messages or callbacks
 async def answer(message: Message | CallbackQuery, text, reply_markup=None):
+    if isinstance(text, str):
+        text = _repair_mojibake_text(text)
     if isinstance(message, CallbackQuery):
         try:
             await message.answer()
@@ -1275,9 +1302,9 @@ async def close_pair_handler(callback: CallbackQuery, state: FSMContext):
                 pair_info.close_handled = True
                 pair_info.is_trading = True
                 await pairs_manager._execute_trade(pair_info, 0, close_reason='manual')
-                await bot.send_message(chat_id, f"Position {s1}/{s2} closed successfully.")
+                await bot.send_message(chat_id, _repair_mojibake_text(f"Position {s1}/{s2} closed successfully."))
             except Exception as e:
-                await bot.send_message(chat_id, f"Error closing {s1}/{s2}: {e}")
+                await bot.send_message(chat_id, _repair_mojibake_text(f"Error closing {s1}/{s2}: {e}"))
 
     asyncio.create_task(_close_one_task())
 
@@ -1329,7 +1356,7 @@ async def close_all_yes_handler(callback: CallbackQuery, state: FSMContext):
             result_msg = f"Closed {closed} positions."
             if failed > 0:
                 result_msg += f"\nFailed to close {failed} positions."
-            await bot.send_message(chat_id, result_msg)
+            await bot.send_message(chat_id, _repair_mojibake_text(result_msg))
 
     asyncio.create_task(_close_all_task())
 
@@ -1340,7 +1367,7 @@ async def send_startup_message():
     """
     for admin_id in tg_admins:
         try:
-            await bot.send_message(admin_id, "Bot started successfully!")
+            await bot.send_message(admin_id, _repair_mojibake_text("Bot started successfully!"))
         except Exception as e:
             print(f"Could not send startup message to admin {admin_id}: {e}")
 

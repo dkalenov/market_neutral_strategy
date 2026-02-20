@@ -65,56 +65,75 @@ def _configure_console_encoding():
         pass
 
 
-
-
-_CP1252_UNICODE_TO_BYTE = {
-    0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
-    0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
-    0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92,
-    0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
-    0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C,
-    0x017E: 0x9E, 0x0178: 0x9F,
-}
-
-
-def _repair_mojibake_once(s: str):
+def _fix_mojibake_text(s: str) -> str:
+    """
+    Repair UTF-8 text decoded as latin1/cp1252.
+    Works on mixed strings by decoding only byte-like segments.
+    """
     if not isinstance(s, str) or not s:
-        return s, False
-    data = bytearray()
-    used_cp1252_map = False
-    for ch in s:
+        return s
+    if not any(ch in s for ch in ("ð", "â", "Î", "Ð", "Ñ", "Ã")):
+        return s
+
+    cp1252_map = {
+        0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
+        0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
+        0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92,
+        0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
+        0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C,
+        0x017E: 0x9E, 0x0178: 0x9F,
+    }
+
+    def char_to_byte(ch: str):
         code = ord(ch)
         if code <= 0xFF:
-            data.append(code)
+            return code
+        return cp1252_map.get(code)
+
+    def decode_chunk(raw_chars: list[str], raw_bytes: bytearray) -> str:
+        if not raw_chars:
+            return ""
+        try:
+            fixed = bytes(raw_bytes).decode("utf-8")
+            # Avoid replacing with gibberish placeholders.
+            if fixed and "\ufffd" not in fixed:
+                return fixed
+        except Exception:
+            pass
+        return "".join(raw_chars)
+
+    out_parts: list[str] = []
+    chunk_chars: list[str] = []
+    chunk_bytes = bytearray()
+    changed = False
+
+    for ch in s:
+        b = char_to_byte(ch)
+        if b is None:
+            if chunk_chars:
+                decoded = decode_chunk(chunk_chars, chunk_bytes)
+                if decoded != "".join(chunk_chars):
+                    changed = True
+                out_parts.append(decoded)
+                chunk_chars = []
+                chunk_bytes = bytearray()
+            out_parts.append(ch)
             continue
-        mapped = _CP1252_UNICODE_TO_BYTE.get(code)
-        if mapped is None:
-            return s, False
-        used_cp1252_map = True
-        data.append(mapped)
-    # If no cp1252-only chars and no control-range chars, likely already clean text.
-    if not used_cp1252_map and not any(0x80 <= b <= 0x9F for b in data):
-        return s, False
-    try:
-        fixed = bytes(data).decode('utf-8')
-    except Exception:
-        return s, False
-    return fixed, (fixed != s)
+        chunk_chars.append(ch)
+        chunk_bytes.append(b)
 
+    if chunk_chars:
+        decoded = decode_chunk(chunk_chars, chunk_bytes)
+        if decoded != "".join(chunk_chars):
+            changed = True
+        out_parts.append(decoded)
 
-def _fix_mojibake_text(s: str) -> str:
-    """Repair UTF-8 text that was decoded as Latin-1/CP1252 (possibly multiple passes)."""
-    out = s
-    for _ in range(2):
-        out2, changed = _repair_mojibake_once(out)
-        if not changed:
-            break
-        out = out2
-    return out
+    fixed_s = "".join(out_parts)
+    return fixed_s if changed else s
 
 
 def _install_print_mojibake_fix():
-    """Patch builtins.print so runtime logs are auto-repaired if mojibake appears."""
+    """Patch print so console logs are auto-normalized."""
     def _fixed_print(*args, **kwargs):
         fixed_args = [(_fix_mojibake_text(a) if isinstance(a, str) else a) for a in args]
         _orig_print(*fixed_args, **kwargs)
