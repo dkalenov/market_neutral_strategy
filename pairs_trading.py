@@ -5101,8 +5101,8 @@ class PairsManager:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
                     pair_info.pending_source = ''
-                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                    await self._notify(warn_msg, reply_to)
+                    # Avoid retry spam in same candle when beta context is unavailable.
+                    self.mark_pair_wait_for_next_candle(pair_info, reason='beta_data_not_ready')
                     return
                 if not np.isnan(current_beta) and abs(current_beta) >= beta_threshold:
                     warn_msg = f"⛔ BETA REJECT: {s1}-{s2} beta={current_beta:.3f} >= {beta_threshold}. Aborting entry."
@@ -5112,9 +5112,8 @@ class PairsManager:
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
                     pair_info.pending_source = ''
-                    # Notify TG to explain why signal was rejected
-                    reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                    await self._notify(warn_msg, reply_to)
+                    # Pair-level cooldown: retry only after next closed candle.
+                    self.mark_pair_wait_for_next_candle(pair_info, reason='beta_reject')
                     return
             except Exception as e:
                 print(f"⚠️ Beta check error: {e}")
