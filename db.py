@@ -184,6 +184,14 @@ class ConfigInfo:
     discovery_shards: int                   # Split full discovery into N shards across cycles (default 4)
     discovery_max_pairs_per_cycle: int      # Max non-priority pairs per discovery cycle (default 12000)
     refresh_warmup_concurrency: int         # History warmup concurrency after symbol refresh (default 8)
+    # Discovery health/watchdog controls
+    stagnation_watchdog_hours: float        # If no new pairs for X hours and no open positions -> deep full scan
+    stagnation_watchdog_cooldown_sec: int   # Minimum gap between watchdog deep scans
+    stagnation_full_scan_max_pairs: int     # Non-priority cap for watchdog deep full scan
+    discovery_diag_interval_sec: int        # TG diagnostic summary interval
+    discovery_reject_repeat_count: int      # Repeated same reject count before pair cooldown
+    discovery_reject_cooldown_hours: float  # Pair reject cooldown duration
+    discovery_reject_state_ttl_hours: float # Keep reject-state cache for at most X hours
 
     def __init__(self, data):
         for key in self.__class__.__annotations__:
@@ -442,6 +450,14 @@ async def load_config():
             'discovery_shards': '4',
             'discovery_max_pairs_per_cycle': '12000',
             'refresh_warmup_concurrency': '8',
+            # Discovery health/watchdog controls
+            'stagnation_watchdog_hours': '12',
+            'stagnation_watchdog_cooldown_sec': '43200',
+            'stagnation_full_scan_max_pairs': '20000',
+            'discovery_diag_interval_sec': '43200',
+            'discovery_reject_repeat_count': '3',
+            'discovery_reject_cooldown_hours': '12',
+            'discovery_reject_state_ttl_hours': '72',
         }
 
 

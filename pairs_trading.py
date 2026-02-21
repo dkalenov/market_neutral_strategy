@@ -266,6 +266,17 @@ class PairsManager:
         self._progress_last_pair_ts = 0
         # Discovery sharding cursor (for weak CPU: spread full universe over cycles).
         self._discovery_round_idx = 0
+        # Discovery health/watchdog state.
+        self._health_task = None
+        self._last_pair_found_ts = time.time()
+        self._stagnation_last_full_scan_ts = 0.0
+        self._diag_last_report_ts = time.time()
+        self._diag_discovery_runs = 0
+        self._diag_discovery_new_pairs = 0
+        self._diag_reject_reason_counts: dict[str, int] = {}
+        # Pair-level anti-repeat reject cooldown:
+        # {frozenset([s1,s2]): {'reason': str, 'count': int, 'updated_at': ts, 'blocked_until': ts}}
+        self._pair_reject_state: dict[frozenset, dict] = {}
 
     async def initialize(self):
         """
@@ -2287,7 +2298,10 @@ class PairsManager:
 
             if run_discovery and not early_discovery_done and loaded_count >= early_threshold:
                 early_discovery_done = True
-                print(f"Early Discovery after warmup batch ({loaded_count}/{len(sorted_symbols)} symbols)...")
+                print(
+                    f"Early Discovery after warmup batch ({loaded_count}/{len(sorted_symbols)} symbols) "
+                    f"[priority-only fast pass; full scan runs after warmup]..."
+                )
                 try:
                     await self._discover_new_pairs(priority_only=True)
                 except Exception as e:
@@ -2419,6 +2433,165 @@ class PairsManager:
         self._progress_analysis_runs = 0
         self._progress_coint_evals = 0
 
+    def _pair_key(self, symbol1: str, symbol2: str) -> frozenset:
+        return frozenset([str(symbol1 or '').strip().upper(), str(symbol2 or '').strip().upper()])
+
+    def _record_discovery_reject(self, symbol1: str, symbol2: str, reason: str, now_ts: float | None = None):
+        """Track repeated discovery rejects and add temporary cooldown for noisy pairs."""
+        now_ts = now_ts if now_ts is not None else time.time()
+        pair_key = self._pair_key(symbol1, symbol2)
+        reason_key = str(reason or 'rejected').strip().lower()
+        if not reason_key:
+            reason_key = 'rejected'
+
+        self._diag_reject_reason_counts[reason_key] = self._diag_reject_reason_counts.get(reason_key, 0) + 1
+
+        prev = self._pair_reject_state.get(pair_key)
+        if prev and str(prev.get('reason', '')).strip().lower() == reason_key:
+            next_count = int(prev.get('count', 0) or 0) + 1
+            blocked_until = float(prev.get('blocked_until', 0.0) or 0.0)
+        else:
+            next_count = 1
+            blocked_until = 0.0
+
+        repeats_to_block = int(getattr(self.config, 'discovery_reject_repeat_count', 3) or 3)
+        cooldown_hours = float(getattr(self.config, 'discovery_reject_cooldown_hours', 12.0) or 12.0)
+        cooldown_sec = max(0.0, cooldown_hours * 3600.0)
+
+        if repeats_to_block > 0 and cooldown_sec > 0 and next_count >= repeats_to_block:
+            blocked_until = max(blocked_until, now_ts + cooldown_sec)
+            print(
+                f"⏳ Discovery anti-repeat cooldown: {symbol1}-{symbol2} "
+                f"reason={reason_key}, repeats={next_count}, cooldown={int(cooldown_sec // 3600)}h"
+            )
+
+        self._pair_reject_state[pair_key] = {
+            'reason': reason_key,
+            'count': next_count,
+            'updated_at': float(now_ts),
+            'blocked_until': float(blocked_until),
+        }
+
+    def _reject_block_info(self, pair_key: frozenset, now_ts: float | None = None) -> tuple[bool, str, int]:
+        now_ts = now_ts if now_ts is not None else time.time()
+        state = self._pair_reject_state.get(pair_key)
+        if not state:
+            return False, '', 0
+        blocked_until = float(state.get('blocked_until', 0.0) or 0.0)
+        if blocked_until <= now_ts:
+            return False, '', 0
+        reason = str(state.get('reason', 'rejected') or 'rejected')
+        left_sec = max(0, int(blocked_until - now_ts))
+        return True, reason, left_sec
+
+    def _clear_reject_state(self, symbol1: str, symbol2: str):
+        self._pair_reject_state.pop(self._pair_key(symbol1, symbol2), None)
+
+    def _cleanup_reject_state(self, now_ts: float | None = None):
+        """Prune old reject-cache entries to keep memory bounded."""
+        if not self._pair_reject_state:
+            return
+        now_ts = now_ts if now_ts is not None else time.time()
+        ttl_hours = float(getattr(self.config, 'discovery_reject_state_ttl_hours', 72.0) or 72.0)
+        ttl_sec = max(3600.0, ttl_hours * 3600.0)
+        for key, state in list(self._pair_reject_state.items()):
+            updated_at = float(state.get('updated_at', 0.0) or 0.0)
+            blocked_until = float(state.get('blocked_until', 0.0) or 0.0)
+            is_stale = (now_ts - updated_at) > ttl_sec
+            if is_stale and blocked_until <= now_ts:
+                self._pair_reject_state.pop(key, None)
+
+    async def _maybe_trigger_stagnation_full_scan(self, now_ts: float):
+        """Run one deeper full-scan only after long stagnation and no open positions."""
+        if not self._initialized:
+            return
+        if self.count_active_positions() > 0:
+            return
+        if self._discovery_task is not None and not self._discovery_task.done():
+            return
+
+        watch_hours = float(getattr(self.config, 'stagnation_watchdog_hours', 12.0) or 12.0)
+        if watch_hours <= 0:
+            return
+        watch_sec = watch_hours * 3600.0
+        anchor_ts = max(float(getattr(self, '_last_pair_found_ts', 0.0) or 0.0), float(self._init_complete_time or 0.0))
+        if anchor_ts <= 0:
+            return
+        if (now_ts - anchor_ts) < watch_sec:
+            return
+
+        cooldown_sec = int(
+            getattr(self.config, 'stagnation_watchdog_cooldown_sec', max(3600, int(watch_sec))) or max(3600, int(watch_sec))
+        )
+        if (now_ts - float(self._stagnation_last_full_scan_ts or 0.0)) < cooldown_sec:
+            return
+
+        ready_symbols = sum(1 for d in self.all_data.values() if len(d.ts) >= self.min_data_points)
+        if ready_symbols < max(20, int(len(self.all_symbols) * 0.1)):
+            return
+
+        idle_pairs = sum(1 for pi in self.active_pairs.values() if pi.position_status == 0 and not pi.is_trading)
+        self._stagnation_last_full_scan_ts = now_ts
+        self._last_discovery_time = now_ts
+        print(
+            f"🧭 Stagnation watchdog: no new pairs for {int((now_ts - anchor_ts) // 3600)}h, "
+            f"open=0, idle={idle_pairs}. Triggering deep full discovery."
+        )
+        await self._notify(
+            "🧭 <b>Stagnation Watchdog</b>\n"
+            f"No new pairs for ~{int((now_ts - anchor_ts) // 3600)}h.\n"
+            f"Open: 0 | Idle: {idle_pairs}\n"
+            "Action: run one deep full-scan (temporary, low-frequency)."
+        )
+        self._discovery_task = self.loop.create_task(self._discover_new_pairs(priority_only=False, force_full_scan=True))
+
+    async def _maybe_send_discovery_diagnostics(self, now_ts: float):
+        """Rare TG heartbeat with discovery health and reject reasons."""
+        report_sec = int(getattr(self.config, 'discovery_diag_interval_sec', 43200) or 43200)
+        if report_sec <= 0:
+            return
+        last_ts = float(getattr(self, '_diag_last_report_ts', 0.0) or 0.0)
+        if last_ts > 0 and (now_ts - last_ts) < report_sec:
+            return
+
+        open_count = self.count_active_positions()
+        idle_count = sum(1 for pi in self.active_pairs.values() if pi.position_status == 0 and not pi.is_trading)
+        last_found = float(getattr(self, '_last_pair_found_ts', 0.0) or 0.0)
+        no_new_hours = (now_ts - last_found) / 3600.0 if last_found > 0 else 0.0
+        top_rejects = sorted(self._diag_reject_reason_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        rejects_line = ", ".join(f"{k}:{v}" for k, v in top_rejects) if top_rejects else "none"
+        window_h = (now_ts - last_ts) / 3600.0 if last_ts > 0 else 0.0
+
+        msg = (
+            "📊 <b>Discovery Health</b>\n"
+            f"Window: {window_h:.1f}h\n"
+            f"Discovery runs: {int(self._diag_discovery_runs)}\n"
+            f"New pairs found: {int(self._diag_discovery_new_pairs)}\n"
+            f"Now: open={open_count}, idle={idle_count}\n"
+            f"No new pairs for: {no_new_hours:.1f}h\n"
+            f"Top reject reasons: {rejects_line}"
+        )
+        await self._notify(msg)
+
+        self._diag_last_report_ts = now_ts
+        self._diag_discovery_runs = 0
+        self._diag_discovery_new_pairs = 0
+        self._diag_reject_reason_counts.clear()
+
+    async def _discovery_health_loop(self):
+        """Low-frequency housekeeping for stagnation safety and diagnostics."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                now_ts = time.time()
+                self._cleanup_reject_state(now_ts)
+                await self._maybe_trigger_stagnation_full_scan(now_ts)
+                await self._maybe_send_discovery_diagnostics(now_ts)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"⚠️ Discovery health loop error (continuing): {e}")
+
     # Legacy method for backward compatibility (single TF mode)
     async def add_kline(self, kline_data):
         """Legacy method - calls add_kline_main for backward compatibility."""
@@ -2469,221 +2642,226 @@ class PairsManager:
         """
         Checks for trading signals and handles pair rotation.
         """
-        current_pairs = list(self.active_pairs.items())
+        symbol_pairs = list(self._pairs_with_symbol(updated_symbol))
+        if not symbol_pairs:
+            return
 
-        for pair_set, pair_info in current_pairs:
+        for pair_info in symbol_pairs:
             if pair_info.is_trading:
                 continue
-                
-            if updated_symbol in pair_set:
-                s1, s2 = pair_info.symbol1, pair_info.symbol2
-                
-                if s1 not in self.all_data or s2 not in self.all_data:
-                    continue
-                
-                data1 = self.all_data[s1]
-                data2 = self.all_data[s2]
+            
+            s1, s2 = pair_info.symbol1, pair_info.symbol2
+            pair_set = frozenset([s1, s2])
+            # Pair can be removed concurrently during this loop.
+            if pair_set not in self.active_pairs:
+                continue
+            
+            if s1 not in self.all_data or s2 not in self.all_data:
+                continue
+            
+            data1 = self.all_data[s1]
+            data2 = self.all_data[s2]
 
-                if len(data1.close) < self.min_data_points or len(data2.close) < self.min_data_points:
-                    continue
+            if len(data1.close) < self.min_data_points or len(data2.close) < self.min_data_points:
+                continue
 
-                if data1.ts[-1] != data2.ts[-1]:
-                    continue
+            if data1.ts[-1] != data2.ts[-1]:
+                continue
 
-                # Evaluate coint metrics at most once per common closed candle for this pair.
-                # Without this guard, repeated ad-hoc checks on the same candle can distort
-                # coint_streak_bars semantics ("consecutive closed candles").
-                common_close_ts = int(data1.ts[-1])
-                last_eval_ts = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
-                if common_close_ts <= last_eval_ts:
-                    continue
-                pair_info._last_coint_eval_ts = common_close_ts
-                self._progress_coint_evals += 1
-                self._progress_last_pair = f"{s1}-{s2}"
-                self._progress_last_pair_ts = common_close_ts
+            # Evaluate coint metrics at most once per common closed candle for this pair.
+            # Without this guard, repeated ad-hoc checks on the same candle can distort
+            # coint_streak_bars semantics ("consecutive closed candles").
+            common_close_ts = int(data1.ts[-1])
+            last_eval_ts = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
+            if common_close_ts <= last_eval_ts:
+                continue
+            pair_info._last_coint_eval_ts = common_close_ts
+            self._progress_coint_evals += 1
+            self._progress_last_pair = f"{s1}-{s2}"
+            self._progress_last_pair_ts = common_close_ts
 
-                log_prices1 = np.log(list(data1.close)[-self.min_data_points:])
-                log_prices2 = np.log(list(data2.close)[-self.min_data_points:])
+            log_prices1 = np.log(list(data1.close)[-self.min_data_points:])
+            log_prices2 = np.log(list(data2.close)[-self.min_data_points:])
 
-                # Dynamic recalculation of cointegration (with configurable p-value threshold)
-                p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
-                flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold, strict_hl=False)
-                if flag == 1:
-                    pair_info.coint_streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0) + 1
-                else:
-                    pair_info.coint_streak_bars = 0
+            # Dynamic recalculation of cointegration (with configurable p-value threshold)
+            p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
+            flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold, strict_hl=False)
+            if flag == 1:
+                pair_info.coint_streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0) + 1
+            else:
+                pair_info.coint_streak_bars = 0
 
-                # === MARKET NEUTRALITY CHECK ===
-                # Calculate beta to BTC to ensure pair is market-neutral
-                beta_btc = np.nan
-                beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
-                
-                if flag == 1 and 'BTCUSDT' in self.all_data:
-                    btc_data = self.all_data['BTCUSDT']
-                    if len(btc_data.close) >= self.min_data_points:
-                        log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
-                        # Spread returns = d(log1) - hedge * d(log2)
-                        spread_returns = np.diff(log_prices1) - hedge * np.diff(log_prices2)
-                        btc_returns = np.diff(log_btc)
-                        beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
-                        
-                        if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
-                            # Only reject/set flag=0 if the pair is IDLE (no open position)
-                            # For active trades, we let _check_realtime_exit handle beta drift
-                            if pair_info.position_status == 0:
-                                print(f"⚠️ {s1}-{s2} rejected: beta_btc={beta_btc:.3f} >= {beta_threshold} (not market-neutral)")
-                                flag = 0  # Mark as not cointegrated (only for idle pairs)
-                            else:
-                                # For trading pairs, just log warning - RT exit will handle PnL-based closure
-                                print(f"🛡️ {s1}-{s2} beta drift detected: |beta|={abs(beta_btc):.3f} (above limit {beta_threshold}). Handling via RT monitoring.")
-                
-                # === HEDGE RATIO BOUNDS CHECK ===
-                # Reject pairs with |hedge| outside configured bounds (too unbalanced positions)
-                if flag == 1:
-                    hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
-                    hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
-                    abs_hedge = abs(hedge) if not np.isnan(hedge) else 0.0
-                    if abs_hedge < hedge_min or abs_hedge > hedge_max:
+            # === MARKET NEUTRALITY CHECK ===
+            # Calculate beta to BTC to ensure pair is market-neutral
+            beta_btc = np.nan
+            beta_threshold = getattr(self.config, 'beta_threshold', 0.11) or 0.11
+            
+            if flag == 1 and 'BTCUSDT' in self.all_data:
+                btc_data = self.all_data['BTCUSDT']
+                if len(btc_data.close) >= self.min_data_points:
+                    log_btc = np.log(list(btc_data.close)[-self.min_data_points:])
+                    # Spread returns = d(log1) - hedge * d(log2)
+                    spread_returns = np.diff(log_prices1) - hedge * np.diff(log_prices2)
+                    btc_returns = np.diff(log_btc)
+                    beta_btc = utils.calculate_pair_beta(spread_returns, btc_returns)
+                    
+                    if not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
+                        # Only reject/set flag=0 if the pair is IDLE (no open position)
+                        # For active trades, we let _check_realtime_exit handle beta drift
                         if pair_info.position_status == 0:
-                            print(f"⚠️ {s1}-{s2} rejected: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}] (positions would be unbalanced)")
-                            flag = 0
+                            print(f"⚠️ {s1}-{s2} rejected: beta_btc={beta_btc:.3f} >= {beta_threshold} (not market-neutral)")
+                            flag = 0  # Mark as not cointegrated (only for idle pairs)
                         else:
-                            print(f"⚠️ {s1}-{s2} hedge drift: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}]")
-                
-                # Store beta for display (ALWAYS, even if rejected)
-                pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
-                pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
-                # Persist to DB for restart recovery & analysis
-                if pair_info.db_id and pair_info.position_status != 0:
-                    try:
-                        await db.update_pair({
-                            'id': pair_info.db_id,
-                            'beta_btc': pair_info.beta_btc,
-                            'last_pvalue': pair_info.last_pvalue
-                        })
-                    except Exception as _db_e:
-                        print(f"⚠️ DB beta/pval save failed: {_db_e}")
-                # Pair rotation: if cointegration breaks
-                if flag == 0:
-                    print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
-                    
-                    if pair_info.position_status != 0:
-                        leg1_open = abs(float(self._exchange_positions_cache.get(s1, 0.0) or 0.0)) > 0
-                        leg2_open = abs(float(self._exchange_positions_cache.get(s2, 0.0) or 0.0)) > 0
-                        if not leg1_open or not leg2_open:
-                            print(
-                                f"Skipping broken_coint close for {s1}-{s2}: "
-                                f"exchange legs present={int(leg1_open)}/{int(leg2_open)}. "
-                                "Waiting for sync/external-close flow."
-                            )
-                            continue
-
-                        # GRACE PERIOD 1: Skip broken_coint closures during warmup
-                        # After bot restart, data may not be fully loaded yet
-                        grace_elapsed = time.time() - self._init_complete_time
-                        if grace_elapsed < self._broken_coint_grace_sec:
-                            print(f"⏳ GRACE PERIOD (init): Skipping broken_coint close for {s1}-{s2} (init {grace_elapsed:.0f}s ago, need {self._broken_coint_grace_sec}s)")
-                            continue
-                        
-                        # GRACE PERIOD 2: Skip broken_coint closures for freshly opened trades
-                        # Cointegration re-test with slightly different data can give false negatives
-                        trade_open_time = getattr(pair_info, '_trade_open_time', 0)
-                        trade_age = time.time() - trade_open_time
-                        if trade_open_time > 0 and trade_age < 60:
-                            print(f"⏳ GRACE PERIOD (trade): Skipping broken_coint close for {s1}-{s2} (trade opened {trade_age:.0f}s ago, need 60s)")
-                            continue
-                        
-                        print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
-                        # Don't send notification here - _execute_trade will send full close message with PnL
-                        if not getattr(pair_info, 'tg_message_id', 0):
-                            restored_reply = await self._resolve_reply_to_message_id(pair_info)
-                            if restored_reply:
-                                print(f"ℹ️ Restored missing tg_message_id for {s1}-{s2}: {restored_reply}")
-                            else:
-                                print(f"⚠️ tg_message_id missing for {s1}-{s2}; close alert may be non-threaded")
-                        pair_info.close_handled = True
-                        pair_info.is_trading = True
-                        
-                        # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
-                        try:
-                            await self._execute_trade(pair_info, 0, close_reason='broken_coint')
-                        except Exception as e:
-                            print(f"❌ Failed to close broken pair {s1}-{s2}: {e}. Keeping in active list to retry.")
-                            continue # Do not delete pair if close failed
-
-                    if pair_info.db_id:
-                        reason = f"Broken cointegration (flag={flag}, p={pval:.4f})"
-                        # CRITICAL: Await this to prevent pool exhaustion (was create_task)
-                        try:
-                            await db.log_pair_history_event(
-                                symbol1=s1,
-                                symbol2=s2,
-                                event_type='BROKEN',
-                                timestamp_ms=int(time.time() * 1000),
-                                hedge_ratio=hedge,
-                                half_life=hl,
-                                reason=reason,
-                                pair_id=pair_info.db_id,
-                                beta_btc=pair_info.beta_btc,
-                                pvalue=pval,
-                            )
-                            await db.archive_pair(pair_info.db_id, reason='broken_coint')
-                        except Exception as e:
-                            print(f"⚠️ Failed to update DB content for broken pair {s1}-{s2}: {e}")
-                    
-                    if pair_set in self.active_pairs:
-                        self._unregister_pair(pair_info)
-                        del self.active_pairs[pair_set]
-                    continue
-
-                # Update parameters
-                pair_info.hedge_ratio = hedge
-                pair_info.half_life = hl
-                self._update_quality_score_cache(pair_info)
-                
-                if pair_info.db_id:
-                    # CRITICAL: Await DB update to prevent pool exhaustion (was create_task)
+                            # For trading pairs, just log warning - RT exit will handle PnL-based closure
+                            print(f"🛡️ {s1}-{s2} beta drift detected: |beta|={abs(beta_btc):.3f} (above limit {beta_threshold}). Handling via RT monitoring.")
+            
+            # === HEDGE RATIO BOUNDS CHECK ===
+            # Reject pairs with |hedge| outside configured bounds (too unbalanced positions)
+            if flag == 1:
+                hedge_min = getattr(self.config, 'hedge_min', 0.3) or 0.3
+                hedge_max = getattr(self.config, 'hedge_max', 3.0) or 3.0
+                abs_hedge = abs(hedge) if not np.isnan(hedge) else 0.0
+                if abs_hedge < hedge_min or abs_hedge > hedge_max:
+                    if pair_info.position_status == 0:
+                        print(f"⚠️ {s1}-{s2} rejected: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}] (positions would be unbalanced)")
+                        flag = 0
+                    else:
+                        print(f"⚠️ {s1}-{s2} hedge drift: |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}]")
+            
+            # Store beta for display (ALWAYS, even if rejected)
+            pair_info.beta_btc = beta_btc if not np.isnan(beta_btc) else 0.0
+            pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
+            # Persist to DB for restart recovery & analysis
+            if pair_info.db_id and pair_info.position_status != 0:
+                try:
                     await db.update_pair({
                         'id': pair_info.db_id,
-                        'hedge_ratio': hedge,
-                        'half_life': hl
+                        'beta_btc': pair_info.beta_btc,
+                        'last_pvalue': pair_info.last_pvalue
                     })
-
-                spread = log_prices1 - pair_info.hedge_ratio * log_prices2
-                z_score = utils.calculate_z_last(spread)
-                if z_score is None:
-                    continue
+                except Exception as _db_e:
+                    print(f"⚠️ DB beta/pval save failed: {_db_e}")
+            # Pair rotation: if cointegration breaks
+            if flag == 0:
+                print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                 
-                pair_info.last_z_score = z_score
+                if pair_info.position_status != 0:
+                    leg1_open = abs(float(self._exchange_positions_cache.get(s1, 0.0) or 0.0)) > 0
+                    leg2_open = abs(float(self._exchange_positions_cache.get(s2, 0.0) or 0.0)) > 0
+                    if not leg1_open or not leg2_open:
+                        print(
+                            f"Skipping broken_coint close for {s1}-{s2}: "
+                            f"exchange legs present={int(leg1_open)}/{int(leg2_open)}. "
+                            "Waiting for sync/external-close flow."
+                        )
+                        continue
 
-                # Circuit Breaker Logic (candle-close backup — primary is in on_ticker_update)
-                if pair_info.position_status != 0 and pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
-                    current_price1 = list(data1.close)[-1]
-                    current_price2 = list(data2.close)[-1]
+                    # GRACE PERIOD 1: Skip broken_coint closures during warmup
+                    # After bot restart, data may not be fully loaded yet
+                    grace_elapsed = time.time() - self._init_complete_time
+                    if grace_elapsed < self._broken_coint_grace_sec:
+                        print(f"⏳ GRACE PERIOD (init): Skipping broken_coint close for {s1}-{s2} (init {grace_elapsed:.0f}s ago, need {self._broken_coint_grace_sec}s)")
+                        continue
                     
-                    # Use EXCHANGE PnL (source of truth)
-                    total_pnl = self._get_exchange_pair_pnl(pair_info, current_price1, current_price2)
+                    # GRACE PERIOD 2: Skip broken_coint closures for freshly opened trades
+                    # Cointegration re-test with slightly different data can give false negatives
+                    trade_open_time = getattr(pair_info, '_trade_open_time', 0)
+                    trade_age = time.time() - trade_open_time
+                    if trade_open_time > 0 and trade_age < 60:
+                        print(f"⏳ GRACE PERIOD (trade): Skipping broken_coint close for {s1}-{s2} (trade opened {trade_age:.0f}s ago, need 60s)")
+                        continue
                     
-                    notional = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
-                    leverage = self.config.leverage if self.config and self.config.leverage else 20
-                    margin = notional / leverage  # Actual deployed capital
-                    circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
+                    print(f"🚨 Broken Correlation on {s1}-{s2} (Pval: {pval:.3f}). Force Closing Position!")
+                    # Don't send notification here - _execute_trade will send full close message with PnL
+                    if not getattr(pair_info, 'tg_message_id', 0):
+                        restored_reply = await self._resolve_reply_to_message_id(pair_info)
+                        if restored_reply:
+                            print(f"ℹ️ Restored missing tg_message_id for {s1}-{s2}: {restored_reply}")
+                        else:
+                            print(f"⚠️ tg_message_id missing for {s1}-{s2}; close alert may be non-threaded")
+                    pair_info.close_handled = True
+                    pair_info.is_trading = True
                     
-                    if notional > 0:
-                        roi_notional = total_pnl / notional
-                        if roi_notional < -circuit_breaker_pct:
-                            roi_margin = total_pnl / margin if margin > 0 else 0
-                            cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
-                                      f"Loss: {roi_notional*100:.2f}% of notional ({total_pnl:.2f} USDT)\n"
-                                      f"Margin: {roi_margin*100:.2f}% | Leverage: {leverage}x\n"
-                                      f"Force Closing...")
-                            print(cb_msg)
-                            reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
-                            await self._notify(cb_msg, reply_to)
-                            pair_info.close_handled = True
-                            pair_info.is_trading = True
-                            await self._execute_trade(pair_info, 0, close_reason='circuit')
-                            continue
+                    # CRITICAL: Await close before removing from active_pairs to avoid zombie positions
+                    try:
+                        await self._execute_trade(pair_info, 0, close_reason='broken_coint')
+                    except Exception as e:
+                        print(f"❌ Failed to close broken pair {s1}-{s2}: {e}. Keeping in active list to retry.")
+                        continue # Do not delete pair if close failed
+
+                if pair_info.db_id:
+                    reason = f"Broken cointegration (flag={flag}, p={pval:.4f})"
+                    # CRITICAL: Await this to prevent pool exhaustion (was create_task)
+                    try:
+                        await db.log_pair_history_event(
+                            symbol1=s1,
+                            symbol2=s2,
+                            event_type='BROKEN',
+                            timestamp_ms=int(time.time() * 1000),
+                            hedge_ratio=hedge,
+                            half_life=hl,
+                            reason=reason,
+                            pair_id=pair_info.db_id,
+                            beta_btc=pair_info.beta_btc,
+                            pvalue=pval,
+                        )
+                        await db.archive_pair(pair_info.db_id, reason='broken_coint')
+                    except Exception as e:
+                        print(f"⚠️ Failed to update DB content for broken pair {s1}-{s2}: {e}")
+                
+                if pair_set in self.active_pairs:
+                    self._unregister_pair(pair_info)
+                    del self.active_pairs[pair_set]
+                continue
+
+            # Update parameters
+            pair_info.hedge_ratio = hedge
+            pair_info.half_life = hl
+            self._update_quality_score_cache(pair_info)
+            
+            if pair_info.db_id:
+                # CRITICAL: Await DB update to prevent pool exhaustion (was create_task)
+                await db.update_pair({
+                    'id': pair_info.db_id,
+                    'hedge_ratio': hedge,
+                    'half_life': hl
+                })
+
+            spread = log_prices1 - pair_info.hedge_ratio * log_prices2
+            z_score = utils.calculate_z_last(spread)
+            if z_score is None:
+                continue
+            
+            pair_info.last_z_score = z_score
+
+            # Circuit Breaker Logic (candle-close backup — primary is in on_ticker_update)
+            if pair_info.position_status != 0 and pair_info.entry_price1 > 0 and pair_info.entry_price2 > 0:
+                current_price1 = list(data1.close)[-1]
+                current_price2 = list(data2.close)[-1]
+
+                # Use EXCHANGE PnL (source of truth)
+                total_pnl = self._get_exchange_pair_pnl(pair_info, current_price1, current_price2)
+
+                notional = (pair_info.entry_price1 * pair_info.qty1) + (pair_info.entry_price2 * pair_info.qty2)
+                leverage = self.config.leverage if self.config and self.config.leverage else 20
+                margin = notional / leverage  # Actual deployed capital
+                circuit_breaker_pct = getattr(self.config, 'circuit_breaker_pct', 0.20) or 0.20
+
+                if notional > 0:
+                    roi_notional = total_pnl / notional
+                    if roi_notional < -circuit_breaker_pct:
+                        roi_margin = total_pnl / margin if margin > 0 else 0
+                        cb_msg = (f"🚨 <b>CIRCUIT BREAKER TRIGGERED</b> on {s1}-{s2}!\n"
+                                  f"Loss: {roi_notional*100:.2f}% of notional ({total_pnl:.2f} USDT)\n"
+                                  f"Margin: {roi_margin*100:.2f}% | Leverage: {leverage}x\n"
+                                  f"Force Closing...")
+                        print(cb_msg)
+                        reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
+                        await self._notify(cb_msg, reply_to)
+                        pair_info.close_handled = True
+                        pair_info.is_trading = True
+                        await self._execute_trade(pair_info, 0, close_reason='circuit')
+                        continue
                 
                 # === BETA DRIFT MONITORING (candle-close backup — primary is in on_ticker_update) ===
                 # Check if open position has become correlated with market
@@ -2786,13 +2964,15 @@ class PairsManager:
                         pair_info.is_trading = True
                         await self._execute_trade(pair_info, 0, close_reason='z_sl')
 
-    async def _discover_new_pairs(self, priority_only: bool = False):
+    async def _discover_new_pairs(self, priority_only: bool = False, force_full_scan: bool = False):
         """
         Finds new cointegrated pairs using parallel processing.
         """
-        mode = "PRIORITY-ONLY" if priority_only else "FULL"
+        mode = "PRIORITY-ONLY" if priority_only else ("FULL-DEEP" if force_full_scan else "FULL")
         print(f"Starting discovery process for new cointegrated pairs ({mode}, PARALLEL)...")
         start_time = time.time()
+        self._diag_discovery_runs += 1
+        self._cleanup_reject_state(start_time)
         
         ready_symbols = []
         data_snapshot = {}
@@ -2884,6 +3064,8 @@ class PairsManager:
         ready_set = set(ready_symbols)
         checked_pairs = set()
         candidates_to_process = []
+        now_discovery_ts = start_time
+        reject_cooldown_skipped = 0
 
         # Pre-filter pairs that already exist in DB to avoid duplicate discovery noise
         # and unnecessary stats/beta calculations for known pairs.
@@ -2931,6 +3113,10 @@ class PairsManager:
                         continue
 
                     if pair_set not in checked_pairs:
+                        blocked, _, _ = self._reject_block_info(pair_set, now_discovery_ts)
+                        if blocked:
+                            reject_cooldown_skipped += 1
+                            continue
                         priority_pairs.append((s1, s2))
                         checked_pairs.add(pair_set)
 
@@ -2955,6 +3141,22 @@ class PairsManager:
             if discovery_max_pairs < 0:
                 discovery_max_pairs = 0
 
+            if force_full_scan:
+                deep_scan_cap = int(
+                    getattr(
+                        self.config,
+                        'stagnation_full_scan_max_pairs',
+                        max(20000, discovery_max_pairs if discovery_max_pairs > 0 else 0),
+                    ) or max(20000, discovery_max_pairs if discovery_max_pairs > 0 else 0)
+                )
+                discovery_shards = 1
+                if deep_scan_cap > 0:
+                    discovery_max_pairs = max(deep_scan_cap, discovery_max_pairs)
+                print(
+                    f"🧭 Deep scan mode: shards=1, non-priority cap="
+                    f"{discovery_max_pairs if discovery_max_pairs > 0 else 'unlimited'}"
+                )
+
             round_idx = int(getattr(self, '_discovery_round_idx', 0) or 0)
             shard_idx = round_idx % discovery_shards
             self._discovery_round_idx = round_idx + 1
@@ -2972,6 +3174,10 @@ class PairsManager:
                     continue
                 pair_set = frozenset(p)
                 if pair_set not in self.active_pairs and pair_set not in checked_pairs:
+                    blocked, _, _ = self._reject_block_info(pair_set, now_discovery_ts)
+                    if blocked:
+                        reject_cooldown_skipped += 1
+                        continue
                     candidates_to_process.append(p)
                     added_count += 1
                     if discovery_max_pairs > 0 and added_count >= discovery_max_pairs:
@@ -2982,6 +3188,8 @@ class PairsManager:
                 
         total_pairs = len(candidates_to_process)
         print(f"Total pairs to check: {total_pairs} (Priority: {len(priority_pairs)}, Others: {added_count})")
+        if reject_cooldown_skipped:
+            print(f"⏭️ Discovery anti-repeat: skipped {reject_cooldown_skipped} pairs on temporary reject cooldown.")
         if truncated_by_cap:
             print("⚡ Discovery non-priority list truncated by cap for this cycle.")
         
@@ -3076,6 +3284,7 @@ class PairsManager:
                     )
                     if not test_mode and not btc_ready:
                         print(f"⚠️ {s1}-{s2} deferred at discovery: BTCUSDT history is not ready for beta check")
+                        self._record_discovery_reject(s1, s2, 'beta_data_not_ready')
                         try:
                             await db.archive_pair(new_pair.id, reason='beta_data_not_ready')
                         except Exception:
@@ -3099,6 +3308,7 @@ class PairsManager:
                     # Reject pair if beta is too high (skip in test_mode)
                     if not test_mode and not np.isnan(beta_btc) and abs(beta_btc) >= beta_threshold:
                         print(f"⚠️ {s1}-{s2} REJECTED at discovery: |beta|={abs(beta_btc):.3f} >= {beta_threshold}")
+                        self._record_discovery_reject(s1, s2, 'beta_rejected')
                         try:
                             await db.log_pair_history_event(
                                 symbol1=s1,
@@ -3124,6 +3334,7 @@ class PairsManager:
                         print(f"🧪 TEST MODE: {s1}-{s2} |beta|={abs(beta_btc):.3f} >= {beta_threshold} - ALLOWED for testing")
                     
                     print(f"✅ FOUND: {s1}-{s2} | HL: {hl:.2f}, P: {pval:.4f}, Beta: {beta_btc:.3f}, Hedge: {hedge:.4f}")
+                    self._clear_reject_state(s1, s2)
                     try:
                         await db.log_pair_history_event(
                             symbol1=s1,
@@ -3150,6 +3361,16 @@ class PairsManager:
                     pair_info.beta_btc = beta_btc
                     pair_info.discovered_at = time.time()  # Track when pair was discovered
                     pair_info.last_pvalue = pval if not np.isnan(pval) else 0.0
+                    # Seed streak from loaded history so restart does not bias coint phase to 0/1 bar.
+                    min_streak = int(getattr(self.config, 'coint_stability_min_bars', 2) or 2)
+                    seed_lookback = max(6, min_streak + 2)
+                    seeded_streak, seeded_eval_ts = self._estimate_coint_streak_from_history(
+                        pair_info, max_recent_bars=seed_lookback
+                    )
+                    if seeded_streak > 0:
+                        pair_info.coint_streak_bars = int(seeded_streak)
+                    if seeded_eval_ts > 0:
+                        pair_info._last_coint_eval_ts = int(seeded_eval_ts)
                     self._update_quality_score_cache(pair_info)
                     self.active_pairs[pair_set] = pair_info
                     self._register_pair(pair_info)
@@ -3200,6 +3421,9 @@ class PairsManager:
 
         elapsed = time.time() - start_time
         print(f"Discovery process finished in {elapsed:.2f}s. Found {new_pairs_count} new pairs.")
+        self._diag_discovery_new_pairs += int(new_pairs_count)
+        if new_pairs_count > 0:
+            self._last_pair_found_ts = time.time()
         # Keep priority file fresh in background (throttled internally).
         self.loop.create_task(self._refresh_best_pairs(force=False, reason='post_discovery'))
 
@@ -3433,6 +3657,65 @@ class PairsManager:
         except Exception as e:
             print(f"⚠️ Failed to set leverage for {symbol}: {e}")
             return False
+
+    def _estimate_coint_streak_from_history(self, pair_info: PairInfo, max_recent_bars: int = 8) -> tuple[int, int]:
+        """
+        Estimate consecutive cointegration streak from already loaded historical candles.
+        Used to avoid restart bias when coint_streak would otherwise start from 0/1.
+        Returns: (streak_bars, latest_eval_ts_ms)
+        """
+        try:
+            s1, s2 = pair_info.symbol1, pair_info.symbol2
+            d1 = self.all_data.get(s1)
+            d2 = self.all_data.get(s2)
+            if not d1 or not d2:
+                return 0, 0
+
+            closes1 = list(d1.close)
+            closes2 = list(d2.close)
+            ts1 = list(d1.ts)
+            ts2 = list(d2.ts)
+            n = min(len(closes1), len(closes2), len(ts1), len(ts2))
+            need = int(self.min_data_points or 0)
+            if n < need or need <= 0:
+                return 0, 0
+
+            closes1 = closes1[-n:]
+            closes2 = closes2[-n:]
+            ts1 = ts1[-n:]
+            ts2 = ts2[-n:]
+
+            p_value_threshold = getattr(self.config, 'p_value_threshold', 0.05) or 0.05
+            max_recent = max(1, int(max_recent_bars or 1))
+            max_shift = min(max_recent - 1, n - need)
+
+            streak = 0
+            latest_eval_ts = 0
+            for shift in range(0, max_shift + 1):
+                end = n - shift
+                start = end - need
+                if start < 0:
+                    break
+
+                ts1_end = int(ts1[end - 1])
+                ts2_end = int(ts2[end - 1])
+                eval_ts = ts1_end if ts1_end == ts2_end else min(ts1_end, ts2_end)
+                if shift == 0:
+                    latest_eval_ts = eval_ts
+                if ts1_end != ts2_end:
+                    break
+
+                lp1 = np.log(np.asarray(closes1[start:end], dtype=float))
+                lp2 = np.log(np.asarray(closes2[start:end], dtype=float))
+                flag, _, _, _ = utils.calculate_cointegration(lp1, lp2, p_value_threshold, strict_hl=False)
+                if flag == 1:
+                    streak += 1
+                else:
+                    break
+
+            return int(streak), int(latest_eval_ts)
+        except Exception:
+            return 0, 0
 
     def _priority_file_path(self) -> str:
         priority_file_path = getattr(self.config, 'priority_pairs_file', 'best_pairs.json')
@@ -5880,6 +6163,26 @@ class PairsManager:
                     if abs(current_z) >= z_entry and abs(current_z) < z_entry_max and (current_z * pair_info.pending_signal > 0):
                         streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0)
                         if streak_bars < coint_stability_min_bars:
+                            # Restart-safe seed: infer streak from loaded history when runtime counters are cold.
+                            last_eval_seed = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
+                            if last_eval_seed <= 0:
+                                seed_lookback = max(6, coint_stability_min_bars + 2)
+                                seeded_streak, seeded_eval_ts = self._estimate_coint_streak_from_history(
+                                    pair_info, max_recent_bars=seed_lookback
+                                )
+                                if seeded_streak > streak_bars:
+                                    pair_info.coint_streak_bars = int(seeded_streak)
+                                    streak_bars = int(seeded_streak)
+                                if seeded_eval_ts > last_eval_seed:
+                                    pair_info._last_coint_eval_ts = int(seeded_eval_ts)
+                                    last_eval_seed = int(seeded_eval_ts)
+                                if seeded_streak > 0 and not bool(getattr(pair_info, '_coint_seeded_logged', False)):
+                                    setattr(pair_info, '_coint_seeded_logged', True)
+                                    print(
+                                        f"🔁 Seeded coint streak from history for {pair_info.symbol1}-{pair_info.symbol2}: "
+                                        f"{seeded_streak} bars (eval_ts={seeded_eval_ts})"
+                                    )
+                        if streak_bars < coint_stability_min_bars:
                             ts1 = int(self.all_data.get(pair_info.symbol1).ts[-1]) if self.all_data.get(pair_info.symbol1) and self.all_data.get(pair_info.symbol1).ts else 0
                             ts2 = int(self.all_data.get(pair_info.symbol2).ts[-1]) if self.all_data.get(pair_info.symbol2) and self.all_data.get(pair_info.symbol2).ts else 0
                             last_eval = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
@@ -5992,3 +6295,6 @@ class PairsManager:
         if self._signal_confirmation_task is None:
             self._signal_confirmation_task = self.loop.create_task(self._signal_confirmation_loop())
             print("🔄 Started real-time signal confirmation loop") 
+        if self._health_task is None:
+            self._health_task = self.loop.create_task(self._discovery_health_loop())
+            print("🧭 Started discovery health watchdog loop")
