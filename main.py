@@ -45,6 +45,28 @@ _ws_recover_lock: asyncio.Lock | None = None
 _ws_last_recover_ts: float = 0.0
 _main_kline_reload_lock: asyncio.Lock | None = None
 
+_BAD_SYMBOL_PATTERNS = (
+    'UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL',
+    'DAI', 'TUSD', 'USDP', 'FDUSD', 'USDC',
+    'EURUSDT', 'GBPUSDT',
+    '3L', '3S', '2L', '2S',
+    'LEVERAGE',
+)
+
+
+def _is_tradeable_usdt_symbol_name(symbol: str) -> bool:
+    """Unified runtime symbol filter for ws subscriptions/warmup candidates."""
+    if not isinstance(symbol, str):
+        return False
+    s = symbol.strip().upper()
+    if not s or not s.endswith('USDT'):
+        return False
+    if not s.isascii() or '_' in s or not s.isalnum():
+        return False
+    if any(pattern in s for pattern in _BAD_SYMBOL_PATTERNS):
+        return False
+    return True
+
 
 def _configure_console_encoding():
     """
@@ -407,7 +429,9 @@ async def main():
                     all_symbols[sym_obj.symbol] = sym_obj
                 except Exception:
                     continue  # Skip problematic symbols
-        print(f"Loaded {len(all_symbols)} symbols.")
+        loaded_raw_count = len(all_symbols)
+        all_symbols = {s: obj for s, obj in all_symbols.items() if _is_tradeable_usdt_symbol_name(s)}
+        print(f"Loaded {len(all_symbols)} symbols (raw: {loaded_raw_count}).")
         _mark('symbols_loaded')
         
         # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
@@ -422,7 +446,11 @@ async def main():
             valid_tickers = []
             for t in tickers:
                 sym = t.get('symbol', '')
-                if sym.endswith('USDT') and sym not in blacklist and sym in all_symbols:
+                if (
+                    _is_tradeable_usdt_symbol_name(sym)
+                    and sym not in blacklist
+                    and sym in all_symbols
+                ):
                     try:
                         vol = float(t.get('quoteVolume', 0))
                         valid_tickers.append((sym, vol))
@@ -432,6 +460,9 @@ async def main():
             # Sort by volume descending and keep top N
             valid_tickers.sort(key=lambda x: x[1], reverse=True)
             top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+            # Always keep BTCUSDT for market-beta calculations, even if blacklisted or out of top-N.
+            if 'BTCUSDT' in all_symbols:
+                top_symbols.add('BTCUSDT')
             
             # SAFETY: Always keep symbols that currently have open positions (DB or exchange)
             protected_symbols = set()
@@ -439,15 +470,20 @@ async def main():
                 db_pairs = await db.get_all_pairs()
                 for p in db_pairs:
                     if getattr(p, 'position_status', 0) != 0:
-                        protected_symbols.add(p.symbol1)
-                        protected_symbols.add(p.symbol2)
+                        s1 = str(getattr(p, 'symbol1', '') or '').strip().upper()
+                        s2 = str(getattr(p, 'symbol2', '') or '').strip().upper()
+                        if _is_tradeable_usdt_symbol_name(s1):
+                            protected_symbols.add(s1)
+                        if _is_tradeable_usdt_symbol_name(s2):
+                            protected_symbols.add(s2)
             except Exception as e:
                 print(f"Could not load protected symbols from DB: {e}")
             try:
                 exchange_positions = await client.get_position_risk()
                 for pos in exchange_positions:
-                    if abs(float(pos.get('positionAmt', 0))) > 0:
-                        protected_symbols.add(pos.get('symbol', ''))
+                    sym = str(pos.get('symbol', '') or '').strip().upper()
+                    if abs(float(pos.get('positionAmt', 0))) > 0 and _is_tradeable_usdt_symbol_name(sym):
+                        protected_symbols.add(sym)
             except Exception as e:
                 print(f"Could not load protected symbols from exchange: {e}")
             
@@ -527,6 +563,10 @@ async def load_symbols_loop():
             
             print("Refreshing market symbols...")
             new_symbols = await client.load_symbols()
+            raw_refresh_count = len(new_symbols)
+            new_symbols = {s: obj for s, obj in new_symbols.items() if _is_tradeable_usdt_symbol_name(s)}
+            if len(new_symbols) != raw_refresh_count:
+                print(f"⏭️ Refresh dropped {raw_refresh_count - len(new_symbols)} invalid symbols.")
             
             # Apply volume filter + blacklist (same as initial load in main())
             conf = await db.load_config()
@@ -538,7 +578,11 @@ async def load_symbols_loop():
                 valid_tickers = []
                 for t in tickers:
                     sym = t.get('symbol', '')
-                    if sym.endswith('USDT') and sym not in blacklist and sym in new_symbols:
+                    if (
+                        _is_tradeable_usdt_symbol_name(sym)
+                        and sym not in blacklist
+                        and sym in new_symbols
+                    ):
                         try:
                             vol = float(t.get('quoteVolume', 0))
                             valid_tickers.append((sym, vol))
@@ -546,19 +590,27 @@ async def load_symbols_loop():
                             continue
                 valid_tickers.sort(key=lambda x: x[1], reverse=True)
                 top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
+                # Always keep BTCUSDT for market-beta calculations, even if blacklisted or out of top-N.
+                if 'BTCUSDT' in new_symbols:
+                    top_symbols.add('BTCUSDT')
                 
                 # SAFETY: Preserve symbols used by active/open positions
                 protected_symbols = set()
                 if pairs_manager:
                     for pair_info in pairs_manager.active_pairs.values():
                         if getattr(pair_info, 'position_status', 0) != 0 or getattr(pair_info, 'is_trading', False):
-                            protected_symbols.add(pair_info.symbol1)
-                            protected_symbols.add(pair_info.symbol2)
+                            s1 = str(getattr(pair_info, 'symbol1', '') or '').strip().upper()
+                            s2 = str(getattr(pair_info, 'symbol2', '') or '').strip().upper()
+                            if _is_tradeable_usdt_symbol_name(s1):
+                                protected_symbols.add(s1)
+                            if _is_tradeable_usdt_symbol_name(s2):
+                                protected_symbols.add(s2)
                 try:
                     exchange_positions = await client.get_position_risk()
                     for pos in exchange_positions:
-                        if abs(float(pos.get('positionAmt', 0))) > 0:
-                            protected_symbols.add(pos.get('symbol', ''))
+                        sym = str(pos.get('symbol', '') or '').strip().upper()
+                        if abs(float(pos.get('positionAmt', 0))) > 0 and _is_tradeable_usdt_symbol_name(sym):
+                            protected_symbols.add(sym)
                 except Exception as e:
                     print(f"Could not refresh protected symbols from exchange: {e}")
                 
@@ -867,27 +919,12 @@ async def connect_ws(timeframe='1h'):
             if not s_name.endswith('USDT'): continue
             pass_filter1_count += 1
 
-        # Filter 2: ASCII only (exclude Chinese chars and weird symbols)
-        if not s_name.isascii():
+        # Filter 2: Strict symbol eligibility
+        if not _is_tradeable_usdt_symbol_name(s_name):
             continue
 
         # Filter 3: Exclude blacklist
         if s_name in FULL_BLACKLIST:
-            continue
-            
-        # Filter 4: Exclude stablecoins, USDC, leverage tokens, and special tokens
-        BAD_PATTERNS = [
-            'UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL',  # Leveraged tokens
-            'DAI', 'TUSD', 'USDP', 'FDUSD', 'USDC',  # Stablecoins
-            'EURUSDT', 'GBPUSDT',  # Fiat pairs
-            '3L', '3S', '2L', '2S',  # Leverage tokens
-            'LEVERAGE'
-        ]
-        if any(pattern in s_name for pattern in BAD_PATTERNS):
-            continue
-            
-        # Filter 5: Exclude symbols with underscore
-        if '_' in s_name:
             continue
 
         target_symbols.append(s_name)
@@ -902,11 +939,24 @@ async def connect_ws(timeframe='1h'):
     active_db_count = 0
     for p in db_pairs:
         if p.position_status != 0:  # Only add if position is open
-            if p.symbol1 not in target_symbols:
-                target_symbols.append(p.symbol1)
-            if p.symbol2 not in target_symbols:
-                target_symbols.append(p.symbol2)
+            s1 = str(getattr(p, 'symbol1', '') or '').strip().upper()
+            s2 = str(getattr(p, 'symbol2', '') or '').strip().upper()
+            if s1 in all_symbols and _is_tradeable_usdt_symbol_name(s1) and s1 not in target_symbols:
+                target_symbols.append(s1)
+            if s2 in all_symbols and _is_tradeable_usdt_symbol_name(s2) and s2 not in target_symbols:
+                target_symbols.append(s2)
             active_db_count += 1
+
+    # Startup audit: prove websocket/warmup universe contains only eligible symbols.
+    invalid_target_symbols = [s for s in target_symbols if not _is_tradeable_usdt_symbol_name(s)]
+    if invalid_target_symbols:
+        sample = ", ".join(sorted(set(invalid_target_symbols))[:10])
+        print(
+            f"⚠️ Symbol universe audit failed: {len(invalid_target_symbols)} invalid symbols in target list. "
+            f"Sample: {sample}"
+        )
+    else:
+        print(f"✅ Symbol universe audit passed: {len(target_symbols)} symbols are valid.")
             
     print(f"Subscribing to {len(target_symbols)} symbols (Filtered: {len(target_symbols) - active_db_count * 2}, DB active: {active_db_count} pairs)...")
 

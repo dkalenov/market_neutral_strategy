@@ -18,6 +18,14 @@ import math
 MAX_LEN = 500
 COINT_WINDOW = 200
 
+_BAD_SYMBOL_PATTERNS = (
+    'UPUSDT', 'DOWNUSDT', 'BEAR', 'BULL',
+    'DAI', 'TUSD', 'USDP', 'FDUSD', 'USDC',
+    'EURUSDT', 'GBPUSDT',
+    '3L', '3S', '2L', '2S',
+    'LEVERAGE',
+)
+
 # Canonical close reason mapping (used in pairs_trading and main.py)
 CLOSE_REASONS = {
     'z_tp': '\U0001F4B0 Z-Score Take Profit',
@@ -37,6 +45,20 @@ CLOSE_REASONS = {
     'manual_partial': '\U0001F464 Manual Close (1 leg)',
     'audit_fail': '\U0001F9FE Trade Audit Safety Close',
 }
+
+
+def _is_tradeable_usdt_symbol(symbol: str) -> bool:
+    """Single source of symbol eligibility for warmup/discovery/runtime subscriptions."""
+    if not isinstance(symbol, str):
+        return False
+    s = symbol.strip().upper()
+    if not s or not s.endswith('USDT'):
+        return False
+    if not s.isascii() or '_' in s or not s.isalnum():
+        return False
+    if any(pattern in s for pattern in _BAD_SYMBOL_PATTERNS):
+        return False
+    return True
 
 
 def _repair_mojibake_text(text: str) -> str:
@@ -1652,7 +1674,7 @@ class PairsManager:
                 except Exception:
                     pass
 
-    async def _close_leg_reduce_only(self, symbol: str, side: str, quantity: float) -> None:
+    async def _close_leg_reduce_only(self, symbol: str, side: str, quantity: float) -> dict | None:
         """
         Close one futures leg with reduceOnly.
         Primary path: MARKET.
@@ -1663,14 +1685,13 @@ class PairsManager:
             return
 
         try:
-            await self.client.new_order(
+            return await self.client.new_order(
                 symbol=symbol,
                 side=side,
                 type='MARKET',
                 quantity=qty,
                 reduceOnly='true'
             )
-            return
         except Exception as e:
             is_percent_price = getattr(e, 'error_code', None) == -4131 or 'PERCENT_PRICE' in str(e)
             if not is_percent_price:
@@ -1713,7 +1734,7 @@ class PairsManager:
                 if price <= 0:
                     raise RuntimeError(f"Invalid fallback price for {symbol}: {price}")
 
-                await self.client.new_order(
+                result = await self.client.new_order(
                     symbol=symbol,
                     side=side,
                     type='LIMIT',
@@ -1724,7 +1745,7 @@ class PairsManager:
                     newOrderRespType='RESULT'
                 )
                 print(f"✅ Closed {symbol} via LIMIT IOC fallback at {price}")
-                return
+                return result
             except Exception as ioc_err:
                 last_err = ioc_err
                 await asyncio.sleep(0.2)
@@ -2169,7 +2190,22 @@ class PairsManager:
         Loads historical data for specified symbols with controlled concurrency.
         Prioritizes active pairs and priority pairs.
         """
-        symbols_to_load = target_symbols if target_symbols else list(self.all_symbols.keys())
+        raw_symbols = target_symbols if target_symbols else list(self.all_symbols.keys())
+        symbols_to_load = []
+        seen_symbols = set()
+        for raw_sym in raw_symbols:
+            sym = str(raw_sym or '').strip().upper()
+            if not sym or sym in seen_symbols:
+                continue
+            if sym not in self.all_symbols:
+                continue
+            if not _is_tradeable_usdt_symbol(sym):
+                continue
+            seen_symbols.add(sym)
+            symbols_to_load.append(sym)
+        dropped_symbols = max(0, len(raw_symbols) - len(symbols_to_load))
+        if dropped_symbols:
+            print(f"⏭️ Warmup skipped {dropped_symbols} invalid/unavailable symbols.")
         #print(f"Initializing history for {len(symbols_to_load)} symbols (Concurrency: {concurrency})...")
         start_time = time.time()
         slow_history: list[tuple[float, str, int]] = []
@@ -2393,6 +2429,11 @@ class PairsManager:
         Loads historical data to initialize deques.
         """
         #print(f"Initializing history for {symbol}...")
+        symbol = str(symbol or '').strip().upper()
+        if not _is_tradeable_usdt_symbol(symbol) or symbol not in self.all_symbols:
+            print(f"⏭️ Skip history init for invalid symbol: {symbol}")
+            self.all_data.pop(symbol, None)
+            return
         try:
             t0 = time.time()
             klines = await self.client.klines(symbol, self.timeframe, limit=self.max_len)
@@ -3441,6 +3482,8 @@ class PairsManager:
             s1, s2 = [x.strip().upper() for x in pair_str.split('-', 1)]
             if not s1 or not s2:
                 continue
+            if not _is_tradeable_usdt_symbol(s1) or not _is_tradeable_usdt_symbol(s2):
+                continue
             if ready_set is not None and (s1 not in ready_set or s2 not in ready_set):
                 continue
             key = tuple(sorted((s1, s2)))
@@ -3814,17 +3857,106 @@ class PairsManager:
                 count += 1
         return count
 
+    async def _fetch_pair_live_position_amts(self, s1: str, s2: str, retries: int = 2, delay_sec: float = 0.35) -> dict | None:
+        """Read signed live position amounts for two symbols from exchange."""
+        last_err = None
+        for attempt in range(max(0, int(retries)) + 1):
+            try:
+                data = await self.client.get_position_risk()
+                out = {s1: 0.0, s2: 0.0}
+                for pos in data:
+                    sym = pos.get('symbol')
+                    if sym in out:
+                        out[sym] = float(pos.get('positionAmt', 0) or 0)
+                return out
+            except Exception as e:
+                last_err = e
+                if attempt < retries:
+                    await asyncio.sleep(max(0.05, float(delay_sec)))
+        print(f"⚠️ Could not fetch live pair positions for {s1}-{s2}: {last_err}")
+        return None
+
+    def _sync_pair_exchange_cache(self, s1: str, s2: str, live_amts: dict | None):
+        """Sync internal exchange caches from signed live amounts."""
+        if not isinstance(live_amts, dict):
+            return
+        amt1 = abs(float(live_amts.get(s1, 0.0) or 0.0))
+        amt2 = abs(float(live_amts.get(s2, 0.0) or 0.0))
+        if amt1 > 0:
+            self._exchange_positions_cache[s1] = amt1
+        else:
+            self._exchange_positions_cache.pop(s1, None)
+        if amt2 > 0:
+            self._exchange_positions_cache[s2] = amt2
+        else:
+            self._exchange_positions_cache.pop(s2, None)
+        self._exchange_position_count = len(self._exchange_positions_cache)
+
+    async def _confirm_pair_closed_on_exchange(self, pair_info: PairInfo, close_reason_tag: str) -> bool:
+        """
+        Final close gate: only allow DB/memory close when BOTH legs are actually zero on exchange.
+        """
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        live_amts = await self._fetch_pair_live_position_amts(s1, s2, retries=2, delay_sec=0.4)
+        if live_amts is None:
+            now_ts = time.time()
+            last_warn = float(getattr(pair_info, '_last_close_verify_warn_ts', 0) or 0)
+            if now_ts - last_warn >= 60:
+                pair_info._last_close_verify_warn_ts = now_ts
+                warn_msg = (
+                    f"⚠️ <b>Close verification delayed</b>: {s1}/{s2}\n"
+                    f"Tag: <code>{close_reason_tag}</code>\n"
+                    f"Could not confirm leg status from exchange, close finalization is blocked."
+                )
+                reply_to = await self._resolve_reply_to_message_id(pair_info)
+                await self._notify(warn_msg, reply_to)
+            return False
+
+        self._sync_pair_exchange_cache(s1, s2, live_amts)
+        amt1_signed = float(live_amts.get(s1, 0.0) or 0.0)
+        amt2_signed = float(live_amts.get(s2, 0.0) or 0.0)
+        amt1 = abs(amt1_signed)
+        amt2 = abs(amt2_signed)
+        if amt1 <= 0 and amt2 <= 0:
+            return True
+
+        # Keep pair OPEN in state if close did not fully complete.
+        pair_info.qty1 = amt1
+        pair_info.qty2 = amt2
+        if pair_info.position_status == 0:
+            if amt1_signed > 0 and amt2_signed < 0:
+                pair_info.position_status = 1
+            elif amt1_signed < 0 and amt2_signed > 0:
+                pair_info.position_status = -1
+            elif amt1 > 0 or amt2 > 0:
+                pair_info.position_status = 1
+
+        now_ts = time.time()
+        last_warn = float(getattr(pair_info, '_last_close_verify_warn_ts', 0) or 0)
+        detail = f"{s1}:{amt1_signed:+.8f}, {s2}:{amt2_signed:+.8f}"
+        print(f"⚠️ Close NOT finalized for {s1}-{s2} [{close_reason_tag}] -> {detail}")
+        if now_ts - last_warn >= 60:
+            pair_info._last_close_verify_warn_ts = now_ts
+            warn_msg = (
+                f"⚠️ <b>Close not finalized on exchange</b>: {s1}/{s2}\n"
+                f"Tag: <code>{close_reason_tag}</code>\n"
+                f"Remaining: <code>{detail}</code>\n"
+                f"Bot keeps pair OPEN and will retry close/sync."
+            )
+            reply_to = await self._resolve_reply_to_message_id(pair_info)
+            await self._notify(warn_msg, reply_to)
+        return False
+
     async def _refresh_exchange_position_count(self):
         """Refresh cached exchange position count from exchange API."""
         try:
-            account = await self.client.account()
+            positions_risk = await self.client.get_position_risk()
             positions = {}
-            for pos in account.get('positions', []):
+            for pos in positions_risk:
                 amt = abs(float(pos.get('positionAmt', 0)))
                 if amt > 0:
                     positions[pos['symbol']] = amt
             self._exchange_positions_cache = positions
-            # Count pairs: each pair = 2 positions, so positions / 2 = pairs
             self._exchange_position_count = len(positions)
             return len(positions)
         except Exception as e:
@@ -3915,7 +4047,9 @@ class PairsManager:
                         pair_info.is_trading = False
                         return
                 except Exception as e:
-                    print(f"⚠️ Could not verify exchange positions: {e}. Proceeding with local check only.")
+                    print(f"⚠️ Could not verify exchange positions: {e}. Blocking trade open for safety.")
+                    pair_info.is_trading = False
+                    return
                 
                 # Mark as opening INSIDE lock — only set is_trading flag.
                 # position_status is set AFTER successful order execution to prevent phantom state.
@@ -4016,6 +4150,10 @@ class PairsManager:
                         )
                     except Exception as e:
                         print(f"⚠️ Cancel orders error: {e}")
+
+                    # Exchange is source of truth: finalize close only after both legs are really zero.
+                    if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                        return
                 
                     # === PnL CALCULATION & NOTIFICATION for hardware close ===
                     # Save values BEFORE zeroing state (needed for PnL calc & notification)
@@ -4299,9 +4437,15 @@ class PairsManager:
                         print(err_msg)
                         await self._notify(err_msg)
                     else:
+                        # Exchange is source of truth: finalize close only after both legs are really zero.
+                        if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                            return
+
                         reason_text = CLOSE_REASONS.get(close_reason_tag, '\u2753 Unknown')
                     
                         def get_price(order):
+                            if not isinstance(order, dict):
+                                return 0.0
                             if 'avgPrice' in order and float(order['avgPrice']) > 0:
                                 return float(order['avgPrice'])
                             if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:
@@ -4546,36 +4690,43 @@ class PairsManager:
                         
                 except Exception as e:
                     print(f"FATAL ERROR closing position for {s1}-{s2}: {e}")
-                    # Ensure state cleanup even on error — position IS closed on exchange
+                    # Conservative path: finalize close only if exchange confirms both legs are zero.
                     try:
-                        if pair_info.current_trade_id:
-                            try:
-                                await db.close_trade_record(
-                                    pair_info.current_trade_id,
-                                    status='CLOSED_ERROR',
-                                    close_reason=close_reason_tag,
-                                )
-                                pair_info.current_trade_id = None
-                            except Exception as trade_close_err:
-                                print(f"⚠️ Failed to mark trade CLOSED_ERROR for {s1}-{s2}: {trade_close_err}")
-                        pair_info.position_status = 0
-                        pair_info.qty1 = 0
-                        pair_info.qty2 = 0
-                        pair_info.entry_price1 = 0
-                        pair_info.entry_price2 = 0
-                        pair_info.close_handled = True
-                        pair_info.last_close_reason = close_reason_tag
-                        self._apply_close_cooldown(pair_info, close_reason_tag)
-                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
-                        self._exchange_positions_cache.pop(s1, None)
-                        self._exchange_positions_cache.pop(s2, None)
-                        self._exchange_position_count = len(self._exchange_positions_cache)
-                        # Send error notification to TG
-                        err_msg = (
-                            f"⚠️ Close error {s1}-{s2} [tag={close_reason_tag}]: "
-                            f"{type(e).__name__}: {e}\n"
-                            f"Position closed on exchange but notification failed."
-                        )
+                        close_confirmed = await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag)
+                        if close_confirmed:
+                            if pair_info.current_trade_id:
+                                try:
+                                    await db.close_trade_record(
+                                        pair_info.current_trade_id,
+                                        status='CLOSED_ERROR',
+                                        close_reason=close_reason_tag,
+                                    )
+                                    pair_info.current_trade_id = None
+                                except Exception as trade_close_err:
+                                    print(f"⚠️ Failed to mark trade CLOSED_ERROR for {s1}-{s2}: {trade_close_err}")
+                            pair_info.position_status = 0
+                            pair_info.qty1 = 0
+                            pair_info.qty2 = 0
+                            pair_info.entry_price1 = 0
+                            pair_info.entry_price2 = 0
+                            pair_info.close_handled = True
+                            pair_info.last_close_reason = close_reason_tag
+                            self._apply_close_cooldown(pair_info, close_reason_tag)
+                            self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
+                            self._exchange_positions_cache.pop(s1, None)
+                            self._exchange_positions_cache.pop(s2, None)
+                            self._exchange_position_count = len(self._exchange_positions_cache)
+                            err_msg = (
+                                f"⚠️ Close error {s1}-{s2} [tag={close_reason_tag}]: "
+                                f"{type(e).__name__}: {e}\n"
+                                f"Position is closed on exchange, state saved as CLOSED_ERROR."
+                            )
+                        else:
+                            err_msg = (
+                                f"⚠️ Close flow failed {s1}-{s2} [tag={close_reason_tag}]: "
+                                f"{type(e).__name__}: {e}\n"
+                                f"Pair remains OPEN until exchange confirms full close."
+                            )
                         reply_to = await self._resolve_reply_to_message_id(pair_info)
                         await self._notify(err_msg, reply_to)
                     except Exception:
@@ -4989,6 +5140,8 @@ class PairsManager:
                     self._exchange_position_count = len(self._exchange_positions_cache)
                 
                     def get_price(order):
+                        if not isinstance(order, dict):
+                            return 0.0
                         if 'avgPrice' in order and float(order['avgPrice']) > 0:
                             return float(order['avgPrice'])
                         if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:

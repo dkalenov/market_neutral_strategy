@@ -3,6 +3,7 @@ import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint
 import math
+import warnings
 
 CAPITAL = 1_000_000.0
 MAX_NOTIONAL_PER_PAIR = 0.1
@@ -54,8 +55,15 @@ def calculate_half_life(spread):
             return np.nan
         spread_lag = s.shift(1).iloc[1:]
         delta = (s - s.shift(1)).iloc[1:]
+        lag_vals = spread_lag.to_numpy(dtype=float)
+        delta_vals = delta.to_numpy(dtype=float)
+        # Degenerate series can trigger statsmodels divide-by-zero warnings.
+        if np.nanstd(lag_vals) < 1e-12 or np.nanstd(delta_vals) < 1e-12:
+            return np.nan
         X = sm.add_constant(spread_lag)
-        res = sm.OLS(delta, X).fit()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            res = sm.OLS(delta, X).fit()
         b = safe_get_slope(res.params)
         if np.isnan(b):
             return np.nan
@@ -80,15 +88,29 @@ def calculate_cointegration(log1, log2, p_value_threshold: float = 0.05, strict_
     """
     safe_p_value = np.nan
     try:
-        coint_t, p_value, crit_vals = coint(log1, log2)
+        arr1 = np.asarray(log1, dtype=float)
+        arr2 = np.asarray(log2, dtype=float)
+        if len(arr1) < 10 or len(arr2) < 10:
+            return 0, np.nan, np.nan, safe_p_value
+        if not np.all(np.isfinite(arr1)) or not np.all(np.isfinite(arr2)):
+            return 0, np.nan, np.nan, safe_p_value
+        # Flat inputs cause unstable regression stats and noisy warnings.
+        if np.nanstd(arr1) < 1e-12 or np.nanstd(arr2) < 1e-12:
+            return 0, np.nan, np.nan, safe_p_value
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            coint_t, p_value, crit_vals = coint(arr1, arr2)
         safe_p_value = float(p_value)
-        X = sm.add_constant(log2)
-        model = sm.OLS(log1, X).fit()
+        X = sm.add_constant(arr2)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            model = sm.OLS(arr1, X).fit()
         hedge = safe_get_slope(model.params)
         if np.isnan(hedge):
             return 0, np.nan, np.nan, safe_p_value
 
-        spread = log1 - hedge * log2
+        spread = arr1 - hedge * arr2
         hl = calculate_half_life(spread)
 
         try:
