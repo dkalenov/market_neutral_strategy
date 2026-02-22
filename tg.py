@@ -645,7 +645,7 @@ async def set_beta_critical_risk_cb(callback: CallbackQuery, state: FSMContext):
 async def set_max_symbols_cb(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="max_symbols")
-    await answer(callback, "Enter maximum number of symbols by volume (50-300, e.g., 150):\n\n⚠️ Requires restart to take effect.")
+    await answer(callback, "Enter maximum number of symbols by volume (min 2, e.g., 300):\n\n⚠️ Requires restart to take effect.")
 
 @dp.callback_query(F.data == "set_max_idle")
 async def set_max_idle_cb(callback: CallbackQuery, state: FSMContext):
@@ -920,32 +920,32 @@ async def process_strategy_settings(message: Message, state: FSMContext):
 
         elif waiting_for == "max_active_pairs":
             val = int(value)
-            if val < 1 or val > 100:
-                await answer(message, "Value must be between 1 and 100.")
+            if val < 1:
+                await answer(message, "Value must be >= 1.")
                 return
             await db.config_update(max_active_pairs=val)
             await answer(message, f"Max Active Pairs: <b>{val}</b>")
 
         elif waiting_for == "beta_threshold":
             val = float(value)
-            if val <= 0 or val > 5:
-                await answer(message, "Value must be between 0 and 5.")
+            if val <= 0:
+                await answer(message, "Value must be > 0.")
                 return
             await db.config_update(beta_threshold=val)
             await answer(message, f"β Entry Filter: <b>{val}</b>")
 
         elif waiting_for == "beta_alert_threshold":
             val = float(value)
-            if val <= 0 or val > 5:
-                await answer(message, "Value must be between 0 and 5.")
+            if val <= 0:
+                await answer(message, "Value must be > 0.")
                 return
             await db.config_update(beta_alert_threshold=val)
             await answer(message, f"β Alert Threshold: <b>{val}</b>")
 
         elif waiting_for == "beta_critical":
             val = float(value)
-            if val <= 0 or val > 10:
-                await answer(message, "Value must be between 0 and 10.")
+            if val <= 0:
+                await answer(message, "Value must be > 0.")
                 return
             await db.config_update(beta_critical=val)
             await answer(message, f"β Critical: <b>{val}</b>")
@@ -977,16 +977,16 @@ async def process_strategy_settings(message: Message, state: FSMContext):
 
         elif waiting_for == "coint_stability_min_bars":
             val = int(value)
-            if val < 1 or val > 50:
-                await answer(message, "Value must be between 1 and 50.")
+            if val < 1:
+                await answer(message, "Value must be >= 1.")
                 return
             await db.config_update(coint_stability_min_bars=val)
             await answer(message, f"Coint stability min bars: <b>{val}</b>")
 
         elif waiting_for == "max_order_bump":
             val = float(value)
-            if val < 1 or val > 10:
-                await answer(message, "Value must be between 1 and 10.")
+            if val < 1:
+                await answer(message, "Value must be >= 1.")
                 return
             await db.config_update(max_order_bump=val)
             await answer(message, f"Max Order Bump: <b>{val}x</b>")
@@ -999,8 +999,8 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             min_days = float(parts[0])
             max_days = float(parts[1])
-            if min_days < 0.5 or max_days < min_days or max_days > 30:
-                await answer(message, "Error: min must be ≥0.5, max ≥ min, max ≤30")
+            if min_days < 0 or max_days < min_days:
+                await answer(message, "Error: min must be >= 0, max must be >= min")
                 return
             await db.config_update(hl_min_days=min_days, hl_max_days=max_days)
             await answer(message, f"⏱️ Half-Life: <b>{min_days}-{max_days} days</b>")
@@ -1013,32 +1013,32 @@ async def process_strategy_settings(message: Message, state: FSMContext):
                 return
             h_min = float(parts[0])
             h_max = float(parts[1])
-            if h_min < 0.05 or h_max < h_min or h_max > 10.0:
-                await answer(message, "Error: min ≥0.05, max ≥ min, max ≤10.0")
+            if h_min < 0 or h_max < h_min:
+                await answer(message, "Error: min must be >= 0, max must be >= min")
                 return
             await db.config_update(hedge_min=h_min, hedge_max=h_max)
             await answer(message, f"⚖️ Hedge Bounds: <b>{h_min}-{h_max}</b>")
         
         elif waiting_for == "max_symbols":
             val = int(value)
-            if val < 50 or val > 300:
-                await answer(message, "Value must be between 50 and 300.")
+            if val < 2:
+                await answer(message, "Value must be >= 2 (need at least 2 symbols to form a pair).")
                 return
             await db.config_update(max_symbols=val)
             await answer(message, f"📈 Max Symbols: <b>{val}</b>\n⚠️ Requires restart to take effect.")
         
         elif waiting_for == "max_idle_pairs":
             val = int(value)
-            if val < 10 or val > 500:
-                await answer(message, "Value must be between 10 and 500.")
+            if val < 1:
+                await answer(message, "Value must be >= 1.")
                 return
             await db.config_update(max_idle_pairs=val)
             await answer(message, f"🗑️ Max Idle Pairs: <b>{val}</b>")
         
         elif waiting_for == "idle_timeout_hours":
             val = float(value)
-            if val < 1 or val > 168:  # 1 hour to 1 week
-                await answer(message, "Value must be between 1 and 168 hours.")
+            if val < 0.1:
+                await answer(message, "Value must be >= 0.1 hours.")
                 return
             await db.config_update(idle_timeout_hours=val)
             await answer(message, f"⏰ Idle Timeout: <b>{val}h</b>")
