@@ -3014,6 +3014,11 @@ class PairsManager:
             dropped_symbols = []
             for s in ready_symbols:
                 sinfo = self.all_symbols.get(s)
+                # FIX: If symbol is not in all_symbols, it has no step_size/tick_size
+                # and cannot be traded → drop from discovery to prevent 'Symbol info not found' errors.
+                if sinfo is None:
+                    dropped_symbols.append((s, 0.0, 0.0))
+                    continue
                 min_notional = float(getattr(sinfo, 'notional', 0.0) or 0.0)
                 # Same safety margin as in execution path.
                 required_min = min_notional * 1.1
@@ -3030,17 +3035,27 @@ class PairsManager:
                     filtered_ready.append(s)
 
             if dropped_symbols:
-                print(
-                    f"⛔ Discovery prefilter: dropped {len(dropped_symbols)} symbols by minNotional "
-                    f"(max leg ${max_leg_notional:.2f}, bump<= {max_order_bump}x)"
-                )
-                for s, required_min, min_viable in dropped_symbols[:20]:
+                not_in_syms = [(s, r, v) for s, r, v in dropped_symbols if r == 0.0 and v == 0.0]
+                notional_drops = [(s, r, v) for s, r, v in dropped_symbols if not (r == 0.0 and v == 0.0)]
+                if not_in_syms:
                     print(
-                        f"  - {s}: min_required=${required_min:.2f}, "
-                        f"min_viable_calc=${min_viable:.2f} > max_leg=${max_leg_notional:.2f}"
+                        f"⛔ Discovery prefilter: dropped {len(not_in_syms)} symbols "
+                        f"not found in all_symbols (no step_size/tick_size info): "
+                        f"{', '.join(s for s, _, _ in not_in_syms[:10])}"
+                        + (f" and {len(not_in_syms)-10} more" if len(not_in_syms) > 10 else "")
                     )
-                if len(dropped_symbols) > 20:
-                    print(f"  ... and {len(dropped_symbols) - 20} more symbols")
+                if notional_drops:
+                    print(
+                        f"⛔ Discovery prefilter: dropped {len(notional_drops)} symbols by minNotional "
+                        f"(max leg ${max_leg_notional:.2f}, bump<= {max_order_bump}x)"
+                    )
+                    for s, required_min, min_viable in notional_drops[:20]:
+                        print(
+                            f"  - {s}: min_required=${required_min:.2f}, "
+                            f"min_viable_calc=${min_viable:.2f} > max_leg=${max_leg_notional:.2f}"
+                        )
+                    if len(notional_drops) > 20:
+                        print(f"  ... and {len(notional_drops) - 20} more symbols")
 
             # Fail-safe: if filter is too aggressive, keep original universe.
             # Better to spend extra CPU than silently run with zero candidates.
@@ -5021,8 +5036,19 @@ class PairsManager:
             s2_info = self.all_symbols.get(s2)
 
             if not s1_info or not s2_info:
-                print(f"ERROR: Symbol info not found for {s1} or {s2}")
-                pair_info.position_status = 0
+                missing = s1 if not s1_info else s2
+                print(
+                    f"⛔ Symbol info not found for {missing} (not in all_symbols). "
+                    f"Pair {s1}-{s2} skipped. Will retry after next symbol refresh."
+                )
+                # Do NOT touch position_status (pair is idle, not open).
+                # Apply a cooldown so the pair doesn't spam entry attempts
+                # until all_symbols is refreshed (every ~1h in load_symbols_loop).
+                pair_info.is_trading = False
+                pair_info.pending_signal = None
+                pair_info.pending_since = None
+                pair_info.pending_source = ''
+                pair_info._leverage_fail_until = time.time() + 900  # 15-min cooldown
                 return
 
             try:
