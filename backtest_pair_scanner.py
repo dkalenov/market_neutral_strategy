@@ -856,6 +856,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--notional-pct",   type=float, default=None)
     p.add_argument("--hold-multiplier", type=float, default=None)
     p.add_argument("--coint-min-bars", type=int,   default=None)
+    p.add_argument("--signal-confirm-sec", type=int, default=None,
+                   help="Signal confirmation in seconds (4h: 14400=1 bar, 28800=2 bars).")
     p.add_argument("--recompute",      type=int,   default=None,
                    help="Recalculate engine cointegration every N bars (e.g. 6 = 24h).")
 
@@ -970,6 +972,7 @@ def main() -> None:
     if args.output_dir is not None:     cfg["output_dir"] = args.output_dir
     if args.hold_multiplier is not None: cfg["hold_multiplier"] = args.hold_multiplier
     if args.coint_min_bars is not None: cfg["coint_stability_min_bars"] = args.coint_min_bars
+    if args.signal_confirm_sec is not None: cfg["signal_confirm_sec"] = max(0, int(args.signal_confirm_sec))
     if args.min_trades is not None:     cfg["min_trades"] = args.min_trades
     if args.scan_workers is not None:   cfg["scan_workers"] = args.scan_workers
     if args.scan_inflight_per_worker is not None:
@@ -1093,7 +1096,8 @@ def main() -> None:
     for k in ["z_entry", "z_entry_max", "z_exit", "z_stop", "window_size",
               "max_notional_pct", "capital", "hold_multiplier", "max_hold_days",
               "p_value_threshold", "hedge_min", "hedge_max", "beta_threshold",
-              "beta_critical", "coint_stability_min_bars", "hl_min_days", "hl_max_days",
+              "beta_critical", "coint_stability_min_bars", "signal_confirm_sec",
+              "hl_min_days", "hl_max_days",
               "commission_rate", "slippage_rate", "circuit_breaker_pct"]:
         print(f"    {k:<30} = {cfg[k]}")
     print(f"    {'scan_workers':<30} = {cfg['scan_workers']}")
