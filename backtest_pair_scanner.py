@@ -53,6 +53,7 @@ import warnings
 from collections import Counter
 from itertools import combinations
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -88,9 +89,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "max_notional_pct": 0.30,
 
     # ── Z-Score thresholds ────────────────────────────────────────────────────
-    "z_entry":         1.5,
-    "z_entry_max":     3.0,
-    "z_exit":          0.0,
+    "z_entry":         1.8,
+    "z_entry_max":     2.5,
+    "z_exit":          0.05,
     "z_stop":          4.0,
 
     # ── Costs ─────────────────────────────────────────────────────────────────
@@ -98,21 +99,21 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "slippage_rate":    0.0005,
 
     # ── Cointegration quality ─────────────────────────────────────────────────
-    "p_value_threshold":  0.08,  # coarse scan: wider coint filter
-    "hedge_min":          0.25,
-    "hedge_max":          4.0,
+    "p_value_threshold":  0.05,
+    "hedge_min":          0.3,
+    "hedge_max":          3.0,
 
     # ── Beta (BTC neutrality) ─────────────────────────────────────────────────
-    "beta_threshold":       0.18,
-    "beta_alert_threshold": 0.40,
-    "beta_critical":        1.2,
+    "beta_threshold":       0.11,
+    "beta_alert_threshold": 0.30,
+    "beta_critical":        1.0,
 
     # ── Circuit breaker ───────────────────────────────────────────────────────
     "circuit_breaker_pct":  0.50,
 
     # ── Entry confirmation & hold ─────────────────────────────────────────────
     "signal_confirm_sec":    10,
-    "coint_stability_min_bars": 0,
+    "coint_stability_min_bars": 1,
     "entry_et_target_abs_z": 0.5,
     "hold_multiplier":       3.0,
     "max_hold_days":         12.0,
@@ -122,8 +123,8 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "close_retry_cooldown_sec": 30,
 
     # ── Half-life bounds ──────────────────────────────────────────────────────
-    "hl_min_days": 0.25,
-    "hl_max_days": 8.0,
+    "hl_min_days": 0.5,
+    "hl_max_days": 4.0,
 
     # ── Window ────────────────────────────────────────────────────────────────
     "window_size":         180,
@@ -135,17 +136,13 @@ DEFAULT_PARAMS: dict[str, Any] = {
     #
     # Диапазон пар: None=весь рынок (0..53301),  или строка "27500-53301"
     # Твой ПК (40%): "27500-53301"  |  MacBook M2 (60%): None
-    "pair_range":          "27500-28500", #"27500-53301",
+    "pair_range":          None,  # None = scan all pairs from --from-pairs JSON (set range only for brute all-combos scan)
 
     # Воркеры: Windows=12, MacBook M2=8, Colab=2
-    "scan_workers":        8,
-    # Keep queue depth moderate to reduce IPC pressure on long scans.
-    "scan_inflight_per_worker": 3,
-    # Recycle worker process after N pairs to avoid long-run memory bloat (0=off).
-    "scan_max_tasks_per_child": 80,
+    "scan_workers":        1,
 
     # Точность: 1=максимальная (медленно), 6=быстрый фильтр (~90% точности)
-    "recompute":           6,
+    "recompute":           1,
 
     # Шаг 2 (точный скан по лучшим парам из грубого фильтра):
     # None = сканировать все пары,  или путь к best_pairs_backtest.json
@@ -155,7 +152,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     # CSV котировок: None = автопоиск в market_neutral/
     "input_file":          None,
 
-    "min_trades":          1,     # min trades to qualify
+    "min_trades":          3,     # min trades to qualify
     "top_n":               9000,  # how many pairs to export
 
     # ── Hyperopt ──────────────────────────────────────────────────────────────
@@ -177,21 +174,21 @@ def _cfg_to_params_dict(cfg: dict) -> dict:
         "capital":                    float(cfg.get("capital", 1_000_000)),
         "leverage":                   int(cfg.get("leverage", 20)),
         "max_notional_pct":           float(cfg.get("max_notional_pct", 0.30)),
-        "z_entry":                    float(cfg.get("z_entry", 1.5)),
-        "z_entry_max":                float(cfg.get("z_entry_max", 3.0)),
-        "z_exit":                     float(cfg.get("z_exit", 0.0)),
+        "z_entry":                    float(cfg.get("z_entry", 1.8)),
+        "z_entry_max":                float(cfg.get("z_entry_max", 2.8)),
+        "z_exit":                     float(cfg.get("z_exit", 0.25)),
         "z_stop":                     float(cfg.get("z_stop", 4.0)),
         "commission_rate":            float(cfg.get("commission_rate", 0.0004)),
         "slippage_rate":              float(cfg.get("slippage_rate", 0.0005)),
-        "p_value_threshold":          float(cfg.get("p_value_threshold", 0.08)),
-        "hedge_min":                  float(cfg.get("hedge_min", 0.25)),
-        "hedge_max":                  float(cfg.get("hedge_max", 4.0)),
-        "beta_threshold":             float(cfg.get("beta_threshold", 0.18)),
-        "beta_alert_threshold":       float(cfg.get("beta_alert_threshold", 0.40)),
-        "beta_critical":              float(cfg.get("beta_critical", 1.2)),
+        "p_value_threshold":          float(cfg.get("p_value_threshold", 0.05)),
+        "hedge_min":                  float(cfg.get("hedge_min", 0.3)),
+        "hedge_max":                  float(cfg.get("hedge_max", 3.0)),
+        "beta_threshold":             float(cfg.get("beta_threshold", 0.11)),
+        "beta_alert_threshold":       float(cfg.get("beta_alert_threshold", 0.30)),
+        "beta_critical":              float(cfg.get("beta_critical", 1.0)),
         "circuit_breaker_pct":        float(cfg.get("circuit_breaker_pct", 0.50)),
         "signal_confirm_sec":         int(cfg.get("signal_confirm_sec", 10)),
-        "coint_stability_min_bars":   int(cfg.get("coint_stability_min_bars", 0)),
+        "coint_stability_min_bars":   int(cfg.get("coint_stability_min_bars", 1)),
         "entry_et_target_abs_z":      float(cfg.get("entry_et_target_abs_z", 0.5)),
         "hold_multiplier":            float(cfg.get("hold_multiplier", 3.0)),
         "max_hold_days":              float(cfg.get("max_hold_days", 12.0)),
@@ -206,7 +203,7 @@ def _cfg_to_params_dict(cfg: dict) -> dict:
         "top_pairs_limit":            1,
         "progress_every_bars":        0,   # silent
         "hl_min_days":                float(cfg.get("hl_min_days", 0.25)),
-        "hl_max_days":                float(cfg.get("hl_max_days", 8.0)),
+        "hl_max_days":                float(cfg.get("hl_max_days", 2.0)),
     }
 
 
@@ -216,7 +213,6 @@ def _cfg_to_params_dict(cfg: dict) -> dict:
 
 # Worker-local market data (populated once via initializer)
 _SCAN_MARKET: MarketData | None = None
-_SCAN_TASKS_DONE: int = 0
 
 
 def _scan_worker_init(
@@ -230,7 +226,7 @@ def _scan_worker_init(
     """Called once per worker process.  Reconstructs MarketData from raw bytes.
     We serialize numpy arrays as bytes to avoid pickling issues on Windows.
     """
-    global _SCAN_MARKET, _SCAN_TASKS_DONE
+    global _SCAN_MARKET
     n_bars, n_syms = shape
     # Reconstruct dates from int64 nanosecond timestamps
     dates_arr = np.frombuffer(dates_bytes, dtype=np.int64)[:dates_len].copy()
@@ -247,7 +243,6 @@ def _scan_worker_init(
         close_arr=all_data[3],
         volume_arr=all_data[4],
     )
-    _SCAN_TASKS_DONE = 0
 
 
 def _prepare_market_init_args(market: MarketData) -> tuple:
@@ -270,14 +265,15 @@ def _scan_one_pair(args: tuple) -> dict | None:
     """Worker: run full BotParityBacktester for a single pair.
     Returns per-pair metrics dict or None if insufficient data/trades.
     """
-    global _SCAN_TASKS_DONE
-    sym_a, sym_b, params_dict, recompute_bars = args
+    sym_a, sym_b, params_dict = args
     market = _SCAN_MARKET
     if market is None:
         return None
     if sym_a not in market.symbol_to_idx or sym_b not in market.symbol_to_idx:
         return None
     try:
+        params_dict = dict(params_dict)  # copy so we don't mutate the original
+        recompute_bars = params_dict.pop("recompute_bars", 1)
         params = BacktestParams(**params_dict)
 
         candidate = CandidatePair(symbol1=sym_a, symbol2=sym_b, score=1.0, source="scanner")
@@ -290,10 +286,7 @@ def _scan_one_pair(args: tuple) -> dict | None:
             coint_recompute_every=recompute_bars,
         )
         result = bt.run()
-        m = dict(result.metrics)
-        # Scanner only needs metrics; release heavy tables ASAP.
-        del result
-        del bt
+        m = result.metrics
 
         total_trades = int(m.get("total_trades", 0))
         if total_trades < 1:
@@ -327,12 +320,6 @@ def _scan_one_pair(args: tuple) -> dict | None:
         }
     except Exception:
         return None
-    finally:
-        _SCAN_TASKS_DONE += 1
-        # Periodic GC inside worker limits long-run RSS growth.
-        if _SCAN_TASKS_DONE % 25 == 0:
-            import gc
-            gc.collect()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -340,16 +327,25 @@ def _scan_one_pair(args: tuple) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_one_pair_direct(
-    market: MarketData, sym_a: str, sym_b: str, params_dict: dict
+    market: MarketData, sym_a: str, sym_b: str, params_dict: dict,
+    recompute_bars: int = 4,
 ) -> dict | None:
-    """Run a single pair backtest directly (no subprocess)."""
+    """Run a single pair backtest directly (no subprocess).
+
+    recompute_bars controls cointegration recalculation cadence:
+      1 = every bar (slowest, most accurate)
+      4 = every 4 bars  ← default for hyperopt (4x faster, ranks params equally well)
+      6 = every 6 bars  ← fast filter mode
+    """
     if sym_a not in market.symbol_to_idx or sym_b not in market.symbol_to_idx:
         return None
     try:
         params = BacktestParams(**params_dict)
         candidate = CandidatePair(symbol1=sym_a, symbol2=sym_b, score=1.0, source="scanner")
         bt = BotParityBacktester(
-            market=market, params=params, candidates=[candidate], n_workers=1, exact_mode=True,
+            market=market, params=params, candidates=[candidate], n_workers=1,
+            exact_mode=False,              # hyperopt: use recompute cadence, not every-bar
+            coint_recompute_every=max(1, int(recompute_bars)),
         )
         result = bt.run()
         m = result.metrics
@@ -421,6 +417,113 @@ def compute_pair_score(row: dict, min_trades: int = 3) -> float:
 # Hyperopt (optimizes params on a sample of pairs)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_HYPEROPT_PARAM_KEYS = [
+    "z_entry", "z_entry_max", "z_exit", "z_stop",
+    "max_notional_pct", "circuit_breaker_pct", "beta_threshold",
+    "beta_alert_threshold", "beta_critical",
+    "coint_stability_min_bars", "hold_multiplier", "max_hold_days",
+    "hedge_min", "hedge_max", "hl_min_days", "hl_max_days",
+    "p_value_threshold",
+]
+
+
+def _hyperopt_eval_batch(
+    init_args: tuple,
+    sample: list[tuple[str, str]],
+    params_dict: dict,
+    n_workers: int,
+    recompute_bars: int = 4,
+) -> list[dict]:
+    """Evaluate a batch of pairs in parallel using existing worker pool."""
+    params_dict = dict(params_dict)
+    params_dict["recompute_bars"] = recompute_bars
+    tasks = [(a, b, params_dict) for a, b in sample]
+
+    if n_workers <= 1:
+        # Fallback: sequential (for debugging or single-core machines)
+        results = [_scan_one_pair(t) for t in tasks]
+    else:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_scan_worker_init,
+            initargs=init_args,
+        ) as pool:
+            results = list(pool.map(_scan_one_pair, tasks, chunksize=max(1, len(tasks) // n_workers)))
+
+    return [r for r in results if r is not None and r.get("trades", 0) >= 1]
+
+
+def _save_hyperopt_best_params(history: list[dict], seed: int, out_dir: Path) -> None:
+    """Save JSON with the best trial's parameters (overwritten when a new best appears)."""
+    best_row = max(history, key=lambda r: r.get("objective", -99))
+    best_params_out = {
+        "seed": seed,
+        "best_trial":   best_row["trial"],
+        "objective":    best_row["objective"],
+        "avg_score":    best_row["avg_score"],
+        "active_pairs": best_row["active_pairs"],
+        "total_trades": best_row["total_trades"],
+        "avg_pnl":      best_row.get("avg_pnl", 0),
+        "avg_win_rate": best_row.get("avg_win_rate", 0),
+        "avg_sharpe":   best_row.get("avg_sharpe", 0),
+        "avg_pf":       best_row.get("avg_pf", 0),
+        "params": {k: best_row[k] for k in _HYPEROPT_PARAM_KEYS if k in best_row},
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    bp_path = out_dir / f"best_params_seed{seed}.json"
+    with open(bp_path, "w") as f:
+        json.dump(best_params_out, f, indent=2)
+
+
+def _print_hyperopt_summary(history: list[dict], seed: int, elapsed_sec: float) -> None:
+    """Print a rich summary after all hyperopt trials finish."""
+    if not history:
+        print("  [hyperopt] No valid trials completed.")
+        return
+
+    sorted_h = sorted(history, key=lambda r: r.get("objective", -99), reverse=True)
+    best = sorted_h[0]
+    top_n = sorted_h[:min(5, len(sorted_h))]
+
+    print(f"\n  {'═' * 70}")
+    print(f"  ║  HYPEROPT SUMMARY  (seed={seed}, {len(history)} trials, {elapsed_sec/60:.1f} min)")
+    print(f"  {'═' * 70}")
+    print(f"  ║  Best trial: #{best['trial']}  obj={best['objective']:+.4f}")
+    bp = {k: best.get(k) for k in _HYPEROPT_PARAM_KEYS if k in best}
+    print(f"  ║  Params:  z={bp.get('z_entry','?')}-{bp.get('z_entry_max','?')}→{bp.get('z_exit','?')}"
+          f"  stop={bp.get('z_stop','?')}  coint={bp.get('coint_stability_min_bars','?')}b"
+          f"  hl={bp.get('hl_min_days','?')}-{bp.get('hl_max_days','?')}d"
+          f"  hold_mult={bp.get('hold_multiplier','?')}  max_hold={bp.get('max_hold_days','?')}d")
+    print(f"  {'─' * 70}")
+    print(f"  ║  Top-{len(top_n)} trials:")
+    for r in top_n:
+        marker = "★" if r["trial"] == best["trial"] else " "
+        print(
+            f"  ║  {marker} #{r['trial']:>2}"
+            f"  obj={r['objective']:+.4f}"
+            f"  wr={r.get('avg_win_rate', 0):.1%}"
+            f"  sharpe={r.get('avg_sharpe', 0):+.2f}"
+            f"  pf={r.get('avg_pf', 0):.2f}"
+            f"  pnl/pair={r.get('avg_pnl', 0):+,.0f}$"
+            f"  active={r.get('active_pairs', 0)}"
+            f"  trades={r.get('total_trades', 0)}"
+        )
+
+    # Parameter stability across top trials
+    if len(top_n) >= 3:
+        print(f"  {'─' * 70}")
+        print(f"  ║  Parameter stability (top-{len(top_n)}: min / median / max):")
+        for k in ["z_entry", "z_exit", "z_stop", "coint_stability_min_bars",
+                   "hl_min_days", "hl_max_days", "hold_multiplier", "p_value_threshold"]:
+            vals = [r.get(k) for r in top_n if r.get(k) is not None]
+            if vals:
+                vals_sorted = sorted(vals)
+                med = vals_sorted[len(vals_sorted) // 2]
+                print(f"  ║    {k:<28}  {min(vals):>8.3f} / {med:>8.3f} / {max(vals):>8.3f}")
+
+    print(f"  {'═' * 70}\n")
+
+
 def run_scanner_hyperopt(
     market: MarketData,
     pairs: list[tuple[str, str]],
@@ -432,7 +535,8 @@ def run_scanner_hyperopt(
 ) -> tuple[dict, list[dict]]:
     """Run hyperopt on a sample of pairs to find best parameters.
 
-    For each trial: run sampled pairs with candidate params, objective = avg score.
+    For each trial: run sampled pairs with candidate params in parallel,
+    objective = avg score.  Saves CSV + JSON incrementally after each trial.
     Returns (best_cfg, history).
     """
     import optuna
@@ -445,14 +549,65 @@ def run_scanner_hyperopt(
     else:
         sample = list(pairs)
 
+    # ── Prepare parallel worker pool data ──────────────────────────────────
+    n_workers = max(1, int(base_cfg.get("scan_workers", 0)) or (os.cpu_count() or 4) - 2)
+    init_args = _prepare_market_init_args(market)
+    hyperopt_recompute = max(1, int(base_cfg.get("hyperopt_recompute", 4)))
+
+    # ── Pool warmup: test with 1 pair before committing ───────────────────
+    pool_works = False
+    if n_workers > 1:
+        test_pair = sample[0]
+        test_params = _cfg_to_params_dict(base_cfg)
+        test_params["recompute_bars"] = hyperopt_recompute
+        test_task = (test_pair[0], test_pair[1], test_params)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=1,
+                initializer=_scan_worker_init,
+                initargs=init_args,
+            ) as test_pool:
+                test_results = list(test_pool.map(_scan_one_pair, [test_task]))
+                r = test_results[0] if test_results else None
+                if r is not None:
+                    print(f"  [hyperopt] ✓ Pool warmup OK: {test_pair[0]}-{test_pair[1]} → {r.get('trades', 0)} trades", flush=True)
+                    pool_works = True
+                else:
+                    # Try direct call to see if the pair itself is bad
+                    direct_r = _scan_one_pair_direct(market, test_pair[0], test_pair[1], test_params, recompute_bars=hyperopt_recompute)
+                    if direct_r is not None:
+                        print(f"  [hyperopt] ⚠ Pool returns None but direct call works → pool init broken, using sequential", flush=True)
+                    else:
+                        print(f"  [hyperopt] ⚠ Both pool and direct return None for test pair (pair has 0 trades, this is normal)", flush=True)
+                        pool_works = True  # Pool probably works, pair just has no trades
+        except Exception as e:
+            print(f"  [hyperopt] ⚠ Pool warmup FAILED: {e}", flush=True)
+            traceback.print_exc()
+            print(f"  [hyperopt] ⚠ Falling back to sequential mode", flush=True)
+
+    use_pool = pool_works and n_workers > 1
+
+    # ── Output paths for incremental saves ─────────────────────────────────
+    out_dir = Path(base_cfg.get("output_dir", "market_neutral/backtest_results"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ho_csv_path = out_dir / f"pair_scanner_hyperopt_seed{seed}.csv"
+    # Remove stale file from previous failed run
+    if ho_csv_path.exists():
+        ho_csv_path.unlink()
+
     print(f"  [hyperopt] {trials} trials on {len(sample)} sampled pairs, "
-          f"first {n_startup} random -> then Bayesian")
+          f"first {n_startup} random → then Bayesian")
+    print(f"  [hyperopt] workers={n_workers}  hyperopt_recompute={hyperopt_recompute}")
 
     history: list[dict] = []
+    best_obj_so_far = -999.0
+    t_start = time.time()
+    _pool_broken = False  # fallback flag if pool crashes
 
     def objective(trial: optuna.Trial) -> float:
+        nonlocal best_obj_so_far, _pool_broken
         cfg = dict(base_cfg)
-        # Discretized search space (same as backtest_bot_parity)
+        # Discretized search space
         cfg["z_entry"]     = trial.suggest_float("z_entry",     1.4, 2.5,  step=0.1)
         cfg["z_entry_max"] = trial.suggest_float("z_entry_max", cfg["z_entry"] + 0.2, 3.5, step=0.1)
         cfg["z_exit"]      = trial.suggest_float("z_exit",      0.0, 0.35, step=0.05)
@@ -465,66 +620,154 @@ def run_scanner_hyperopt(
         )
         cfg["beta_critical"]    = trial.suggest_float("beta_critical", 0.5, 1.5, step=0.25)
         cfg["p_value_threshold"] = trial.suggest_float("p_value_threshold", 0.01, 0.08, step=0.01)
-        cfg["coint_stability_min_bars"] = trial.suggest_int("coint_stability_min_bars", 1, 8)
-        cfg["hold_multiplier"] = trial.suggest_float("hold_multiplier", 1.5, 6.0, step=0.5)
-        cfg["max_hold_days"]   = trial.suggest_float("max_hold_days",   5.0, 45.0, step=1.0)
+        cfg["coint_stability_min_bars"] = trial.suggest_int("coint_stability_min_bars", 1, 5)
+        cfg["hold_multiplier"] = trial.suggest_float("hold_multiplier", 2.0, 8.0, step=0.5)
+        cfg["max_hold_days"]   = trial.suggest_float("max_hold_days",   7.0, 60.0, step=1.0)
         cfg["hedge_min"] = trial.suggest_float("hedge_min", 0.10, 0.60, step=0.05)
-        cfg["hedge_max"] = trial.suggest_float("hedge_max", 1.5,  5.0,  step=0.5)
-        cfg["hl_min_days"] = trial.suggest_float("hl_min_days", 0.1, 1.0, step=0.1)
-        cfg["hl_max_days"] = trial.suggest_float("hl_max_days", cfg["hl_min_days"] + 0.5, 5.0, step=0.5)
+        cfg["hedge_max"] = trial.suggest_float("hedge_max", 1.5,  6.0,  step=0.5)
+        cfg["hl_min_days"] = trial.suggest_float("hl_min_days", 0.5, 3.0, step=0.25)
+        cfg["hl_max_days"] = trial.suggest_float("hl_max_days", cfg["hl_min_days"] + 1.0, 15.0, step=1.0)
 
         params_dict = _cfg_to_params_dict(cfg)
+        params_dict["recompute_bars"] = hyperopt_recompute
 
+        # ── Parallel pair evaluation ──────────────────────────────────────
+        t_trial = time.time()
+        tasks = [(a, b, params_dict) for a, b in sample]
+
+        raw_results = None
+        if use_pool and not _pool_broken:
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=n_workers,
+                    initializer=_scan_worker_init,
+                    initargs=init_args,
+                ) as pool:
+                    raw_results = list(pool.map(
+                        _scan_one_pair, tasks,
+                        chunksize=max(1, len(tasks) // n_workers),
+                    ))
+            except Exception as e:
+                print(f"  [hyperopt] ⚠ Pool error: {e}", flush=True)
+                print(f"  [hyperopt] ⚠ Falling back to sequential mode", flush=True)
+                _pool_broken = True
+                raw_results = None
+
+        if raw_results is None:
+            # Sequential fallback (or single-core mode)
+            raw_results = []
+            for t in tasks:
+                raw_results.append(_scan_one_pair_direct(
+                    market, t[0], t[1], params_dict,
+                    recompute_bars=hyperopt_recompute,
+                ))
+
+        # ── Aggregate metrics ─────────────────────────────────────────────
         scores = []
         total_trades = 0
-        for sym_a, sym_b in sample:
-            res = _scan_one_pair_direct(market, sym_a, sym_b, params_dict)
-            if res and res["trades"] >= 1:
+        total_pnl = 0.0
+        win_rates = []
+        sharpes = []
+        pfs = []
+        for res in raw_results:
+            if res and res.get("trades", 0) >= 1:
                 s = compute_pair_score(res, min_trades=1)
                 scores.append(s)
                 total_trades += res["trades"]
+                total_pnl    += res.get("total_net_pnl", 0) or 0
+                win_rates.append(res.get("win_rate", 0) or 0)
+                sharpes.append(res.get("sharpe", 0) or 0)
+                pfs.append(res.get("pf", 0) or 0)
 
         if not scores:
             return -10.0
 
-        avg_score = float(np.mean(scores))
+        avg_score  = float(np.mean(scores))
+        avg_wr     = float(np.mean(win_rates))   if win_rates else 0.0
+        avg_sharpe = float(np.mean(sharpes))     if sharpes   else 0.0
+        avg_pf     = float(np.mean(pfs))         if pfs       else 0.0
+        avg_pnl    = total_pnl / len(scores)     if scores    else 0.0
         active_pct = len(scores) / len(sample)
         obj = avg_score + 0.2 * active_pct
+        trial_sec  = time.time() - t_trial
 
         idx = trial.number + 1
         row = {
+            "seed": seed,
             "trial": idx, "objective": round(obj, 4),
             "avg_score": round(avg_score, 4),
             "active_pairs": len(scores),
             "total_trades": total_trades,
+            "avg_pnl":    round(avg_pnl, 2),
+            "avg_win_rate": round(avg_wr, 4),
+            "avg_sharpe":  round(avg_sharpe, 4),
+            "avg_pf":      round(avg_pf, 4),
+            "trial_sec":   round(trial_sec, 1),
         }
-        # Save all tuned params
-        for k in ["z_entry", "z_entry_max", "z_exit", "z_stop",
-                   "max_notional_pct", "circuit_breaker_pct", "beta_threshold",
-                   "beta_alert_threshold", "beta_critical",
-                   "coint_stability_min_bars", "hold_multiplier", "max_hold_days",
-                   "hedge_min", "hedge_max", "hl_min_days", "hl_max_days",
-                   "p_value_threshold"]:
+        for k in _HYPEROPT_PARAM_KEYS:
             row[k] = cfg[k]
         history.append(row)
-        print(f"  [hyperopt] {idx}/{trials}  obj={obj:.4f}  "
-              f"avg_score={avg_score:.3f}  active={len(scores)}/{len(sample)}  "
-              f"tot_trades={total_trades}")
+
+        # ── Incremental CSV save (append mode) ────────────────────────────
+        pd.DataFrame([row]).to_csv(
+            ho_csv_path, mode="a", header=not ho_csv_path.exists() or idx == 1,
+            index=False,
+        )
+
+        # ── Update best_params JSON if new best ──────────────────────────
+        is_best = obj > best_obj_so_far
+        if is_best:
+            best_obj_so_far = obj
+            _save_hyperopt_best_params(history, seed, out_dir)
+
+        # ── Rich console line ─────────────────────────────────────────────
+        marker = "★" if is_best else " "
+        elapsed = time.time() - t_start
+        eta = (elapsed / idx) * (trials - idx) if idx > 0 else 0
+        print(
+            f"  [hyperopt {marker}] {idx:>2}/{trials}"
+            f"  obj={obj:+.4f}  score={avg_score:.3f}"
+            f"  wr={avg_wr:.1%}  sharpe={avg_sharpe:+.2f}  pf={avg_pf:.2f}"
+            f"  pnl/pair={avg_pnl:+,.0f}$"
+            f"  active={len(scores)}/{len(sample)}  trades={total_trades}"
+            f"  |  z={cfg['z_entry']:.1f}-{cfg['z_entry_max']:.1f}→{cfg['z_exit']:.2f}"
+            f"  coint={cfg['coint_stability_min_bars']}b"
+            f"  hl={cfg['hl_min_days']:.1f}-{cfg['hl_max_days']:.0f}d"
+            f"  [{trial_sec:.0f}s  ETA {eta/60:.0f}m]",
+            flush=True,
+        )
         return obj
 
     sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=n_startup)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(objective, n_trials=trials, show_progress_bar=False)
 
+    # ── Final summary ─────────────────────────────────────────────────────
+    elapsed = time.time() - t_start
+    _print_hyperopt_summary(history, seed, elapsed)
+
+    # ── Save final files ──────────────────────────────────────────────────
     if history:
+        # Overwrite CSV with clean version (append may have duplicated headers)
+        pd.DataFrame(history).to_csv(ho_csv_path, index=False)
+        print(f"  [hyperopt] History CSV  → {ho_csv_path}")
+
+        _save_hyperopt_best_params(history, seed, out_dir)
+        bp_path = out_dir / f"best_params_seed{seed}.json"
+        print(f"  [hyperopt] Best params  → {bp_path}")
+
+        # Colab auto-download
+        try:
+            from google.colab import files as colab_files
+            colab_files.download(str(ho_csv_path))
+            colab_files.download(str(bp_path))
+            print(f"  [hyperopt] Colab download triggered ✓")
+        except ImportError:
+            pass
+
+        # Apply best params to cfg
         best = max(history, key=lambda r: r.get("objective", -99))
-        print(f"\n  [hyperopt] Best trial #{best['trial']}  obj={best['objective']:.4f}")
-        for k in ["z_entry", "z_entry_max", "z_exit", "z_stop",
-                   "max_notional_pct", "circuit_breaker_pct", "beta_threshold",
-                   "beta_alert_threshold", "beta_critical",
-                   "coint_stability_min_bars", "hold_multiplier", "max_hold_days",
-                   "hedge_min", "hedge_max", "hl_min_days", "hl_max_days",
-                   "p_value_threshold"]:
+        for k in _HYPEROPT_PARAM_KEYS:
             if k in best:
                 base_cfg[k] = best[k]
 
@@ -545,7 +788,7 @@ def run_scanner(
     """Scan all pairs with SLIDING-WINDOW parallelism (Windows-friendly).
 
     Architecture:
-      - Maintain a bounded pending queue (`workers * inflight_per_worker`)
+      - Maintain a pool of `max_inflight = workers * 10` pending futures at all times
       - As each future completes → collect result → immediately submit next pair
       - Workers are NEVER idle (unlike sequential batches where the slowest pair
         blocks the entire batch)
@@ -554,29 +797,23 @@ def run_scanner(
     Memory safety:
       - Never more than `max_inflight` futures in memory (not 53K)
       - gc.collect() every 500 completed pairs
-      - Intermediate CSV save every 1000 pairs (crash-safe)
+      - Intermediate CSV save every 2000 pairs (crash-safe)
     """
     import gc
-    import inspect
     from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
     t0 = time.perf_counter()
     n = len(pairs)
     params_dict = _cfg_to_params_dict(cfg)
-    recompute_bars = max(1, int(cfg.get("recompute_bars", cfg.get("recompute", 1))))
     init_args = _prepare_market_init_args(market)
 
-    inflight_per_worker = max(1, int(cfg.get("scan_inflight_per_worker", 4)))
-    max_inflight = max(scan_workers * inflight_per_worker, scan_workers + 2)
-    max_tasks_per_child_cfg = int(cfg.get("scan_max_tasks_per_child", 0) or 0)
-    max_tasks_per_child = max_tasks_per_child_cfg if max_tasks_per_child_cfg > 0 else None
+    max_inflight = max(scan_workers * 10, 20)
 
     print(f"\n  [scanner] Scanning {n:,} pairs with {scan_workers} workers "
-          f"(max_inflight={max_inflight}, recycle={max_tasks_per_child or 'off'})")
+          f"(max_inflight={max_inflight})")
     print(f"  [scanner] Params:  z_entry={cfg['z_entry']}  z_exit={cfg['z_exit']}  "
           f"z_stop={cfg['z_stop']}  window={cfg.get('window_size', 180)}  "
-          f"hold_mult={cfg['hold_multiplier']}  max_hold={cfg['max_hold_days']}d  "
-          f"recompute={recompute_bars}")
+          f"hold_mult={cfg['hold_multiplier']}  max_hold={cfg['max_hold_days']}d")
 
     results: list[dict] = []
     done = 0
@@ -587,23 +824,17 @@ def run_scanner(
     out_dir = Path(cfg.get("output_dir", "market_neutral/backtest_results"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pool_kwargs = {
-        "max_workers": scan_workers,
-        "initializer": _scan_worker_init,
-        "initargs": init_args,
-    }
-    if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
-        pool_kwargs["max_tasks_per_child"] = max_tasks_per_child
-    elif max_tasks_per_child is not None:
-        print("  [scanner] NOTE: max_tasks_per_child unsupported in this Python, ignoring recycle.")
-
-    with ProcessPoolExecutor(**pool_kwargs) as pool:
+    with ProcessPoolExecutor(
+        max_workers=scan_workers,
+        initializer=_scan_worker_init,
+        initargs=init_args,
+    ) as pool:
         pending: set = set()
 
         # ── Initial fill: submit up to max_inflight pairs ─────────────────────
         while next_idx < n and len(pending) < max_inflight:
             a, b = pairs[next_idx]
-            fut = pool.submit(_scan_one_pair, (a, b, params_dict, recompute_bars))
+            fut = pool.submit(_scan_one_pair, (a, b, params_dict))
             pending.add(fut)
             next_idx += 1
 
@@ -627,7 +858,7 @@ def run_scanner(
             # Immediately refill pending up to max_inflight
             while next_idx < n and len(pending) < max_inflight:
                 a, b = pairs[next_idx]
-                fut = pool.submit(_scan_one_pair, (a, b, params_dict, recompute_bars))
+                fut = pool.submit(_scan_one_pair, (a, b, params_dict))
                 pending.add(fut)
                 next_idx += 1
 
@@ -648,8 +879,8 @@ def run_scanner(
                 last_gc = done
                 gc.collect()
 
-            # Intermediate crash-safe save every 1000 pairs
-            if done - last_save >= 1000:
+            # Intermediate crash-safe save every 2000 pairs
+            if done - last_save >= 2000:
                 last_save = done
                 partial_sorted = sorted(
                     results, key=lambda r: r.get("score", -99), reverse=True
@@ -660,7 +891,7 @@ def run_scanner(
     results.sort(key=lambda r: r.get("score", -99), reverse=True)
     elapsed = time.perf_counter() - t0
     speed = n / elapsed if elapsed > 0 else 0
-    print(f"\n  [scanner] Done in {elapsed:.0f}s ({speed:.1f} pairs/s) - "
+    print(f"\n  [scanner] ✓ Done in {elapsed:.0f}s ({speed:.1f} pairs/s) — "
           f"{len(results)} qualifying pairs (from {n:,} tested)")
     return results
 
@@ -703,7 +934,7 @@ def save_ranking_csv(results: list[dict], out_path: Path) -> None:
         })
     df = pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
-    print(f"  [scanner] Full ranking saved -> {out_path}")
+    print(f"  [scanner] Full ranking saved → {out_path}")
 
 
 def save_best_pairs_json(
@@ -757,7 +988,7 @@ def save_best_pairs_json(
         "scan_info": {
             "total_pairs_scanned":   params_used.get("_total_scanned", 0),
             "qualifying_pairs":      len(entries),
-            "min_trades":            params_used.get("min_trades", 1),
+            "min_trades":            params_used.get("min_trades", 3),
             "scan_date":             time.strftime("%Y-%m-%d %H:%M:%S"),
         },
         "pairs": entries,
@@ -765,7 +996,7 @@ def save_best_pairs_json(
 
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
-    print(f"  [scanner] Top {min(top_n, len(results))} pairs -> {out_path}")
+    print(f"  [scanner] Top {min(top_n, len(results))} pairs → {out_path}")
 
 
 def print_summary(results: list[dict], top_n: int = 25) -> None:
@@ -839,10 +1070,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top",            type=int, default=None, help="Top N pairs to export")
     p.add_argument("--min-trades",     type=int, default=None, help="Min trades to qualify")
     p.add_argument("--scan-workers",   type=int, default=None, help="Parallel worker processes")
-    p.add_argument("--scan-inflight-per-worker", type=int, default=None,
-                   help="Pending tasks per worker (lower = less RAM pressure)")
-    p.add_argument("--scan-max-tasks-per-child", type=int, default=None,
-                   help="Recycle worker after N pairs (0 disables recycle)")
     p.add_argument("--output-dir",     default=None)
 
     # Strategy params (override defaults)
@@ -856,10 +1083,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--notional-pct",   type=float, default=None)
     p.add_argument("--hold-multiplier", type=float, default=None)
     p.add_argument("--coint-min-bars", type=int,   default=None)
-    p.add_argument("--signal-confirm-sec", type=int, default=None,
-                   help="Signal confirmation in seconds (4h: 14400=1 bar, 28800=2 bars).")
-    p.add_argument("--recompute",      type=int,   default=None,
-                   help="Recalculate engine cointegration every N bars (e.g. 6 = 24h).")
+    p.add_argument("--recompute",      type=int,   default=1,
+                   help="Recalculate engine cointegration every N bars (e.g. 6 = 24h). Default 1.")
 
     # Hyperopt
     p.add_argument("--hyperopt-trials",   type=int, default=0, help="0=no hyperopt")
@@ -911,7 +1136,7 @@ def merge_shards(out_dir: Path, min_trades: int = 3, top_n: int = 9000) -> None:
     # Save merged ranking
     ranking_path = out_dir / "pair_scanner_ranking.csv"
     merged.to_csv(ranking_path, index=False)
-    print(f"  [merge] Full ranking -> {ranking_path}")
+    print(f"  [merge] Full ranking → {ranking_path}")
 
     # Build best_pairs_backtest.json from merged data
     entries = []
@@ -944,7 +1169,7 @@ def merge_shards(out_dir: Path, min_trades: int = 3, top_n: int = 9000) -> None:
     best_path = out_dir / "best_pairs_backtest.json"
     with open(best_path, "w") as f:
         json.dump(output, f, indent=2)
-    print(f"  [merge] Top {len(entries)} pairs -> {best_path}")
+    print(f"  [merge] Top {len(entries)} pairs → {best_path}")
 
     # Print top 20
     print(f"\n  Top 20 merged pairs:")
@@ -972,19 +1197,14 @@ def main() -> None:
     if args.output_dir is not None:     cfg["output_dir"] = args.output_dir
     if args.hold_multiplier is not None: cfg["hold_multiplier"] = args.hold_multiplier
     if args.coint_min_bars is not None: cfg["coint_stability_min_bars"] = args.coint_min_bars
-    if args.signal_confirm_sec is not None: cfg["signal_confirm_sec"] = max(0, int(args.signal_confirm_sec))
     if args.min_trades is not None:     cfg["min_trades"] = args.min_trades
     if args.scan_workers is not None:   cfg["scan_workers"] = args.scan_workers
-    if args.scan_inflight_per_worker is not None:
-        cfg["scan_inflight_per_worker"] = args.scan_inflight_per_worker
-    if args.scan_max_tasks_per_child is not None:
-        cfg["scan_max_tasks_per_child"] = args.scan_max_tasks_per_child
     if args.top is not None:            cfg["top_n"] = args.top
-    # recompute: explicit CLI value always overrides DEFAULT_PARAMS["recompute"]
-    if args.recompute is not None:
-        cfg["recompute_bars"] = max(1, int(args.recompute))
+    # recompute: CLI --recompute перекрывает DEFAULT_PARAMS["recompute"]
+    if args.recompute != 1:
+        cfg["recompute_bars"] = args.recompute
     else:
-        cfg["recompute_bars"] = max(1, int(cfg.get("recompute", 1)))
+        cfg["recompute_bars"] = int(cfg.get("recompute", 1))
 
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1084,7 +1304,7 @@ def main() -> None:
         if total_all_pairs > 5000:
             n_suggested = 4
             chunk = math.ceil(total_all_pairs / n_suggested)
-            print(f"\n  Tip: to split across {n_suggested} Colabs, use --pair-range:")
+            print(f"\n  💡 To split across {n_suggested} Colabs, use --pair-range:")
             for i in range(n_suggested):
                 s = i * chunk
                 e = min(s + chunk, total_all_pairs)
@@ -1092,17 +1312,12 @@ def main() -> None:
 
     # Print config
     print(f"\n  Strategy parameters:")
-    print(f"    {'recompute_bars':<30} = {cfg.get('recompute_bars', cfg.get('recompute', 1))}")
     for k in ["z_entry", "z_entry_max", "z_exit", "z_stop", "window_size",
               "max_notional_pct", "capital", "hold_multiplier", "max_hold_days",
               "p_value_threshold", "hedge_min", "hedge_max", "beta_threshold",
-              "beta_critical", "coint_stability_min_bars", "signal_confirm_sec",
-              "hl_min_days", "hl_max_days",
+              "beta_critical", "coint_stability_min_bars", "hl_min_days", "hl_max_days",
               "commission_rate", "slippage_rate", "circuit_breaker_pct"]:
         print(f"    {k:<30} = {cfg[k]}")
-    print(f"    {'scan_workers':<30} = {cfg['scan_workers']}")
-    print(f"    {'scan_inflight_per_worker':<30} = {cfg.get('scan_inflight_per_worker', 4)}")
-    print(f"    {'scan_max_tasks_per_child':<30} = {cfg.get('scan_max_tasks_per_child', 0)}")
     print()
 
     # ── Hyperopt (optional) ────────────────────────────────────────────────────
@@ -1119,8 +1334,7 @@ def main() -> None:
             sample_pairs=args.hyperopt_sample,
         )
         print(f"\n  Updated parameters after hyperopt:")
-        for k in ["z_entry", "z_entry_max", "z_exit", "z_stop",
-                   "hold_multiplier", "max_hold_days", "p_value_threshold"]:
+        for k in _HYPEROPT_PARAM_KEYS:
             print(f"    {k:<30} = {cfg[k]}")
         print()
 
@@ -1143,12 +1357,6 @@ def main() -> None:
     else:
         ranking_path = out_dir / "pair_scanner_ranking.csv"
     save_ranking_csv(results, ranking_path)
-
-    # Hyperopt history CSV
-    if hyperopt_history:
-        ho_path = out_dir / "pair_scanner_hyperopt.csv"
-        pd.DataFrame(hyperopt_history).to_csv(ho_path, index=False)
-        print(f"  [scanner] Hyperopt history -> {ho_path}")
 
     # Best pairs JSON (only in non-shard mode)
     if not shard_label:
