@@ -688,7 +688,18 @@ def run_scanner_hyperopt(
         avg_pf     = float(np.mean(pfs))         if pfs       else 0.0
         avg_pnl    = total_pnl / len(scores)     if scores    else 0.0
         active_pct = len(scores) / len(sample)
-        obj = avg_score + 0.2 * active_pct
+
+        # ── Objective: balance quality vs coverage ────────────────────────
+        # Reject degenerate solutions: need enough pairs & trades for stats
+        min_active_pct = 0.10   # at least 10% of sampled pairs must trade
+        min_total_trades = 30   # at least 30 trades total
+        if active_pct < min_active_pct or total_trades < min_total_trades:
+            obj = -5.0 + active_pct  # heavy penalty but still differentiable
+        else:
+            # Weighted: 50% quality + 30% coverage + 20% trade volume
+            coverage_bonus = min(1.0, active_pct / 0.5)   # saturates at 50% active
+            trade_bonus = min(1.0, total_trades / 500)     # saturates at 500 trades
+            obj = 0.50 * avg_score + 0.30 * coverage_bonus + 0.20 * trade_bonus
         trial_sec  = time.time() - t_trial
 
         idx = trial.number + 1
@@ -719,6 +730,15 @@ def run_scanner_hyperopt(
         if is_best:
             best_obj_so_far = obj
             _save_hyperopt_best_params(history, seed, out_dir)
+
+        # ── Colab: copy to Google Drive after each trial (survives disconnect) ─
+        gdrive_dir = Path("/content/drive/MyDrive/hyperopt_results")
+        if gdrive_dir.exists():
+            import shutil
+            shutil.copy2(ho_csv_path, gdrive_dir / ho_csv_path.name)
+            bp_src = out_dir / f"best_params_seed{seed}.json"
+            if bp_src.exists():
+                shutil.copy2(bp_src, gdrive_dir / bp_src.name)
 
         # ── Rich console line ─────────────────────────────────────────────
         marker = "★" if is_best else " "
