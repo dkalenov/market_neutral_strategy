@@ -340,6 +340,8 @@ def _scan_one_pair_direct(
     if sym_a not in market.symbol_to_idx or sym_b not in market.symbol_to_idx:
         return None
     try:
+        params_dict = dict(params_dict)  # copy so we don't mutate the original
+        params_dict.pop("recompute_bars", None)  # not a BacktestParams field
         params = BacktestParams(**params_dict)
         candidate = CandidatePair(symbol1=sym_a, symbol2=sym_b, score=1.0, source="scanner")
         bt = BotParityBacktester(
@@ -607,26 +609,24 @@ def run_scanner_hyperopt(
     def objective(trial: optuna.Trial) -> float:
         nonlocal best_obj_so_far, _pool_broken
         cfg = dict(base_cfg)
-        # Discretized search space
+        # ── Search space (11 params that directly affect signal quality) ──
+        # Core entry/exit
         cfg["z_entry"]     = trial.suggest_float("z_entry",     1.4, 2.5,  step=0.1)
         cfg["z_entry_max"] = trial.suggest_float("z_entry_max", cfg["z_entry"] + 0.2, 3.5, step=0.1)
         cfg["z_exit"]      = trial.suggest_float("z_exit",      0.0, 0.35, step=0.05)
         cfg["z_stop"]      = trial.suggest_float("z_stop",      2.5, 5.0,  step=0.5)
-        cfg["max_notional_pct"]    = trial.suggest_float("max_notional_pct",    0.10, 0.55, step=0.05)
-        cfg["circuit_breaker_pct"] = trial.suggest_float("circuit_breaker_pct", 0.15, 0.70, step=0.05)
+        # Cointegration & beta filters
         cfg["beta_threshold"]      = trial.suggest_float("beta_threshold",      0.05, 0.25, step=0.05)
-        cfg["beta_alert_threshold"] = trial.suggest_float(
-            "beta_alert_threshold", cfg["beta_threshold"] + 0.05, 0.50, step=0.05
-        )
-        cfg["beta_critical"]    = trial.suggest_float("beta_critical", 0.5, 1.5, step=0.25)
-        cfg["p_value_threshold"] = trial.suggest_float("p_value_threshold", 0.01, 0.08, step=0.01)
+        cfg["p_value_threshold"]   = trial.suggest_float("p_value_threshold",   0.01, 0.08, step=0.01)
         cfg["coint_stability_min_bars"] = trial.suggest_int("coint_stability_min_bars", 1, 5)
+        # Holding period
         cfg["hold_multiplier"] = trial.suggest_float("hold_multiplier", 2.0, 8.0, step=0.5)
         cfg["max_hold_days"]   = trial.suggest_float("max_hold_days",   7.0, 60.0, step=1.0)
-        cfg["hedge_min"] = trial.suggest_float("hedge_min", 0.10, 0.60, step=0.05)
-        cfg["hedge_max"] = trial.suggest_float("hedge_max", 1.5,  6.0,  step=0.5)
+        # Half-life filter
         cfg["hl_min_days"] = trial.suggest_float("hl_min_days", 0.5, 3.0, step=0.25)
         cfg["hl_max_days"] = trial.suggest_float("hl_max_days", cfg["hl_min_days"] + 1.0, 15.0, step=1.0)
+        # Fixed (not optimized): max_notional_pct, circuit_breaker_pct,
+        # beta_alert_threshold (Telegram only), beta_critical, hedge_min/max
 
         params_dict = _cfg_to_params_dict(cfg)
         params_dict["recompute_bars"] = hyperopt_recompute
@@ -747,7 +747,7 @@ def run_scanner_hyperopt(
         print(
             f"  [hyperopt {marker}] {idx:>2}/{trials}"
             f"  obj={obj:+.4f}  score={avg_score:.3f}"
-            f"  wr={avg_wr:.1%}  sharpe={avg_sharpe:+.2f}  pf={avg_pf:.2f}"
+            f"  wr={avg_wr:.1%}  sharpe={avg_sharpe:+.2f}  pf={'inf' if (avg_pf != avg_pf or avg_pf == 0) else f'{avg_pf:.2f}'}"
             f"  pnl/pair={avg_pnl:+,.0f}$"
             f"  active={len(scores)}/{len(sample)}  trades={total_trades}"
             f"  |  z={cfg['z_entry']:.1f}-{cfg['z_entry_max']:.1f}→{cfg['z_exit']:.2f}"
@@ -1112,6 +1112,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hyperopt-sample",   type=int, default=30,
                    help="Number of pairs to sample for hyperopt")
     p.add_argument("--seed",              type=int, default=42)
+    p.add_argument("--hyperopt-only",     action="store_true",
+                   help="Run hyperopt only, skip full scan. For Colab/distributed hyperopt.")
 
     # Sharding — split work across multiple machines
     p.add_argument("--shard",             default=None,
@@ -1276,6 +1278,7 @@ def main() -> None:
         return
 
     total_all_pairs = len(pairs)
+    all_pairs = pairs  # full list for hyperopt (BEFORE pair-range filter)
 
     # ── Apply shard / pair-range ────────────────────────────────────────────────
     shard_id = 0
@@ -1346,7 +1349,7 @@ def main() -> None:
         print(f"  Running hyperopt: {args.hyperopt_trials} trials …\n")
         cfg, hyperopt_history = run_scanner_hyperopt(
             market=market,
-            pairs=pairs,
+            pairs=all_pairs,   # use FULL pair list, not pair-range filtered
             base_cfg=cfg,
             trials=args.hyperopt_trials,
             n_startup=args.hyperopt_startup,
@@ -1357,6 +1360,10 @@ def main() -> None:
         for k in _HYPEROPT_PARAM_KEYS:
             print(f"    {k:<30} = {cfg[k]}")
         print()
+
+        if args.hyperopt_only:
+            print("  [hyperopt-only] Skipping full scan. Done.")
+            return
 
     # ── Run scanner ────────────────────────────────────────────────────────────
     scan_workers = max(1, int(cfg["scan_workers"]))
