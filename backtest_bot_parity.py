@@ -138,6 +138,7 @@ class BacktestParams:
     circuit_breaker_pct: float = 0.50
     signal_confirm_sec: int = 10
     coint_stability_min_bars: int = 2
+    coint_broken_grace_bars: int = 2  # bars to wait before closing on broken coint (0=immediate)
     entry_et_target_abs_z: float = 0.5
     max_active_pairs: int = 3
     max_idle_pairs: int = 150
@@ -217,6 +218,7 @@ class PairState:
     last_z_score: float = 0.0
     coint_streak_bars: int = 0
     coint_run_len: int = 0
+    coint_broken_count: int = 0  # consecutive bars with broken coint while in position
     pending_signal: float | None = None
     pending_since_idx: int | None = None
     pending_source: str = ""
@@ -1624,13 +1626,20 @@ class BotParityBacktester:
         beta = float(st.beta_btc)
 
         reason = ""
+        # Grace period for broken cointegration
         if snap.flag == 0:
-            reason = "broken_coint"
-        elif roi_notional < -float(self.params.circuit_breaker_pct):
-            reason = "circuit"
-        elif not np.isnan(beta) and abs(beta) >= float(self.params.beta_critical):
-            reason = "beta_critical"
+            st.coint_broken_count += 1
+            grace = int(self.params.coint_broken_grace_bars)
+            if grace <= 0 or st.coint_broken_count > grace:
+                reason = "broken_coint"
         else:
+            st.coint_broken_count = 0  # coint restored, reset counter
+
+        if not reason and roi_notional < -float(self.params.circuit_breaker_pct):
+            reason = "circuit"
+        if not reason and not np.isnan(beta) and abs(beta) >= float(self.params.beta_critical):
+            reason = "beta_critical"
+        if not reason:
             if pos.direction == 1:
                 if z >= float(self.params.z_exit):
                     reason = "z_tp"
