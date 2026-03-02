@@ -61,6 +61,13 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+# Prevent UnicodeEncodeError on Windows cp1252 terminals.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 # Import the real engine from backtest_bot_parity
 from backtest_bot_parity import (
     BacktestParams,
@@ -140,6 +147,8 @@ DEFAULT_PARAMS: dict[str, Any] = {
 
     # Воркеры: Windows=12, MacBook M2=8, Colab=2
     "scan_workers":        1,
+    "max_inflight":       0,   # 0=auto (workers*3)
+    "worker_recycle":     80,  # max tasks per child (0=disable)
 
     # Точность: 1=максимальная (медленно), 6=быстрый фильтр (~90% точности)
     "recompute":           1,
@@ -205,6 +214,8 @@ def _cfg_to_params_dict(cfg: dict) -> dict:
         "progress_every_bars":        0,   # silent
         "hl_min_days":                float(cfg.get("hl_min_days", 0.25)),
         "hl_max_days":                float(cfg.get("hl_max_days", 2.0)),
+        # Scanner-only key (not BacktestParams): consumed by _scan_one_pair via pop().
+        "recompute_bars":             int(cfg.get("recompute_bars", cfg.get("recompute", 1))),
     }
 
 
@@ -809,7 +820,7 @@ def run_scanner(
     """Scan all pairs with SLIDING-WINDOW parallelism (Windows-friendly).
 
     Architecture:
-      - Maintain a pool of `max_inflight = workers * 10` pending futures at all times
+      - Maintain a bounded pool of pending futures (auto: workers * 3)
       - As each future completes → collect result → immediately submit next pair
       - Workers are NEVER idle (unlike sequential batches where the slowest pair
         blocks the entire batch)
@@ -828,10 +839,12 @@ def run_scanner(
     params_dict = _cfg_to_params_dict(cfg)
     init_args = _prepare_market_init_args(market)
 
-    max_inflight = max(scan_workers * 10, 20)
+    max_inflight_cfg = int(cfg.get("max_inflight", 0) or 0)
+    max_inflight = max_inflight_cfg if max_inflight_cfg > 0 else max(scan_workers * 3, 20)
+    worker_recycle = int(cfg.get("worker_recycle", 80) or 0)
 
     print(f"\n  [scanner] Scanning {n:,} pairs with {scan_workers} workers "
-          f"(max_inflight={max_inflight})")
+          f"(max_inflight={max_inflight}, recycle={worker_recycle})")
     print(f"  [scanner] Params:  z_entry={cfg['z_entry']}  z_exit={cfg['z_exit']}  "
           f"z_stop={cfg['z_stop']}  window={cfg.get('window_size', 180)}  "
           f"hold_mult={cfg['hold_multiplier']}  max_hold={cfg['max_hold_days']}d")
@@ -849,6 +862,7 @@ def run_scanner(
         max_workers=scan_workers,
         initializer=_scan_worker_init,
         initargs=init_args,
+        max_tasks_per_child=(worker_recycle if worker_recycle > 0 else None),
     ) as pool:
         pending: set = set()
 
@@ -1092,6 +1106,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top",            type=int, default=None, help="Top N pairs to export")
     p.add_argument("--min-trades",     type=int, default=None, help="Min trades to qualify")
     p.add_argument("--scan-workers",   type=int, default=None, help="Parallel worker processes")
+    p.add_argument("--max-inflight",   type=int, default=None, help="Max pending futures (0=auto)")
+    p.add_argument("--worker-recycle", type=int, default=None,
+                   help="Max tasks per child process before recycle (0=disable)")
     p.add_argument("--output-dir",     default=None)
 
     # Strategy params (override defaults)
@@ -1139,13 +1156,15 @@ def merge_shards(out_dir: Path, min_trades: int = 3, top_n: int = 9000) -> None:
     and exports final pair_scanner_ranking.csv + best_pairs_backtest.json.
     """
     shard_files = sorted(out_dir.glob("pair_scanner_shard_*.csv"))
-    if not shard_files:
-        print(f"[ERROR] No shard files found in {out_dir}")
+    range_files = sorted(out_dir.glob("pair_scanner_range_*.csv"))
+    files_to_merge = shard_files + range_files
+    if not files_to_merge:
+        print(f"[ERROR] No shard/range files found in {out_dir}")
         return
 
-    print(f"\n  [merge] Found {len(shard_files)} shard files:")
+    print(f"\n  [merge] Found {len(files_to_merge)} files (shard={len(shard_files)}, range={len(range_files)}):")
     dfs = []
-    for f in shard_files:
+    for f in files_to_merge:
         df = pd.read_csv(f)
         print(f"    {f.name}: {len(df)} pairs")
         dfs.append(df)
@@ -1184,6 +1203,8 @@ def merge_shards(out_dir: Path, min_trades: int = 3, top_n: int = 9000) -> None:
     output = {
         "scan_info": {
             "merged_shards":     len(shard_files),
+            "merged_ranges":     len(range_files),
+            "merged_files":      len(files_to_merge),
             "total_qualifying":  len(merged),
             "exported_pairs":    len(entries),
             "min_trades":        min_trades,
@@ -1226,6 +1247,8 @@ def main() -> None:
         cfg["coint_broken_grace_bars"] = args.coint_broken_grace_bars
     if args.min_trades is not None:     cfg["min_trades"] = args.min_trades
     if args.scan_workers is not None:   cfg["scan_workers"] = args.scan_workers
+    if args.max_inflight is not None:   cfg["max_inflight"] = args.max_inflight
+    if args.worker_recycle is not None: cfg["worker_recycle"] = args.worker_recycle
     if args.top is not None:            cfg["top_n"] = args.top
     # recompute: CLI --recompute перекрывает DEFAULT_PARAMS["recompute"]
     if args.recompute != 1:
@@ -1398,8 +1421,9 @@ def main() -> None:
         save_best_pairs_json(results, top_n, best_path, params_used=cfg)
     else:
         print(f"\n  [scanner] Shard {shard_id+1}/{n_shards} complete!")
+        script_name = Path(__file__).name
         print(f"  [scanner] When ALL shards done, merge with:")
-        print(f"    python backtest_pair_scanner.py --merge-shards")
+        print(f"    python {script_name} --merge-shards")
 
     # ── Print summary ──────────────────────────────────────────────────────────
     print_summary(results, top_n=25)
