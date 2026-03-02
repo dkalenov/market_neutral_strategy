@@ -89,10 +89,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "max_notional_pct": 0.30,
 
     # ── Z-Score thresholds ────────────────────────────────────────────────────
-    "z_entry":         1.8,
-    "z_entry_max":     2.5,
-    "z_exit":          0.05,
-    "z_stop":          4.0,
+    "z_entry":         1.6,       # final: median of 35 top grace trials
+    "z_entry_max":     2.7,       # final: median (Q25=2.5, Q75=3.1)
+    "z_exit":          0.10,      # final: median (mass in 0.05-0.15)
+    "z_stop":          5.0,       # final: stable across seeds
 
     # ── Costs ─────────────────────────────────────────────────────────────────
     "commission_rate":  0.0004,
@@ -104,27 +104,27 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "hedge_max":          3.0,
 
     # ── Beta (BTC neutrality) ─────────────────────────────────────────────────
-    "beta_threshold":       0.11,
-    "beta_alert_threshold": 0.30,
-    "beta_critical":        1.0,
+    "beta_threshold":       0.20,      # median: 3 seeds agree (was 0.11)
+    "beta_alert_threshold": 0.30,      # fixed (Telegram only)
+    "beta_critical":        1.0,       # fixed
 
     # ── Circuit breaker ───────────────────────────────────────────────────────
     "circuit_breaker_pct":  0.50,
 
     # ── Entry confirmation & hold ─────────────────────────────────────────────
     "signal_confirm_sec":    10,
-    "coint_stability_min_bars": 1,
+    "coint_stability_min_bars": 4,     # final: stable (Q25=3, Q75=5)
     "entry_et_target_abs_z": 0.5,
-    "hold_multiplier":       3.0,
-    "max_hold_days":         12.0,
+    "hold_multiplier":       6.5,      # final: median of 35 top trials
+    "max_hold_days":         22.0,     # final: median (Q25=18, Q75=30)
 
     # ── Cooldowns ─────────────────────────────────────────────────────────────
     "sl_reentry_cooldown_sec":  0,
     "close_retry_cooldown_sec": 30,
 
     # ── Half-life bounds ──────────────────────────────────────────────────────
-    "hl_min_days": 0.5,
-    "hl_max_days": 4.0,
+    "hl_min_days": 0.5,      # final: 5/7 seeds agree
+    "hl_max_days": 4.5,      # final: narrow runs converge to 3.5-4.5
 
     # ── Window ────────────────────────────────────────────────────────────────
     "window_size":         180,
@@ -189,6 +189,7 @@ def _cfg_to_params_dict(cfg: dict) -> dict:
         "circuit_breaker_pct":        float(cfg.get("circuit_breaker_pct", 0.50)),
         "signal_confirm_sec":         int(cfg.get("signal_confirm_sec", 10)),
         "coint_stability_min_bars":   int(cfg.get("coint_stability_min_bars", 1)),
+        "coint_broken_grace_bars":    int(cfg.get("coint_broken_grace_bars", 2)),
         "entry_et_target_abs_z":      float(cfg.get("entry_et_target_abs_z", 0.5)),
         "hold_multiplier":            float(cfg.get("hold_multiplier", 3.0)),
         "max_hold_days":              float(cfg.get("max_hold_days", 12.0)),
@@ -999,6 +1000,7 @@ def save_best_pairs_json(
             "beta_critical":         params_used.get("beta_critical"),
             "circuit_breaker_pct":   params_used.get("circuit_breaker_pct"),
             "coint_stability_min_bars": params_used.get("coint_stability_min_bars"),
+            "coint_broken_grace_bars": params_used.get("coint_broken_grace_bars"),
             "hold_multiplier":       params_used.get("hold_multiplier"),
             "max_hold_days":         params_used.get("max_hold_days"),
             "hl_min_days":           params_used.get("hl_min_days"),
@@ -1103,6 +1105,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--notional-pct",   type=float, default=None)
     p.add_argument("--hold-multiplier", type=float, default=None)
     p.add_argument("--coint-min-bars", type=int,   default=None)
+    p.add_argument("--coint-broken-grace-bars", type=int, default=None)
     p.add_argument("--recompute",      type=int,   default=1,
                    help="Recalculate engine cointegration every N bars (e.g. 6 = 24h). Default 1.")
 
@@ -1219,6 +1222,8 @@ def main() -> None:
     if args.output_dir is not None:     cfg["output_dir"] = args.output_dir
     if args.hold_multiplier is not None: cfg["hold_multiplier"] = args.hold_multiplier
     if args.coint_min_bars is not None: cfg["coint_stability_min_bars"] = args.coint_min_bars
+    if args.coint_broken_grace_bars is not None:
+        cfg["coint_broken_grace_bars"] = args.coint_broken_grace_bars
     if args.min_trades is not None:     cfg["min_trades"] = args.min_trades
     if args.scan_workers is not None:   cfg["scan_workers"] = args.scan_workers
     if args.top is not None:            cfg["top_n"] = args.top
@@ -1338,7 +1343,8 @@ def main() -> None:
     for k in ["z_entry", "z_entry_max", "z_exit", "z_stop", "window_size",
               "max_notional_pct", "capital", "hold_multiplier", "max_hold_days",
               "p_value_threshold", "hedge_min", "hedge_max", "beta_threshold",
-              "beta_critical", "coint_stability_min_bars", "hl_min_days", "hl_max_days",
+              "beta_critical", "coint_stability_min_bars", "coint_broken_grace_bars",
+              "hl_min_days", "hl_max_days",
               "commission_rate", "slippage_rate", "circuit_breaker_pct"]:
         print(f"    {k:<30} = {cfg[k]}")
     print()

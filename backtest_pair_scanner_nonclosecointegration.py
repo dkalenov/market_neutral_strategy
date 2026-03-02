@@ -611,24 +611,24 @@ def run_scanner_hyperopt(
     def objective(trial: optuna.Trial) -> float:
         nonlocal best_obj_so_far, _pool_broken
         cfg = dict(base_cfg)
-        # ── Search space (11 params that directly affect signal quality) ──
+        # ── NARROWED search space (based on 9 prior runs convergence) ──
         # Core entry/exit
-        cfg["z_entry"]     = trial.suggest_float("z_entry",     1.4, 2.5,  step=0.1)
+        cfg["z_entry"]     = trial.suggest_float("z_entry",     1.5, 2.2,  step=0.1)    # was 1.4-2.5
         cfg["z_entry_max"] = trial.suggest_float("z_entry_max", cfg["z_entry"] + 0.2, 3.5, step=0.1)
-        cfg["z_exit"]      = trial.suggest_float("z_exit",      0.0, 0.35, step=0.05)
-        cfg["z_stop"]      = trial.suggest_float("z_stop",      2.5, 5.0,  step=0.5)
+        cfg["z_exit"]      = trial.suggest_float("z_exit",      0.0, 0.30, step=0.05)   # was 0-0.35
+        cfg["z_stop"]      = trial.suggest_float("z_stop",      3.5, 5.0,  step=0.5)    # was 2.5-5.0
         # Cointegration & beta filters
-        cfg["beta_threshold"]      = trial.suggest_float("beta_threshold",      0.05, 0.25, step=0.05)
-        cfg["p_value_threshold"]   = trial.suggest_float("p_value_threshold",   0.01, 0.08, step=0.01)
-        cfg["coint_stability_min_bars"] = trial.suggest_int("coint_stability_min_bars", 1, 5)
+        cfg["beta_threshold"]      = trial.suggest_float("beta_threshold",    0.15, 0.25, step=0.05)  # was 0.05-0.25
+        cfg["p_value_threshold"]   = trial.suggest_float("p_value_threshold", 0.03, 0.06, step=0.01)  # was 0.01-0.08
+        cfg["coint_stability_min_bars"] = trial.suggest_int("coint_stability_min_bars", 2, 5)          # was 1-5
         # Holding period
-        cfg["hold_multiplier"] = trial.suggest_float("hold_multiplier", 2.0, 8.0, step=0.5)
-        cfg["max_hold_days"]   = trial.suggest_float("max_hold_days",   7.0, 60.0, step=1.0)
+        cfg["hold_multiplier"] = trial.suggest_float("hold_multiplier", 4.0, 8.0, step=0.5)  # was 2.0-8.0
+        cfg["max_hold_days"]   = trial.suggest_float("max_hold_days",   14.0, 40.0, step=1.0) # was 7-60
         # Half-life filter
-        cfg["hl_min_days"] = trial.suggest_float("hl_min_days", 0.5, 3.0, step=0.25)
-        cfg["hl_max_days"] = trial.suggest_float("hl_max_days", cfg["hl_min_days"] + 1.0, 15.0, step=1.0)
-        # Grace period for broken cointegration (THE experiment)
-        cfg["coint_broken_grace_bars"] = trial.suggest_int("coint_broken_grace_bars", 0, 12)
+        cfg["hl_min_days"] = trial.suggest_float("hl_min_days", 0.5, 1.0, step=0.25)     # was 0.5-3.0
+        cfg["hl_max_days"] = trial.suggest_float("hl_max_days", cfg["hl_min_days"] + 1.0, 13.0, step=0.5) # was +1-15
+        # Grace period (narrowed: 0-4 instead of 0-12)
+        cfg["coint_broken_grace_bars"] = trial.suggest_int("coint_broken_grace_bars", 0, 4) # was 0-12
         # Fixed (not optimized): max_notional_pct, circuit_breaker_pct,
         # beta_alert_threshold (Telegram only), beta_critical, hedge_min/max
 
@@ -1003,6 +1003,7 @@ def save_best_pairs_json(
             "beta_critical":         params_used.get("beta_critical"),
             "circuit_breaker_pct":   params_used.get("circuit_breaker_pct"),
             "coint_stability_min_bars": params_used.get("coint_stability_min_bars"),
+            "coint_broken_grace_bars": params_used.get("coint_broken_grace_bars"),
             "hold_multiplier":       params_used.get("hold_multiplier"),
             "max_hold_days":         params_used.get("max_hold_days"),
             "hl_min_days":           params_used.get("hl_min_days"),
@@ -1107,6 +1108,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--notional-pct",   type=float, default=None)
     p.add_argument("--hold-multiplier", type=float, default=None)
     p.add_argument("--coint-min-bars", type=int,   default=None)
+    p.add_argument("--coint-broken-grace-bars", type=int, default=None)
     p.add_argument("--recompute",      type=int,   default=1,
                    help="Recalculate engine cointegration every N bars (e.g. 6 = 24h). Default 1.")
 
@@ -1223,6 +1225,8 @@ def main() -> None:
     if args.output_dir is not None:     cfg["output_dir"] = args.output_dir
     if args.hold_multiplier is not None: cfg["hold_multiplier"] = args.hold_multiplier
     if args.coint_min_bars is not None: cfg["coint_stability_min_bars"] = args.coint_min_bars
+    if args.coint_broken_grace_bars is not None:
+        cfg["coint_broken_grace_bars"] = args.coint_broken_grace_bars
     if args.min_trades is not None:     cfg["min_trades"] = args.min_trades
     if args.scan_workers is not None:   cfg["scan_workers"] = args.scan_workers
     if args.top is not None:            cfg["top_n"] = args.top
@@ -1342,7 +1346,8 @@ def main() -> None:
     for k in ["z_entry", "z_entry_max", "z_exit", "z_stop", "window_size",
               "max_notional_pct", "capital", "hold_multiplier", "max_hold_days",
               "p_value_threshold", "hedge_min", "hedge_max", "beta_threshold",
-              "beta_critical", "coint_stability_min_bars", "hl_min_days", "hl_max_days",
+              "beta_critical", "coint_stability_min_bars", "coint_broken_grace_bars",
+              "hl_min_days", "hl_max_days",
               "commission_rate", "slippage_rate", "circuit_breaker_pct"]:
         print(f"    {k:<30} = {cfg[k]}")
     print()
