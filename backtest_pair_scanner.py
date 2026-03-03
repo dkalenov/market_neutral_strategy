@@ -121,6 +121,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     # ── Entry confirmation & hold ─────────────────────────────────────────────
     "signal_confirm_sec":    10,
     "coint_stability_min_bars": 4,     # final: stable (Q25=3, Q75=5)
+    "coint_broken_grace_bars": 2,
     "entry_et_target_abs_z": 0.5,
     "hold_multiplier":       6.5,      # final: median of 35 top trials
     "max_hold_days":         22.0,     # final: median (Q25=18, Q75=30)
@@ -1369,7 +1370,7 @@ def main() -> None:
               "beta_critical", "coint_stability_min_bars", "coint_broken_grace_bars",
               "hl_min_days", "hl_max_days",
               "commission_rate", "slippage_rate", "circuit_breaker_pct"]:
-        print(f"    {k:<30} = {cfg[k]}")
+        print(f"    {k:<30} = {cfg.get(k)}")
     print()
 
     # ── Hyperopt (optional) ────────────────────────────────────────────────────
