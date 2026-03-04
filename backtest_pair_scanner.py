@@ -99,7 +99,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "z_entry":         1.6,       # final: median of 35 top grace trials
     "z_entry_max":     2.7,       # final: median (Q25=2.5, Q75=3.1)
     "z_exit":          0.10,      # final: median (mass in 0.05-0.15)
-    "z_stop":          5.0,       # final: stable across seeds
+    "z_stop":          4.0,       # user override
 
     # ── Costs ─────────────────────────────────────────────────────────────────
     "commission_rate":  0.0004,
@@ -1093,9 +1093,6 @@ def print_summary(results: list[dict], top_n: int = 25) -> None:
     print()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1110,6 +1107,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-inflight",   type=int, default=None, help="Max pending futures (0=auto)")
     p.add_argument("--worker-recycle", type=int, default=None,
                    help="Max tasks per child process before recycle (0=disable)")
+    p.add_argument("--blacklist",      default=None,
+                   help="Path to blacklist JSON (pairs to exclude from scan)")
     p.add_argument("--output-dir",     default=None)
 
     # Strategy params (override defaults)
@@ -1290,6 +1289,27 @@ def main() -> None:
     print(f"  Data:     {len(market.symbols)} symbols × {len(market.dates)} bars")
     print(f"  Source:   {klines_path}")
 
+    # ── Load blacklist ─────────────────────────────────────────────────────────
+    blacklist_pairs: set[tuple[str, str]] = set()
+    if args.blacklist:
+        bl_path = Path(args.blacklist)
+        if bl_path.exists():
+            try:
+                with open(bl_path, "r", encoding="utf-8") as f:
+                    bl_data = json.load(f)
+                bl_list = bl_data.get("pairs", bl_data) if isinstance(bl_data, dict) else bl_data
+                for item in bl_list:
+                    pair_str = item.get("pair", item) if isinstance(item, dict) else str(item)
+                    parts = pair_str.strip().upper().split("-")
+                    if len(parts) == 2:
+                        a, b = sorted(parts)
+                        blacklist_pairs.add((a, b))
+                print(f"  Blacklist: {len(blacklist_pairs)} pairs from {bl_path}")
+            except Exception as e:
+                print(f"  [WARN] Failed to parse blacklist {bl_path}: {e}")
+        else:
+            print(f"  [WARN] Blacklist file not found: {bl_path}")
+
     # ── Build pair list ────────────────────────────────────────────────────────
     # Priority: CLI --from-pairs > DEFAULT_PARAMS from_pairs > all combos
     from_pairs_path = args.from_pairs or cfg.get("from_pairs")
@@ -1301,6 +1321,16 @@ def main() -> None:
         sym_set = [s for s in market.symbols if s != "BTCUSDT"]
         pairs = list(combinations(sym_set, 2))
         print(f"  Mode:     ALL PAIRS — {len(pairs):,} combinations from {len(sym_set)} symbols")
+
+    # ── Apply blacklist filter ─────────────────────────────────────────────────
+    if blacklist_pairs:
+        before = len(pairs)
+        pairs = [
+            (a, b) for a, b in pairs
+            if tuple(sorted((a, b))) not in blacklist_pairs
+        ]
+        removed = before - len(pairs)
+        print(f"  Filtered: {removed} blacklisted pairs removed → {len(pairs):,} remaining")
 
     if not pairs:
         print("[ERROR] No pairs to scan!")

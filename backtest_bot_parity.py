@@ -303,6 +303,31 @@ def load_klines_market_data(csv_path: str, max_symbols: int) -> MarketData:
     df = df[(df["Open"] > 0) & (df["High"] > 0) & (df["Low"] > 0) & (df["Close"] > 0)]
     df = df.sort_values(["Symbol", "Date"]).reset_index(drop=True)
 
+    # Some data sources can contain repeated candles for the same Date+Symbol.
+    # Collapse duplicates before pivot to avoid "Index contains duplicate entries".
+    dup_mask = df.duplicated(subset=["Date", "Symbol"], keep=False)
+    if bool(dup_mask.any()):
+        dup_rows = int(dup_mask.sum())
+        dup_keys = int(df.loc[dup_mask, ["Date", "Symbol"]].drop_duplicates().shape[0])
+        df = (
+            df.groupby(["Date", "Symbol"], as_index=False, sort=False)
+            .agg(
+                {
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }
+            )
+            .sort_values(["Symbol", "Date"])
+            .reset_index(drop=True)
+        )
+        print(
+            f"[WARN] Collapsed duplicate candles: rows={dup_rows}, keys={dup_keys} "
+            f"in {path.name}"
+        )
+
     vol_rank = (
         df.groupby("Symbol")["Volume"]
         .median()
@@ -2284,6 +2309,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-idle-pairs", type=int, default=None)
     # ── Entry confirmation & hold ─────────────────────────────────────────────
     parser.add_argument("--coint-stability-min-bars", type=int, default=None)
+    parser.add_argument("--coint-broken-grace-bars", type=int, default=None)
     parser.add_argument("--signal-confirm-sec", type=int, default=None)
     parser.add_argument("--entry-et-target-abs-z", type=float, default=None)
     parser.add_argument("--hold-multiplier", type=float, default=None)
@@ -2400,6 +2426,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     # ── Entry confirmation & hold ─────────────────────────────────────────────
     "signal_confirm_sec":    10,
     "coint_stability_min_bars": 1,    # was 2 — require 5 bars of cointegration
+    "coint_broken_grace_bars": 2,     # wait N bars of broken coint before forced close
     "entry_et_target_abs_z": 0.5,
     "hold_multiplier":       3.0,    # max_hold = HL * this
     "max_hold_days":         12.0,   # hard cap on hold time (was 30)
@@ -2526,6 +2553,7 @@ def main() -> None:
         circuit_breaker_pct=float(cfg["circuit_breaker_pct"]),
         signal_confirm_sec=int(cfg["signal_confirm_sec"]),
         coint_stability_min_bars=int(cfg["coint_stability_min_bars"]),
+        coint_broken_grace_bars=int(cfg["coint_broken_grace_bars"]),
         entry_et_target_abs_z=float(cfg["entry_et_target_abs_z"]),
         max_active_pairs=int(cfg["max_active_pairs"]),
         max_idle_pairs=int(cfg["max_idle_pairs"]),
