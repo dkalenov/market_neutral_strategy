@@ -410,6 +410,9 @@ async def audit_data_integrity(sample_limit: int = 20):
     return result
 
 FINAL_STRATEGY_PATH = Path(__file__).resolve().parent / 'backtest_results' / 'final_ready_4h_nonclose' / 'final_best_pairs_4h_nonclose.json'
+LIVE_SAFE_SYMBOL_BLACKLIST = 'BTCUSDT,ETHUSDT,LTCUSDT,BTCDOMUSDT,DEFIUSDT,USDCUSDT'
+LIVE_SAFE_MAX_NOTIONAL_PCT = '0.175'
+LIVE_SAFE_MAX_ACTIVE_PAIRS = '4'
 
 
 def _stringify_config_value(value):
@@ -470,12 +473,13 @@ async def load_config():
             'window_size': '0',
             'capital': '100',
             'leverage': canonical_strategy.get('leverage', '20'),
-            'max_notional_pct': canonical_strategy.get('max_notional_pct', '0.3'),
+            # Live defaults are intentionally safer than backtest portfolio sizing.
+            'max_notional_pct': LIVE_SAFE_MAX_NOTIONAL_PCT,
             'z_entry': canonical_strategy.get('z_entry', '1.6'),
             'z_entry_max': canonical_strategy.get('z_entry_max', '2.7'),  # Upper bound for entry window
             'z_exit': canonical_strategy.get('z_exit', '0.1'),
             'z_stop': canonical_strategy.get('z_stop', '4.0'),
-            'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
+            'blacklist': LIVE_SAFE_SYMBOL_BLACKLIST,
             # Hardware SL/TP defaults
             'sl_atr_mult': '2.5',
             'sl_min_pct': '0.10',
@@ -487,7 +491,7 @@ async def load_config():
             'p_value_threshold': canonical_strategy.get('p_value_threshold', '0.05'),
             'max_order_bump': '1.5',
             # Position Management (Phase 2)
-            'max_active_pairs': canonical_strategy.get('max_active_pairs', '8'),
+            'max_active_pairs': LIVE_SAFE_MAX_ACTIVE_PAIRS,
             'test_mode': 'false',
             'priority_pairs_file': final_best_pairs_path,
             'best_pairs_only': 'true',
@@ -553,12 +557,15 @@ async def load_config():
             legacy_value_map = {
                 'timeframe': {'1h'},
                 'window_size': {'', '336'},
-                'max_notional_pct': {'0.4'},
+                'max_notional_pct': {'0.4', '0.3', '0.30'},
                 'z_entry': {'1.8'},
                 'z_entry_max': {'2.5'},
                 'z_exit': {'0.05'},
+                'blacklist': {
+                    'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
+                },
                 'circuit_breaker_pct': {'0.5', '0.50'},
-                'max_active_pairs': {'3'},
+                'max_active_pairs': {'3', '8'},
                 'max_symbols': {'300'},
                 'hl_min_days': {'0.25'},
                 'hl_max_days': {'2.0'},
