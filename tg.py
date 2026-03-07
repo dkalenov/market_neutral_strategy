@@ -49,6 +49,16 @@ config.read('market_neutral/config.ini')
 tg_admins = []
 
 
+def _cfg_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
 def _repair_mojibake_text(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
@@ -403,20 +413,27 @@ async def settings(message: Message, state: FSMContext):
     await state.set_state(States.settings)
     # Get test mode status
     test_mode = getattr(conf, 'test_mode', False)
-    if isinstance(test_mode, str):
-        test_mode = test_mode.lower() in ('true', '1', 'yes')
+    test_mode = _cfg_bool(test_mode, False)
     
     # Get trade mode status
     trade_mode = getattr(conf, 'trade_mode', True)
-    if isinstance(trade_mode, str):
-        trade_mode = trade_mode.lower() in ('true', '1', 'yes')
+    trade_mode = _cfg_bool(trade_mode, True)
+    best_pairs_only = _cfg_bool(getattr(conf, 'best_pairs_only', True), True)
+    pair_blacklist_enabled = _cfg_bool(getattr(conf, 'pair_blacklist_enabled', True), True)
+    if not best_pairs_only:
+        pair_blacklist_enabled = True
+    auto_refresh_priority_pairs = _cfg_bool(getattr(conf, 'auto_refresh_priority_pairs', False), False)
+    priority_pairs_file = str(getattr(conf, 'priority_pairs_file', '') or '')
+    pair_blacklist_file = str(getattr(conf, 'pair_blacklist_file', '') or '')
     
     # Create keyboard
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔄 Trading: {'ON ✅' if trade_mode else 'OFF ❌'}", callback_data="toggle_trade_mode")],
+        [InlineKeyboardButton(text=f"🎯 Universe: {'BEST ✅' if best_pairs_only else 'FULL 🌐'}", callback_data="toggle_best_pairs_only"),
+         InlineKeyboardButton(text=f"⛔ Pair BL: {'ON ✅' if pair_blacklist_enabled else 'OFF ❌'}", callback_data="toggle_pair_blacklist_enabled")],
         [InlineKeyboardButton(text="Strategy Settings", callback_data="strategy_settings")],
         [InlineKeyboardButton(text="Risk Settings", callback_data="risk_settings")],
-        [InlineKeyboardButton(text="📋 Manage Blacklist", callback_data="manage_blacklist")],
+        [InlineKeyboardButton(text="📋 Manage Symbol Blacklist", callback_data="manage_blacklist")],
         [InlineKeyboardButton(text=f"🧪 Test Mode: {'ON ✅' if test_mode else 'OFF ❌'}", callback_data="toggle_test_mode")],
         [InlineKeyboardButton(text="Change Keys/Tokens", callback_data="change_keys")],
         [InlineKeyboardButton(text="Restart Bot", callback_data="restart")]
@@ -438,6 +455,12 @@ async def settings(message: Message, state: FSMContext):
             f"<b>Strategy Parameters:</b>\n"
             f"Timeframe: <b>{tf}</b>\n"
             f"Window: <b>{win}</b>\n\n"
+            f"<b>Universe:</b>\n"
+            f"Mode: <b>{'best_pairs only' if best_pairs_only else 'full market'}</b>\n"
+            f"Pair blacklist: <b>{'ON' if pair_blacklist_enabled else 'OFF'}</b>\n"
+            f"Auto-refresh best_pairs file: <b>{'ON' if auto_refresh_priority_pairs else 'OFF'}</b>\n"
+            f"Best pairs file: <code>{os.path.basename(priority_pairs_file) if priority_pairs_file else '(not set)'}</code>\n"
+            f"Pair blacklist file: <code>{os.path.basename(pair_blacklist_file) if pair_blacklist_file else '(not set)'}</code>\n\n"
             f"<b>Risk Management:</b>\n"
             f"Capital: <b>{cap} USDT</b>\n"
             f"Leverage: <b>x{lev}</b>\n"
@@ -538,6 +561,9 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
     bump = getattr(conf, 'max_order_bump', 1.5) or 1.5
     et_target = getattr(conf, 'entry_et_target_abs_z', 0.5) or 0.5
     coint_stability = int(getattr(conf, 'coint_stability_min_bars', 3) or 3)
+    coint_broken_grace = int(getattr(conf, 'coint_broken_grace_bars', 2) or 2)
+    hold_multiplier = float(getattr(conf, 'hold_multiplier', 6.5) or 6.5)
+    max_hold_days = float(getattr(conf, 'max_hold_days', 22.0) or 22.0)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💵 Capital: {capital} USDT", callback_data="set_capital")],
@@ -556,6 +582,9 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"🧪 P-Value Threshold: {p_val}", callback_data="set_p_value")],
         [InlineKeyboardButton(text=f"🎯 E[T] target |Z|: {et_target}", callback_data="set_entry_et_target_abs_z")],
         [InlineKeyboardButton(text=f"🔁 Coint stability bars: {coint_stability}", callback_data="set_coint_stability_min_bars")],
+        [InlineKeyboardButton(text=f"🧱 Broken coint grace: {coint_broken_grace}", callback_data="set_coint_broken_grace_bars")],
+        [InlineKeyboardButton(text=f"⏱️ Hold xHL: {hold_multiplier}", callback_data="set_hold_multiplier"),
+         InlineKeyboardButton(text=f"📅 Max hold: {max_hold_days}d", callback_data="set_max_hold_days")],
         [InlineKeyboardButton(text=f"📏 Max Order Bump: {bump}x", callback_data="set_max_bump")],
         [InlineKeyboardButton(text=f"📈 Max Symbols: {max_symbols}", callback_data="set_max_symbols")],
         [InlineKeyboardButton(text=f"🗑️ Max Idle: {max_idle}", callback_data="set_max_idle"),
@@ -570,6 +599,8 @@ async def risk_settings_menu(callback: CallbackQuery, state: FSMContext):
                            f"<b>β Alert/Critical</b>: {beta_alert_threshold} / {beta_critical}\n"
                            f"<b>E[T] target |Z|</b>: {et_target}\n"
                            f"<b>Coint stability bars</b>: {coint_stability}\n"
+                           f"<b>Broken coint grace</b>: {coint_broken_grace} bars\n"
+                           f"<b>Time exit</b>: HL x {hold_multiplier}, cap {max_hold_days}d\n"
                            f"<b>Max Symbols</b>: Filter top {max_symbols} by volume.\n\n"
                            f"<b>Idle Pair Cleanup:</b>\n"
                            f"  • Max idle pairs: {max_idle}\n"
@@ -663,8 +694,7 @@ async def set_idle_timeout_cb(callback: CallbackQuery, state: FSMContext):
 async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     current = getattr(conf, 'trade_mode', True)
-    if isinstance(current, str):
-        current = current.lower() in ('true', '1', 'yes')
+    current = _cfg_bool(current, True)
     
     new_value = 'false' if current else 'true'
     await db.config_update(trade_mode=new_value)
@@ -682,12 +712,52 @@ async def toggle_trade_mode_cb(callback: CallbackQuery, state: FSMContext):
     # Refresh menu - go back to settings
     await settings(callback, state)
 
+
+@dp.callback_query(F.data == "toggle_best_pairs_only")
+async def toggle_best_pairs_only_cb(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    current = _cfg_bool(getattr(conf, 'best_pairs_only', True), True)
+    new_best_only = not current
+    updates = {'best_pairs_only': 'true' if new_best_only else 'false'}
+    if not new_best_only:
+        updates['pair_blacklist_enabled'] = 'true'
+    await db.config_update(**updates)
+
+    if pairs_manager and hasattr(pairs_manager, 'config'):
+        pairs_manager.config = await db.load_config()
+
+    if new_best_only:
+        status = "🎯 Universe: BEST PAIRS ONLY"
+    else:
+        status = "🌐 Universe: FULL MARKET\n⛔ Pair blacklist forced ON"
+    await callback.answer(status, show_alert=True)
+    await settings(callback, state)
+
+
+@dp.callback_query(F.data == "toggle_pair_blacklist_enabled")
+async def toggle_pair_blacklist_enabled_cb(callback: CallbackQuery, state: FSMContext):
+    conf = await db.load_config()
+    current = _cfg_bool(getattr(conf, 'pair_blacklist_enabled', True), True)
+    best_pairs_only = _cfg_bool(getattr(conf, 'best_pairs_only', True), True)
+    if not best_pairs_only and current:
+        await callback.answer("⛔ In FULL universe mode pair blacklist must stay ON", show_alert=True)
+        await settings(callback, state)
+        return
+    new_value = 'false' if current else 'true'
+    await db.config_update(pair_blacklist_enabled=new_value)
+
+    if pairs_manager and hasattr(pairs_manager, 'config'):
+        pairs_manager.config = await db.load_config()
+
+    status = f"⛔ Pair blacklist {'ENABLED' if new_value == 'true' else 'DISABLED'}"
+    await callback.answer(status, show_alert=True)
+    await settings(callback, state)
+
 @dp.callback_query(F.data == "toggle_test_mode")
 async def toggle_test_mode_cb(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     current = getattr(conf, 'test_mode', False)
-    if isinstance(current, str):
-        current = current.lower() in ('true', '1', 'yes')
+    current = _cfg_bool(current, False)
     
     new_value = 'false' if current else 'true'
     await db.config_update(test_mode=new_value)
@@ -797,6 +867,27 @@ async def set_coint_stability_min_bars_cb(callback: CallbackQuery, state: FSMCon
     await state.set_state(States.settings)
     await state.update_data(waiting_for="coint_stability_min_bars")
     await answer(callback, "Enter minimum consecutive cointegration bars before entry (e.g., 3):")
+
+
+@dp.callback_query(F.data == "set_coint_broken_grace_bars")
+async def set_coint_broken_grace_bars_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="coint_broken_grace_bars")
+    await answer(callback, "Enter broken cointegration grace bars before forced close (e.g., 2):")
+
+
+@dp.callback_query(F.data == "set_hold_multiplier")
+async def set_hold_multiplier_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="hold_multiplier")
+    await answer(callback, "Enter time-exit hold multiplier on entry half-life in bars (e.g., 6.5):")
+
+
+@dp.callback_query(F.data == "set_max_hold_days")
+async def set_max_hold_days_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(States.settings)
+    await state.update_data(waiting_for="max_hold_days")
+    await answer(callback, "Enter hard cap for time-exit in days (e.g., 22):")
 
 @dp.callback_query(F.data == "set_max_bump")
 async def set_max_bump_cb(callback: CallbackQuery, state: FSMContext):
@@ -983,6 +1074,30 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             await db.config_update(coint_stability_min_bars=val)
             await answer(message, f"Coint stability min bars: <b>{val}</b>")
 
+        elif waiting_for == "coint_broken_grace_bars":
+            val = int(value)
+            if val < 0:
+                await answer(message, "Value must be >= 0.")
+                return
+            await db.config_update(coint_broken_grace_bars=val)
+            await answer(message, f"Broken coint grace bars: <b>{val}</b>")
+
+        elif waiting_for == "hold_multiplier":
+            val = float(value)
+            if val <= 0:
+                await answer(message, "Value must be > 0.")
+                return
+            await db.config_update(hold_multiplier=val)
+            await answer(message, f"Time-exit hold multiplier: <b>{val}</b>")
+
+        elif waiting_for == "max_hold_days":
+            val = float(value)
+            if val <= 0:
+                await answer(message, "Value must be > 0.")
+                return
+            await db.config_update(max_hold_days=val)
+            await answer(message, f"Max hold days: <b>{val}</b>")
+
         elif waiting_for == "max_order_bump":
             val = float(value)
             if val < 1:
@@ -1107,7 +1222,7 @@ async def blacklist_menu(event: Message | CallbackQuery, state: FSMContext):
     full_bl_str = ", ".join(sorted(split_list)) if split_list else "(empty)"
 
     text = (
-        "<b>Blacklist Management</b>\n\n"
+        "<b>Symbol Blacklist Management</b>\n\n"
         "Symbols in this list are ignored during pair discovery.\n\n"
         f"<b>Current Blacklist:</b>\n<code>{full_bl_str}</code>\n\n"
         "To <b>add</b> symbols, send them separated by commas (e.g., PEPE, FLOKI).\n"
@@ -1370,9 +1485,3 @@ async def send_startup_message():
             await bot.send_message(admin_id, _repair_mojibake_text("Bot started successfully!"))
         except Exception as e:
             print(f"Could not send startup message to admin {admin_id}: {e}")
-
-
-
-
-
-

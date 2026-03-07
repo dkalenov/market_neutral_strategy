@@ -1,4 +1,6 @@
-﻿import time
+import json
+import time
+from pathlib import Path
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, select, delete, update, text, func, case
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -45,6 +47,8 @@ class Pairs(Base):
     symbol2 = Column(String)
     hedge_ratio = Column(Float)
     half_life = Column(Float)
+    entry_half_life_bars = Column(Float, default=0.0)
+    entry_hold_limit_bars = Column(Integer, default=0)
     position_status = Column(Integer, default=0) # 0: none, 1: long spread, -1: short spread
     qty1 = Column(Float, default=0.0)
     qty2 = Column(Float, default=0.0)
@@ -158,6 +162,10 @@ class ConfigInfo:
     max_active_pairs: int   # Maximum concurrent open pairs (default 5)
     test_mode: bool         # Force trades without signals on testnet (default False)
     priority_pairs_file: str # Path to JSON file with priority pairs (default 'market_neutral/best_pairs.json')
+    best_pairs_only: bool   # If True, only pairs from priority_pairs_file may open new trades
+    pair_blacklist_file: str  # Path to JSON/CSV/TXT pair blacklist file
+    pair_blacklist_enabled: bool  # If True, skip blacklisted pairs on discovery/entry
+    auto_refresh_priority_pairs: bool  # If True, mutate priority_pairs_file from live results
     # Symbol Filtering
     max_symbols: int        # Top N symbols by 24h volume (default 150)
     tg_channel: str         # TG channel ID for trade notifications (default '')
@@ -172,6 +180,9 @@ class ConfigInfo:
     trade_mode: bool        # If True, allow opening new positions (default True)
     entry_et_target_abs_z: float  # Target |Z| for E[T] estimate in open alert (default 0.5)
     coint_stability_min_bars: int  # Minimum consecutive coint bars before entry (default 3)
+    coint_broken_grace_bars: int  # Bars to wait before closing open trade on broken coint
+    hold_multiplier: float  # Time-exit multiplier on entry half-life in bars
+    max_hold_days: float  # Hard cap for time-exit in days
     # Hedge Ratio Bounds (market neutrality)
     hedge_min: float        # Minimum |hedge_ratio| for pair acceptance (default 0.3)
     hedge_max: float        # Maximum |hedge_ratio| for pair acceptance (default 3.0)
@@ -240,6 +251,8 @@ async def run_migrations(engine):
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS qty2 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price1 FLOAT DEFAULT 0.0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_price2 FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_half_life_bars FLOAT DEFAULT 0.0;",
+        "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS entry_hold_limit_bars INTEGER DEFAULT 0;",
         # TG notification tracking columns
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS tg_message_id INTEGER DEFAULT 0;",
         "ALTER TABLE pairs ADD COLUMN IF NOT EXISTS open_time BIGINT DEFAULT 0;",
@@ -396,21 +409,72 @@ async def audit_data_integrity(sample_limit: int = 20):
         result['pairs_with_multiple_open_trades'] = int(q3.scalar() or 0)
     return result
 
+FINAL_STRATEGY_PATH = Path(__file__).resolve().parent / 'backtest_results' / 'final_ready_4h_nonclose' / 'final_best_pairs_4h_nonclose.json'
+
+
+def _stringify_config_value(value):
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, float):
+        return format(value, '.15g')
+    return str(value)
+
+
+def _value_matches_any(value, candidates: set[str]) -> bool:
+    current = str(value or '').strip().lower()
+    if current in {str(c).strip().lower() for c in candidates}:
+        return True
+    try:
+        current_num = float(current)
+    except Exception:
+        return False
+    for candidate in candidates:
+        try:
+            if abs(current_num - float(candidate)) < 1e-12:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _load_canonical_strategy_defaults() -> dict[str, str]:
+    if not FINAL_STRATEGY_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(FINAL_STRATEGY_PATH.read_text(encoding='utf-8'))
+        params = payload.get('strategy_params', {}) or {}
+    except Exception as e:
+        print(f"WARN: canonical strategy defaults load failed: {e}")
+        return {}
+
+    allowed_keys = {
+        'timeframe', 'leverage', 'max_notional_pct', 'z_entry', 'z_entry_max', 'z_exit', 'z_stop',
+        'p_value_threshold', 'hedge_min', 'hedge_max', 'beta_threshold', 'beta_alert_threshold',
+        'beta_critical', 'circuit_breaker_pct', 'signal_confirm_sec', 'coint_stability_min_bars',
+        'coint_broken_grace_bars', 'entry_et_target_abs_z', 'max_active_pairs', 'max_idle_pairs',
+        'hold_multiplier', 'max_hold_days', 'discovery_shards', 'discovery_max_pairs_per_cycle',
+        'max_symbols', 'hl_min_days', 'hl_max_days'
+    }
+    return {key: _stringify_config_value(params[key]) for key in allowed_keys if key in params and params[key] is not None}
+
+
 async def load_config():
     if Session is None:
         raise RuntimeError("DB Session not initialized. Call db.connect() first.")
     try:
-        # Default values
+        final_best_pairs_path = 'backtest_results/final_ready_4h_nonclose/final_best_pairs_4h_nonclose.json'
+        final_pair_blacklist_path = 'backtest_results/final_ready_4h_nonclose/final_pair_blacklist_4h_nonclose.json'
+        canonical_strategy = _load_canonical_strategy_defaults()
         DEFAULTS = {
-            'timeframe': '1h',
-            'window_size': '',
+            'timeframe': canonical_strategy.get('timeframe', '4h'),
+            'window_size': '0',
             'capital': '100',
-            'leverage': '20',
-            'max_notional_pct': '0.4',
-            'z_entry': '1.8',
-            'z_entry_max': '2.5',  # Upper bound for entry window
-            'z_exit': '0.05',
-            'z_stop': '4.0',
+            'leverage': canonical_strategy.get('leverage', '20'),
+            'max_notional_pct': canonical_strategy.get('max_notional_pct', '0.3'),
+            'z_entry': canonical_strategy.get('z_entry', '1.6'),
+            'z_entry_max': canonical_strategy.get('z_entry_max', '2.7'),  # Upper bound for entry window
+            'z_exit': canonical_strategy.get('z_exit', '0.1'),
+            'z_stop': canonical_strategy.get('z_stop', '4.0'),
             'blacklist': 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,TRXUSDT,LTCUSDT,USDCUSDT,BTCDOMUSDT,DEFIUSDT',
             # Hardware SL/TP defaults
             'sl_atr_mult': '2.5',
@@ -419,36 +483,43 @@ async def load_config():
             'tp_atr_mult': '4.0',
             'tp_min_pct': '0.15',
             'tp_max_pct': '0.50',
-            'circuit_breaker_pct': '0.50',
-            'p_value_threshold': '0.05',
+            'circuit_breaker_pct': canonical_strategy.get('circuit_breaker_pct', '0.3'),
+            'p_value_threshold': canonical_strategy.get('p_value_threshold', '0.05'),
             'max_order_bump': '1.5',
             # Position Management (Phase 2)
-            'max_active_pairs': '3',
+            'max_active_pairs': canonical_strategy.get('max_active_pairs', '8'),
             'test_mode': 'false',
-            'priority_pairs_file': 'best_pairs.json',
+            'priority_pairs_file': final_best_pairs_path,
+            'best_pairs_only': 'true',
+            'pair_blacklist_file': final_pair_blacklist_path,
+            'pair_blacklist_enabled': 'true',
+            'auto_refresh_priority_pairs': 'false',
             # Symbol Filtering
-            'max_symbols': '300',
+            'max_symbols': canonical_strategy.get('max_symbols', '450'),
             'tg_channel': '',
             # Half-Life Limits (in days) - optimized for 1h/4h TFs
-            'hl_min_days': '0.25',   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
-            'hl_max_days': '2.0',    # Max 2 days (1h=48 candles, 4h=12 candles)
-            'beta_threshold': '0.11',        # Max |beta_btc| for pair acceptance
-            'beta_alert_threshold': '0.3',  # Alert if |beta| > this for open positions
-            'beta_critical': '1.0',          # Force-close if |beta| > this regardless of PnL
-            'signal_confirm_sec': '10',      # Signal confirmation time in seconds
+            'hl_min_days': canonical_strategy.get('hl_min_days', '0.5'),   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
+            'hl_max_days': canonical_strategy.get('hl_max_days', '4.5'),    # Max 2 days (1h=48 candles, 4h=12 candles)
+            'beta_threshold': canonical_strategy.get('beta_threshold', '0.2'),        # Max |beta_btc| for pair acceptance
+            'beta_alert_threshold': canonical_strategy.get('beta_alert_threshold', '0.3'),  # Alert if |beta| > this for open positions
+            'beta_critical': canonical_strategy.get('beta_critical', '1.0'),          # Force-close if |beta| > this regardless of PnL
+            'signal_confirm_sec': canonical_strategy.get('signal_confirm_sec', '10'),      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
-            'entry_et_target_abs_z': '0.5',
-            'coint_stability_min_bars': '2',
+            'entry_et_target_abs_z': canonical_strategy.get('entry_et_target_abs_z', '0.5'),
+            'coint_stability_min_bars': canonical_strategy.get('coint_stability_min_bars', '4'),
+            'coint_broken_grace_bars': canonical_strategy.get('coint_broken_grace_bars', '2'),
+            'hold_multiplier': canonical_strategy.get('hold_multiplier', '6.5'),
+            'max_hold_days': canonical_strategy.get('max_hold_days', '22'),
             # Hedge Ratio Bounds (market neutrality)
-            'hedge_min': '0.3',              # Min |hedge| — below this positions are too unbalanced
-            'hedge_max': '3.0',              # Max |hedge| — above this positions are too unbalanced
+            'hedge_min': canonical_strategy.get('hedge_min', '0.3'),              # Min |hedge| — below this positions are too unbalanced
+            'hedge_max': canonical_strategy.get('hedge_max', '3.0'),              # Max |hedge| — above this positions are too unbalanced
             # Idle Pair Management
-            'max_idle_pairs': '150',         # Maximum idle pairs without positions
+            'max_idle_pairs': canonical_strategy.get('max_idle_pairs', '200'),         # Maximum idle pairs without positions
             'idle_timeout_hours': '24',      # Remove idle pairs older than X hours
             'markprice_max_symbols': '200',
             # Discovery performance controls
-            'discovery_shards': '4',
-            'discovery_max_pairs_per_cycle': '12000',
+            'discovery_shards': canonical_strategy.get('discovery_shards', '4'),
+            'discovery_max_pairs_per_cycle': canonical_strategy.get('discovery_max_pairs_per_cycle', '12000'),
             'refresh_warmup_concurrency': '8',
             # Discovery health/watchdog controls
             'stagnation_watchdog_hours': '12',
@@ -467,6 +538,34 @@ async def load_config():
             existing_rows = (await s.execute(select(Config))).scalars().all()
             existing_map = {row.key: row for row in existing_rows}
             changed = False
+            legacy_path_map = {
+                'priority_pairs_file': {
+                    'best_pairs.json',
+                    'market_neutral/best_pairs.json',
+                    'market_neutral\\best_pairs.json',
+                },
+                'pair_blacklist_file': {
+                    'pair_blacklist.json',
+                    'market_neutral/pair_blacklist.json',
+                    'market_neutral\\pair_blacklist.json',
+                },
+            }
+            legacy_value_map = {
+                'timeframe': {'1h'},
+                'window_size': {'', '336'},
+                'max_notional_pct': {'0.4'},
+                'z_entry': {'1.8'},
+                'z_entry_max': {'2.5'},
+                'z_exit': {'0.05'},
+                'circuit_breaker_pct': {'0.5', '0.50'},
+                'max_active_pairs': {'3'},
+                'max_symbols': {'300'},
+                'hl_min_days': {'0.25'},
+                'hl_max_days': {'2.0'},
+                'beta_threshold': {'0.11'},
+                'coint_stability_min_bars': {'2'},
+                'max_idle_pairs': {'150'},
+            }
 
             for key in ConfigInfo.__annotations__.keys():
                 default_val = DEFAULTS.get(key, None)
@@ -477,6 +576,18 @@ async def load_config():
                 elif (existing.value is None or existing.value == "") and default_val is not None:
                     existing.value = default_val
                     changed = True
+                elif existing is not None and default_val is not None and key in legacy_path_map:
+                    cur_norm = str(existing.value or '').strip().replace('\\', '/').lower()
+                    legacy_norm = {v.replace('\\', '/').lower() for v in legacy_path_map[key]}
+                    if cur_norm in legacy_norm:
+                        if str(existing.value or '') != str(default_val):
+                            existing.value = default_val
+                            changed = True
+                elif existing is not None and default_val is not None and key in legacy_value_map:
+                    if _value_matches_any(existing.value, legacy_value_map[key]):
+                        if str(existing.value or '') != str(default_val):
+                            existing.value = default_val
+                            changed = True
 
             if changed:
                 await s.commit()
@@ -571,6 +682,8 @@ async def update_pair(data: dict):
             close_time = int(time.time())
         # Normalize to milliseconds for candle-boundary math in strategy layer.
         data['last_close_candle_ts'] = close_time if close_time > 1_000_000_000_000 else close_time * 1000
+        data.setdefault('entry_half_life_bars', 0.0)
+        data.setdefault('entry_hold_limit_bars', 0)
     elif pos is not None and pos != 0 and 'last_close_candle_ts' not in data:
         # Opening/active state clears close-candle guard marker.
         data['last_close_candle_ts'] = 0
@@ -640,6 +753,8 @@ async def archive_pair(pair_id: int, reason: str = ''):
         'qty2': 0.0,
         'entry_price1': 0.0,
         'entry_price2': 0.0,
+        'entry_half_life_bars': 0.0,
+        'entry_hold_limit_bars': 0,
         'close_time': int(time.time()),
     }
     if reason:

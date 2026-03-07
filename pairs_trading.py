@@ -1,5 +1,6 @@
-﻿from collections import deque
+from collections import deque
 import numpy as np
+import csv
 from dataclasses import dataclass, field
 import utils
 import asyncio
@@ -44,6 +45,7 @@ CLOSE_REASONS = {
     'stale_symbols': '\u23f3 Stale Symbols',
     'manual_partial': '\U0001F464 Manual Close (1 leg)',
     'audit_fail': '\U0001F9FE Trade Audit Safety Close',
+    'time_exit': '\u23f1\ufe0f Time Exit',
 }
 
 
@@ -87,6 +89,54 @@ def _repair_mojibake_text(text: str) -> str:
 
     best = max(candidates, key=_score)
     return best
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _canonical_pair_key(symbol1: str, symbol2: str) -> tuple[str, str]:
+    a = str(symbol1 or '').strip().upper()
+    b = str(symbol2 or '').strip().upper()
+    return tuple(sorted((a, b)))
+
+
+def _extract_pair_entries(raw):
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        pairs = raw.get('pairs')
+        if isinstance(pairs, list):
+            return pairs
+    return []
+
+
+def _parse_pair_text(entry):
+    pair_str = ''
+    if isinstance(entry, str):
+        pair_str = entry.strip().upper()
+    elif isinstance(entry, dict):
+        pair_str = str(entry.get('pair', '') or '').strip().upper()
+        if not pair_str:
+            s1 = str(entry.get('symbol1', '') or '').strip().upper()
+            s2 = str(entry.get('symbol2', '') or '').strip().upper()
+            if s1 and s2:
+                pair_str = f"{s1}-{s2}"
+
+    if '-' not in pair_str:
+        return None
+    s1, s2 = [x.strip().upper() for x in pair_str.split('-', 1)]
+    if not s1 or not s2 or s1 == s2:
+        return None
+    if not _is_tradeable_usdt_symbol(s1) or not _is_tradeable_usdt_symbol(s2):
+        return None
+    return (s1, s2)
 
 class Data:
     """
@@ -135,6 +185,8 @@ class PairInfo:
     tg_message_id: int = 0     # TG message ID for reply threading
     open_time: int = 0         # Unix timestamp when trade opened
     entry_z_score: float = 0.0 # Z-score at trade entry
+    entry_half_life_bars: float = 0.0  # Half-life frozen at entry for time-exit parity with backtest
+    entry_hold_limit_bars: int = 0     # Hold limit frozen at entry for restart-safe time_exit parity
     # Market neutrality
     beta_btc: float = 0.0      # Beta to BTC (should be near 0 for market-neutral)
     last_pvalue: float = 0.0   # Last p-value from cointegration test
@@ -150,6 +202,7 @@ class PairInfo:
     entry_coint_streak_bars: int = 0
     # Cointegration persistence
     coint_streak_bars: int = 0
+    coint_broken_count: int = 0
     # Idle pair management
     discovered_at: float = field(default_factory=time.time)  # When pair was discovered
     # Close tracking - prevents duplicate notifications
@@ -255,6 +308,13 @@ class PairsManager:
         # best_pairs v2 refresh controls
         self._best_pairs_refresh_lock = asyncio.Lock()
         self._best_pairs_last_refresh = 0.0
+        self._priority_pairs_cache_path = ''
+        self._priority_pairs_cache_mtime = None
+        self._priority_pairs_cache_entries: list[tuple[str, str]] = []
+        self._priority_pairs_cache_keys: set[tuple[str, str]] = set()
+        self._pair_blacklist_cache_path = ''
+        self._pair_blacklist_cache_mtime = None
+        self._pair_blacklist_cache_keys: set[tuple[str, str]] = set()
         # Main-TF progress heartbeat (to prove bot is processing closed candles).
         self._progress_last_log_ts = 0.0
         self._progress_kline_added = 0
@@ -396,12 +456,15 @@ class PairsManager:
                             symbol2=p.symbol2,
                             hedge_ratio=p.hedge_ratio,
                             half_life=p.half_life,
+                            entry_half_life_bars=float(getattr(p, 'entry_half_life_bars', 0.0) or 0.0),
+                            entry_hold_limit_bars=int(getattr(p, 'entry_hold_limit_bars', 0) or 0),
                             position_status=p.position_status,
                             qty1=p.qty1,
                             qty2=p.qty2,
                             entry_price1=p.entry_price1,
                             entry_price2=p.entry_price2,
                             db_id=p.id,
+                            open_time=int(getattr(p, 'open_time', 0) or 0),
                             tg_message_id=getattr(p, 'tg_message_id', 0) or 0,
                             reentry_block_candle_ts=close_anchor
                         )
@@ -414,6 +477,7 @@ class PairsManager:
                         last_trade = await db.get_last_open_trade_for_pair(p.id)
                         if last_trade:
                             info.current_trade_id = last_trade.id
+                        await self._ensure_entry_time_exit_state(info, persist=True)
                         
                         self.active_pairs[pair_set] = info
                         self._register_pair(info)
@@ -688,12 +752,15 @@ class PairsManager:
                                         symbol2=db_pair.symbol2,
                                         hedge_ratio=db_pair.hedge_ratio,
                                         half_life=db_pair.half_life,
+                                        entry_half_life_bars=float(getattr(db_pair, 'entry_half_life_bars', 0.0) or 0.0),
+                                        entry_hold_limit_bars=int(getattr(db_pair, 'entry_hold_limit_bars', 0) or 0),
                                         position_status=db_pair.position_status,
                                         qty1=db_pair.qty1,
                                         qty2=db_pair.qty2,
                                         entry_price1=db_pair.entry_price1,
                                         entry_price2=db_pair.entry_price2,
                                         db_id=db_pair.id,
+                                        open_time=int(getattr(db_pair, 'open_time', 0) or 0),
                                         tg_message_id=getattr(db_pair, 'tg_message_id', 0) or 0,
                                         reentry_block_candle_ts=close_anchor
                                     )
@@ -701,6 +768,7 @@ class PairsManager:
                                     info.last_pvalue = getattr(db_pair, 'last_pvalue', 0.0) or 0.0
                                     info.entry_z_score = getattr(db_pair, 'entry_z_score', 0.0) or 0.0
                                     self._update_quality_score_cache(info)
+                                    await self._ensure_entry_time_exit_state(info, persist=True)
                                     self.active_pairs[pair_set] = info
                                     self._register_pair(info)
                                     tracked_symbols.add(db_pair.symbol1)
@@ -2688,8 +2756,13 @@ class PairsManager:
             flag, hedge, hl, pval = utils.calculate_cointegration(log_prices1, log_prices2, p_value_threshold, strict_hl=False)
             if flag == 1:
                 pair_info.coint_streak_bars = int(getattr(pair_info, 'coint_streak_bars', 0) or 0) + 1
+                pair_info.coint_broken_count = 0
             else:
                 pair_info.coint_streak_bars = 0
+                if pair_info.position_status != 0:
+                    pair_info.coint_broken_count = int(getattr(pair_info, 'coint_broken_count', 0) or 0) + 1
+                else:
+                    pair_info.coint_broken_count = 0
 
             # === MARKET NEUTRALITY CHECK ===
             # Calculate beta to BTC to ensure pair is market-neutral
@@ -2746,6 +2819,14 @@ class PairsManager:
                 print(f"⚠️ Pair {s1}-{s2} correlation broken (pval: {pval:.4f}, HL: {hl}). Removing...")
                 
                 if pair_info.position_status != 0:
+                    broken_bars = int(getattr(pair_info, 'coint_broken_count', 0) or 0)
+                    grace_bars = max(0, int(getattr(self.config, 'coint_broken_grace_bars', 0) or 0))
+                    if grace_bars > 0 and broken_bars <= grace_bars:
+                        print(
+                            f"⏳ GRACE PERIOD (coint bars): Skipping broken_coint close for {s1}-{s2} "
+                            f"(broken bars {broken_bars}/{grace_bars})"
+                        )
+                        continue
                     leg1_open = abs(float(self._exchange_positions_cache.get(s1, 0.0) or 0.0)) > 0
                     leg2_open = abs(float(self._exchange_positions_cache.get(s2, 0.0) or 0.0)) > 0
                     if not leg1_open or not leg2_open:
@@ -2898,6 +2979,18 @@ class PairsManager:
                                 await self._notify(beta_warn)
                                 # Don't continue - let position stay open
 
+                if pair_info.position_status != 0:
+                    due_time_exit, hold_bars, hold_limit = self._time_exit_due(pair_info)
+                    if due_time_exit:
+                        print(
+                            f"⏱️ TIME EXIT (candle backup) on {s1}-{s2}. "
+                            f"hold_bars={hold_bars} >= limit={hold_limit}. Closing..."
+                        )
+                        pair_info.close_handled = True
+                        pair_info.is_trading = True
+                        await self._execute_trade(pair_info, 0, close_reason='time_exit')
+                        continue
+
                 z_entry = self.config.z_entry if self.config and self.config.z_entry else 1.9
                 z_exit = self.config.z_exit if self.config and self.config.z_exit is not None else 0.0
                 z_stop = self.config.z_stop if self.config and self.config.z_stop else 4.0
@@ -2968,7 +3061,12 @@ class PairsManager:
         """
         Finds new cointegrated pairs using parallel processing.
         """
-        mode = "PRIORITY-ONLY" if priority_only else ("FULL-DEEP" if force_full_scan else "FULL")
+        best_pairs_only = self._best_pairs_only_enabled()
+        effective_priority_only = priority_only or best_pairs_only
+        if best_pairs_only:
+            mode = "BEST-PAIRS-ONLY"
+        else:
+            mode = "PRIORITY-ONLY" if priority_only else ("FULL-DEEP" if force_full_scan else "FULL")
         print(f"Starting discovery process for new cointegrated pairs ({mode}, PARALLEL)...")
         start_time = time.time()
         self._diag_discovery_runs += 1
@@ -3081,6 +3179,9 @@ class PairsManager:
         candidates_to_process = []
         now_discovery_ts = start_time
         reject_cooldown_skipped = 0
+        pair_blacklist_keys = self._load_pair_blacklist_keys() if self._pair_blacklist_enabled() else set()
+        if pair_blacklist_keys:
+            print(f"⛔ Pair blacklist active: {len(pair_blacklist_keys)} pairs")
 
         # Pre-filter pairs that already exist in DB to avoid duplicate discovery noise
         # and unnecessary stats/beta calculations for known pairs.
@@ -3118,6 +3219,9 @@ class PairsManager:
                         continue
 
                     pair_set = frozenset([s1, s2])
+                    pair_key = _canonical_pair_key(s1, s2)
+                    if pair_key in pair_blacklist_keys:
+                        continue
                     # If pair already exists in memory (idle), force immediate inspection with top priority.
                     if pair_set in self.active_pairs:
                         pi = self.active_pairs.get(pair_set)
@@ -3148,7 +3252,7 @@ class PairsManager:
         # --- 2. Generate standard combinations ---
         added_count = 0
         truncated_by_cap = False
-        if not priority_only:
+        if not effective_priority_only:
             discovery_shards = int(getattr(self.config, 'discovery_shards', 1) or 1)
             if discovery_shards < 1:
                 discovery_shards = 1
@@ -3188,6 +3292,9 @@ class PairsManager:
                 if discovery_shards > 1 and (combo_idx % discovery_shards) != shard_idx:
                     continue
                 pair_set = frozenset(p)
+                pair_key = _canonical_pair_key(p[0], p[1])
+                if pair_key in pair_blacklist_keys:
+                    continue
                 if pair_set not in self.active_pairs and pair_set not in checked_pairs:
                     blocked, _, _ = self._reject_block_info(pair_set, now_discovery_ts)
                     if blocked:
@@ -3199,7 +3306,10 @@ class PairsManager:
                         truncated_by_cap = True
                         break
         else:
-            print("Priority-only discovery: skipping non-priority pair combinations for fast startup.")
+            if best_pairs_only:
+                print("Best-pairs-only discovery: skipping non-priority combinations.")
+            else:
+                print("Priority-only discovery: skipping non-priority pair combinations for fast startup.")
                 
         total_pairs = len(candidates_to_process)
         print(f"Total pairs to check: {total_pairs} (Priority: {len(priority_pairs)}, Others: {added_count})")
@@ -3739,6 +3849,97 @@ class PairsManager:
             priority_file_path = os.path.join(script_dir, priority_file_path)
         return priority_file_path or ''
 
+    def _pair_blacklist_file_path(self) -> str:
+        pair_blacklist_file = getattr(self.config, 'pair_blacklist_file', '')
+        if pair_blacklist_file and not os.path.isabs(pair_blacklist_file):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            pair_blacklist_file = os.path.join(script_dir, pair_blacklist_file)
+        return pair_blacklist_file or ''
+
+    def _best_pairs_only_enabled(self) -> bool:
+        return _as_bool(getattr(self.config, 'best_pairs_only', False), False)
+
+    def _pair_blacklist_enabled(self) -> bool:
+        if not self._best_pairs_only_enabled():
+            return True
+        return _as_bool(getattr(self.config, 'pair_blacklist_enabled', True), True)
+
+    def _auto_refresh_priority_pairs_enabled(self) -> bool:
+        return _as_bool(getattr(self.config, 'auto_refresh_priority_pairs', False), False)
+
+    def _read_pair_file_entries(self, path: str, *, sort_by_score: bool = False) -> list[tuple[str, str]]:
+        if not path or not os.path.exists(path):
+            return []
+
+        try:
+            suffix = os.path.splitext(path)[1].lower()
+            raw_entries = []
+            if suffix == '.json':
+                with open(path, 'r', encoding='utf-8') as f:
+                    raw_entries = _extract_pair_entries(json.load(f))
+            elif suffix in ('.csv', '.tsv'):
+                with open(path, 'r', encoding='utf-8', newline='') as f:
+                    reader = csv.DictReader(f, delimiter='\t' if suffix == '.tsv' else ',')
+                    for row in reader:
+                        raw_entries.append(row)
+            else:
+                with open(path, 'r', encoding='utf-8') as f:
+                    raw_entries = [line.strip() for line in f if line.strip()]
+        except Exception:
+            return []
+
+        if sort_by_score and raw_entries and all(isinstance(x, dict) for x in raw_entries):
+            raw_entries = sorted(raw_entries, key=lambda x: float(x.get('score', 0.0) or 0.0), reverse=True)
+
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in raw_entries:
+            parsed = _parse_pair_text(item)
+            if parsed is None:
+                continue
+            key = _canonical_pair_key(parsed[0], parsed[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(parsed)
+        return out
+
+    def _load_priority_pairs_cache(self) -> tuple[list[tuple[str, str]], set[tuple[str, str]]]:
+        path = self._priority_file_path()
+        try:
+            mtime = os.path.getmtime(path) if path and os.path.exists(path) else None
+        except Exception:
+            mtime = None
+        if path != self._priority_pairs_cache_path or mtime != self._priority_pairs_cache_mtime:
+            entries = self._read_pair_file_entries(path, sort_by_score=True)
+            self._priority_pairs_cache_path = path
+            self._priority_pairs_cache_mtime = mtime
+            self._priority_pairs_cache_entries = entries
+            self._priority_pairs_cache_keys = {_canonical_pair_key(s1, s2) for s1, s2 in entries}
+        return list(self._priority_pairs_cache_entries), set(self._priority_pairs_cache_keys)
+
+    def _load_pair_blacklist_keys(self) -> set[tuple[str, str]]:
+        path = self._pair_blacklist_file_path()
+        try:
+            mtime = os.path.getmtime(path) if path and os.path.exists(path) else None
+        except Exception:
+            mtime = None
+        if path != self._pair_blacklist_cache_path or mtime != self._pair_blacklist_cache_mtime:
+            entries = self._read_pair_file_entries(path, sort_by_score=False)
+            self._pair_blacklist_cache_path = path
+            self._pair_blacklist_cache_mtime = mtime
+            self._pair_blacklist_cache_keys = {_canonical_pair_key(s1, s2) for s1, s2 in entries}
+        return set(self._pair_blacklist_cache_keys)
+
+    def _is_pair_trade_allowed(self, symbol1: str, symbol2: str) -> bool:
+        key = _canonical_pair_key(symbol1, symbol2)
+        if self._pair_blacklist_enabled() and key in self._load_pair_blacklist_keys():
+            return False
+        if self._best_pairs_only_enabled():
+            _, priority_keys = self._load_priority_pairs_cache()
+            return key in priority_keys
+        return True
+
     def _load_priority_pairs_list(self, ready_set: set | None = None) -> list[tuple[str, str]]:
         """
         Load priority pairs from file.
@@ -3746,42 +3947,10 @@ class PairsManager:
         - ["SYM1-SYM2", ...] (legacy)
         - [{"pair":"SYM1-SYM2","score":...,...}, ...] (rich)
         """
-        path = self._priority_file_path()
-        if not path or not os.path.exists(path):
-            return []
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                raw = json.load(f)
-        except Exception:
-            return []
-
-        if not isinstance(raw, list):
-            return []
-
-        entries = raw
-        if raw and all(isinstance(x, dict) for x in raw):
-            entries = sorted(raw, key=lambda x: float(x.get('score', 0.0) or 0.0), reverse=True)
-
+        entries, _ = self._load_priority_pairs_cache()
         out: list[tuple[str, str]] = []
         seen = set()
-        for item in entries:
-            pair_str = ''
-            if isinstance(item, str):
-                pair_str = item
-            elif isinstance(item, dict):
-                pair_str = str(item.get('pair', '') or '').strip()
-                if not pair_str:
-                    s1 = str(item.get('symbol1', '') or '').strip()
-                    s2 = str(item.get('symbol2', '') or '').strip()
-                    if s1 and s2:
-                        pair_str = f"{s1}-{s2}"
-            if '-' not in pair_str:
-                continue
-            s1, s2 = [x.strip().upper() for x in pair_str.split('-', 1)]
-            if not s1 or not s2:
-                continue
-            if not _is_tradeable_usdt_symbol(s1) or not _is_tradeable_usdt_symbol(s2):
-                continue
+        for s1, s2 in entries:
             if ready_set is not None and (s1 not in ready_set or s2 not in ready_set):
                 continue
             key = tuple(sorted((s1, s2)))
@@ -3829,6 +3998,8 @@ class PairsManager:
         Rebuild best_pairs.json from closed trade performance.
         Promotes stable profitable pairs, demotes/removes degrading pairs.
         """
+        if not self._auto_refresh_priority_pairs_enabled():
+            return
         now = time.time()
         refresh_sec = 300.0  # throttle expensive rebuilds
         if not force and (now - self._best_pairs_last_refresh) < refresh_sec:
@@ -3996,6 +4167,8 @@ class PairsManager:
         Legacy trigger kept for compatibility.
         Now schedules full best_pairs rebuild from performance stats.
         """
+        if not self._auto_refresh_priority_pairs_enabled():
+            return
         try:
             self.loop.create_task(self._refresh_best_pairs(force=True, reason=f"tp_close:{symbol1}-{symbol2}"))
         except Exception as e:
@@ -4013,6 +4186,68 @@ class PairsManager:
         except Exception:
             pass
         return 3600
+
+    def _max_hold_bars_from_days(self) -> int:
+        try:
+            candles_per_day = float(utils.CANDLES_PER_DAY.get(str(self.timeframe), 24) or 24)
+        except Exception:
+            candles_per_day = 24.0
+        max_hold_days = float(getattr(self.config, 'max_hold_days', 30.0) or 30.0)
+        return max(1, int(round(max_hold_days * candles_per_day)))
+
+    def _compute_entry_hold_limit_bars(self, hl_bars: float) -> int:
+        max_hold_bars = self._max_hold_bars_from_days()
+        hl_bars = float(hl_bars or 0.0)
+        if hl_bars > 0:
+            hold_multiplier = float(getattr(self.config, 'hold_multiplier', 3.0) or 3.0)
+            hl_limit = max(1, int(round(hl_bars * hold_multiplier)))
+            return min(hl_limit, max_hold_bars)
+        return max_hold_bars
+
+    def _time_exit_hold_limit_bars(self, pair_info: PairInfo) -> int:
+        frozen_limit = int(getattr(pair_info, 'entry_hold_limit_bars', 0) or 0)
+        if frozen_limit > 0:
+            return frozen_limit
+        hl_bars = float(getattr(pair_info, 'entry_half_life_bars', 0.0) or 0.0)
+        if hl_bars <= 0:
+            hl_bars = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+        return self._compute_entry_hold_limit_bars(hl_bars)
+
+    def _position_hold_bars(self, pair_info: PairInfo, now_ts: float | None = None) -> int:
+        if now_ts is None:
+            now_ts = time.time()
+        tf_sec = max(1, int(self._timeframe_seconds_local() or 3600))
+        open_ts = float(getattr(pair_info, '_trade_open_time', 0.0) or 0.0)
+        if open_ts <= 0:
+            open_ts = float(int(getattr(pair_info, 'open_time', 0) or 0))
+        if open_ts <= 0:
+            return 0
+        elapsed = max(0.0, float(now_ts) - open_ts)
+        return max(0, int(elapsed // tf_sec))
+
+    def _time_exit_due(self, pair_info: PairInfo, now_ts: float | None = None) -> tuple[bool, int, int]:
+        hold_bars = self._position_hold_bars(pair_info, now_ts=now_ts)
+        hold_limit = self._time_exit_hold_limit_bars(pair_info)
+        return hold_bars >= hold_limit, hold_bars, hold_limit
+
+    async def _ensure_entry_time_exit_state(self, pair_info: PairInfo, persist: bool = False) -> bool:
+        changed = False
+        if float(getattr(pair_info, 'entry_half_life_bars', 0.0) or 0.0) <= 0:
+            pair_info.entry_half_life_bars = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+            changed = True
+        if int(getattr(pair_info, 'entry_hold_limit_bars', 0) or 0) <= 0:
+            pair_info.entry_hold_limit_bars = self._compute_entry_hold_limit_bars(pair_info.entry_half_life_bars)
+            changed = True
+        if persist and changed and pair_info.db_id:
+            try:
+                await db.update_pair({
+                    'id': pair_info.db_id,
+                    'entry_half_life_bars': pair_info.entry_half_life_bars,
+                    'entry_hold_limit_bars': pair_info.entry_hold_limit_bars,
+                })
+            except Exception as e:
+                print(f"?? Failed to persist time-exit state for {pair_info.symbol1}-{pair_info.symbol2}: {e}")
+        return changed
 
     def _floor_to_candle_ts_ms(self, ts_ms: int) -> int:
         tf_ms = self._timeframe_seconds_local() * 1000
@@ -4287,6 +4522,9 @@ class PairsManager:
         # Check if trading is enabled
         trade_mode = getattr(self.config, 'trade_mode', True)
         if trade_mode is not None and str(trade_mode).lower() in ('false', '0', 'no'):
+            return False
+
+        if not self._is_pair_trade_allowed(s1, s2):
             return False
         
         # Check max active pairs limit (local memory)
@@ -5440,6 +5678,8 @@ class PairsManager:
                     pair_info._beta_critical_triggered = False
                     pair_info._beta_at_trigger = None
                     pair_info._trade_open_time = time.time()
+                    pair_info.entry_half_life_bars = float(getattr(pair_info, 'half_life', 0.0) or 0.0)
+                    pair_info.entry_hold_limit_bars = self._compute_entry_hold_limit_bars(pair_info.entry_half_life_bars)
                     
                     # CRITICAL: Update exchange position cache immediately
                     # This prevents race condition where another task checks limit before cache refreshes
@@ -5665,6 +5905,8 @@ class PairsManager:
                                 'beta_btc': pair_info.beta_btc,
                                 'last_pvalue': pair_info.last_pvalue,
                                 'entry_z_score': pair_info.entry_z_score,
+                                'entry_half_life_bars': pair_info.entry_half_life_bars,
+                                'entry_hold_limit_bars': pair_info.entry_hold_limit_bars,
                                 'open_time': int(time.time()),
                             })
                         except Exception as dbe:
@@ -6076,6 +6318,18 @@ class PairsManager:
             else:
                 # Beta is within normal range — reset flag
                 pair_info._beta_critical_triggered = False
+
+        due_time_exit, hold_bars, hold_limit = self._time_exit_due(pair_info, now_ts=now_ts)
+        if due_time_exit:
+            print(
+                f"⏱️ RT TIME EXIT on {s1}-{s2}. "
+                f"hold_bars={hold_bars} >= limit={hold_limit}. Closing..."
+            )
+            pair_info.close_handled = True
+            pair_info.is_trading = True
+            _arm_close_retry()
+            await self._execute_trade(pair_info, 0, close_reason='time_exit')
+            return
     
     async def _signal_confirmation_loop(self):
         """
@@ -6257,6 +6511,9 @@ class PairsManager:
                 for score, _, pair_info, current_z in ready_candidates:
                     if free_slots <= 0:
                         break
+                    if not self._is_pair_trade_allowed(pair_info.symbol1, pair_info.symbol2):
+                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: pair list filter")
+                        continue
                     if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
                         print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: can_open_new_position=False")
                         continue
