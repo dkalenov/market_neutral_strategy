@@ -480,13 +480,13 @@ async def load_config():
             'z_exit': canonical_strategy.get('z_exit', '0.1'),
             'z_stop': canonical_strategy.get('z_stop', '4.0'),
             'blacklist': LIVE_SAFE_SYMBOL_BLACKLIST,
-            # Hardware SL/TP defaults
-            'sl_atr_mult': '2.5',
-            'sl_min_pct': '0.10',
-            'sl_max_pct': '0.30',
-            'tp_atr_mult': '4.0',
-            'tp_min_pct': '0.15',
-            'tp_max_pct': '0.50',
+            # Hardware SL/TP defaults: emergency tail-risk protection only
+            'sl_atr_mult': '5.0',
+            'sl_min_pct': '0.50',
+            'sl_max_pct': '0.75',
+            'tp_atr_mult': '8.0',
+            'tp_min_pct': '0.50',
+            'tp_max_pct': '0.75',
             'circuit_breaker_pct': canonical_strategy.get('circuit_breaker_pct', '0.3'),
             'p_value_threshold': canonical_strategy.get('p_value_threshold', '0.05'),
             'max_order_bump': '1.5',
@@ -572,6 +572,12 @@ async def load_config():
                 'beta_threshold': {'0.11'},
                 'coint_stability_min_bars': {'2'},
                 'max_idle_pairs': {'150'},
+                'sl_atr_mult': {'2.5', '4.0'},
+                'sl_min_pct': {'0.10', '0.1', '0.15', '0.25'},
+                'sl_max_pct': {'0.30', '0.3', '0.40', '0.4', '0.45', '0.50', '0.5'},
+                'tp_atr_mult': {'4.0'},
+                'tp_min_pct': {'0.15', '0.30', '0.3'},
+                'tp_max_pct': {'0.50', '0.5'},
             }
 
             for key in ConfigInfo.__annotations__.keys():
