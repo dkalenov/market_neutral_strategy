@@ -718,6 +718,23 @@ def _timeframe_to_seconds(tf: str) -> int:
     return 3600
 
 
+def _format_half_life_for_display(hl_bars: float, timeframe: str) -> str:
+    try:
+        hl_bars = float(hl_bars or 0.0)
+    except Exception:
+        hl_bars = 0.0
+    if hl_bars <= 0:
+        return 'N/A'
+    hl_hours = hl_bars * (_timeframe_to_seconds(timeframe) / 3600.0)
+    if hl_hours >= 24:
+        hl_d = int(hl_hours // 24)
+        hl_h = int(hl_hours % 24)
+        return f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
+    hl_h = int(hl_hours)
+    hl_m = int((hl_hours - hl_h) * 60)
+    return f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
+
+
 async def _rebuild_main_kline_subscriptions(symbols: list[str], timeframe: str, reason: str = "runtime") -> bool:
     """
     Rebuild only MAIN timeframe kline subscriptions (discovery/validation stream).
@@ -1371,19 +1388,8 @@ async def ws_user_msg(ws, msg):
                         zscore = getattr(pair_info, 'last_z_score', 0) or 0
                     beta = getattr(pair_info, 'beta_btc', 0) or 0
                     close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
-                    # Format half-life
                     hl = getattr(pair_info, 'half_life', 0) or 0
-                    if hl > 0:
-                        if hl >= 24:
-                            hl_d = int(hl // 24)
-                            hl_h = int(hl % 24)
-                            close_hl = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
-                        else:
-                            hl_h = int(hl)
-                            hl_m = int((hl - hl_h) * 60)
-                            close_hl = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
-                    else:
-                        close_hl = 'N/A'
+                    close_hl = _format_half_life_for_display(hl, _main_timeframe_global)
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                     e1 = '🟢' if pnl1 >= 0 else '🔴'
                     e2 = '🟢' if pnl2 >= 0 else '🔴'
@@ -1672,19 +1678,8 @@ async def ws_user_msg(ws, msg):
                         zscore = getattr(pair_info, 'last_z_score', 0) or 0
                     beta = getattr(pair_info, 'beta_btc', 0) or 0
                     close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
-                    # Format half-life
                     hl = getattr(pair_info, 'half_life', 0) or 0
-                    if hl > 0:
-                        if hl >= 24:
-                            hl_d = int(hl // 24)
-                            hl_h = int(hl % 24)
-                            close_hl = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
-                        else:
-                            hl_h = int(hl)
-                            hl_m = int((hl - hl_h) * 60)
-                            close_hl = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
-                    else:
-                        close_hl = 'N/A'
+                    close_hl = _format_half_life_for_display(hl, _main_timeframe_global)
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                     e1 = '🟢' if pnl1 >= 0 else '🔴'
                     e2 = '🟢' if pnl2 >= 0 else '🔴'

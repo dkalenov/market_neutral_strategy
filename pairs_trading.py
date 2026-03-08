@@ -1477,9 +1477,8 @@ class PairsManager:
         sl2 = round(sl2, s2_info.tick_size)
         tp1 = round(tp1, s1_info.tick_size)
         tp2 = round(tp2, s2_info.tick_size)
-
         if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
-            print(f"⚠️ Invalid restore prices for {s1}-{s2}: sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}")
+            print(f"WARN: Invalid restore prices for {s1}-{s2}: sl1={sl1}, tp1={tp1}, sl2={sl2}, tp2={tp2}")
             return False
 
         pair_key = frozenset([s1, s2])
@@ -1514,7 +1513,6 @@ class PairsManager:
                 except Exception as clean_err:
                     print(f"⚠️ Cleanup before protection restore failed for {s1}-{s2}: {clean_err}")
 
-                # Place full 4 protection orders.
                 tasks = [
                     self.client.new_algo_order(symbol=s1, side=close_side1, type='STOP_MARKET',
                                                triggerPrice=sl1, quantity=pair_info.qty1, reduceOnly='true'),
@@ -1525,6 +1523,7 @@ class PairsManager:
                     self.client.new_algo_order(symbol=s2, side=close_side2, type='TAKE_PROFIT_MARKET',
                                                triggerPrice=tp2, quantity=pair_info.qty2, reduceOnly='true'),
                 ]
+                task_meta = [(s1, 'STOP'), (s2, 'STOP'), (s1, 'TAKE_PROFIT'), (s2, 'TAKE_PROFIT')]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 ok_ids = []
@@ -1534,19 +1533,17 @@ class PairsManager:
                     if isinstance(r, dict) and 'algoId' in r:
                         ok_ids.append(str(r['algoId']))
 
-                if len(ok_ids) != 4:
-                    raise RuntimeError(f"Expected 4 algo orders, got {len(ok_ids)}")
+                if len(ok_ids) != len(task_meta):
+                    raise RuntimeError(f"Expected {len(task_meta)} algo orders, got {len(ok_ids)}")
 
                 # Replace local algo mapping for this pair.
                 to_remove = [aid for aid, info in self.algo_orders.items() if info.get('pair_key') == pair_key]
                 for aid in to_remove:
                     self.algo_orders.pop(aid, None)
-                self.algo_orders[ok_ids[0]] = {'pair_key': pair_key, 'symbol': s1, 'type': 'STOP'}
-                self.algo_orders[ok_ids[1]] = {'pair_key': pair_key, 'symbol': s2, 'type': 'STOP'}
-                self.algo_orders[ok_ids[2]] = {'pair_key': pair_key, 'symbol': s1, 'type': 'TAKE_PROFIT'}
-                self.algo_orders[ok_ids[3]] = {'pair_key': pair_key, 'symbol': s2, 'type': 'TAKE_PROFIT'}
+                for aid, (sym, typ) in zip(ok_ids, task_meta):
+                    self.algo_orders[aid] = {'pair_key': pair_key, 'symbol': sym, 'type': typ}
 
-                print(f"✅ Protection restored for {s1}-{s2}")
+                print(f"OK: Protection restored for {s1}-{s2} ({len(task_meta)} orders)")
                 return True
             except Exception as restore_err:
                 print(f"⚠️ Protection restore attempt {attempt} failed for {s1}-{s2}: {restore_err}")
@@ -3587,16 +3584,24 @@ class PairsManager:
 
         return None
 
-    def _format_half_life(self, hl_hours: float) -> str:
-        """Format half-life in human-readable format (e.g., '1d 6h' or '16h 48m')."""
+    def _format_half_life(self, hl_bars: float) -> str:
+        """Format half-life stored in bars into human-readable hours/days for the current timeframe."""
+        try:
+            hl_bars = float(hl_bars or 0.0)
+        except Exception:
+            hl_bars = 0.0
+        if hl_bars <= 0:
+            return "N/A"
+
+        tf_hours = self._timeframe_seconds_local() / 3600.0
+        hl_hours = hl_bars * tf_hours
         if hl_hours >= 24:
             days = int(hl_hours // 24)
             hours = int(hl_hours % 24)
             return f"{days}d {hours}h" if hours > 0 else f"{days}d"
-        else:
-            hours = int(hl_hours)
-            mins = int((hl_hours - hours) * 60)
-            return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+        hours = int(hl_hours)
+        mins = int((hl_hours - hours) * 60)
+        return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
 
     def _trade_window_start_ms(self, pair_info: PairInfo, default_lookback_sec: int = 300, buffer_sec: int = 120) -> int:
         """
@@ -5799,91 +5804,78 @@ class PairsManager:
                         
 
                         print(f"🛡️ Placing SL/TP (Algo): {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
-                        
-                        # Validate all prices are positive before placing orders
+
                         if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
-                            warn_msg = (f"⚠️ CRITICAL: Invalid SL/TP prices for {s1}-{s2}! "
-                                       f"sl1={sl1}, sl2={sl2}, tp1={tp1}, tp2={tp2}. "
-                                       f"Force closing position.")
+                            warn_msg = (f"WARN: CRITICAL: Invalid protection prices for {s1}-{s2}! "
+                                       f"sl1={sl1}, tp1={tp1}, sl2={sl2}, tp2={tp2}. Force closing position.")
                             print(warn_msg)
                             print(f"  Entry prices: {pair_info.entry_price1}, {pair_info.entry_price2}")
                             print(f"  ATR values: {atr1}, {atr2}")
                             reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                             await self._notify(warn_msg, reply_to)
-                            # Force close — can't leave positions unprotected
                             pair_info.close_handled = True
                             pair_info.is_trading = True
                             await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                             return
-                        
-                        # Use algo orders
+
                         protection_tasks = [
-                            # SL Orders (MARKET trigger via algo endpoint)
                             self.client.new_algo_order(symbol=s1, side=sl_side1, type='STOP_MARKET',
                                                        triggerPrice=sl1, quantity=pair_info.qty1, reduceOnly='true'),
                             self.client.new_algo_order(symbol=s2, side=sl_side2, type='STOP_MARKET',
                                                        triggerPrice=sl2, quantity=pair_info.qty2, reduceOnly='true'),
-                            # TP Orders (MARKET trigger via algo endpoint)
                             self.client.new_algo_order(symbol=s1, side=sl_side1, type='TAKE_PROFIT_MARKET',
                                                        triggerPrice=tp1, quantity=pair_info.qty1, reduceOnly='true'),
                             self.client.new_algo_order(symbol=s2, side=sl_side2, type='TAKE_PROFIT_MARKET',
                                                        triggerPrice=tp2, quantity=pair_info.qty2, reduceOnly='true'),
                         ]
-                        
+                        task_meta = [(s1, 'STOP'), (s2, 'STOP'), (s1, 'TAKE_PROFIT'), (s2, 'TAKE_PROFIT')]
+
                         results = await asyncio.gather(*protection_tasks, return_exceptions=True)
-                        
-                        # Collect successful order algoIds for potential cancellation
+
                         successful_algo_ids = []
                         failed_count = 0
                         for res in results:
                             if isinstance(res, Exception):
-                                print(f"⚠️ WARN: Failed to place protection order: {res}")
+                                print(f"WARN: Failed to place protection order: {res}")
                                 failed_count += 1
                             elif isinstance(res, dict) and 'algoId' in res:
                                 successful_algo_ids.append(res['algoId'])
-                        
-                        if failed_count == 0 and len(successful_algo_ids) == 4:
-                            print(f"🛡️ Protection placed successfully (4 orders)")
-                            # Store algo order mapping for ALGO_UPDATE event handling
+
+                        expected_orders = len(task_meta)
+                        if failed_count == 0 and len(successful_algo_ids) == expected_orders:
+                            print("🛡️ Protection placed successfully (4 orders)")
                             pair_key = frozenset([s1, s2])
-                            for i, aid in enumerate(successful_algo_ids):
-                                aid_str = str(aid)  # Ensure consistent string keys
-                                if i == 0:
-                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s1, 'type': 'STOP'}
-                                elif i == 1:
-                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s2, 'type': 'STOP'}
-                                elif i == 2:
-                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s1, 'type': 'TAKE_PROFIT'}
-                                elif i == 3:
-                                    self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': s2, 'type': 'TAKE_PROFIT'}
-                        elif failed_count > 0:
-                            warn_msg = f"⚠️ CRITICAL: Protection partially FAILED for {s1}-{s2} ({failed_count}/4 failed). Force closing!"
+                            for aid, (sym, typ) in zip(successful_algo_ids, task_meta):
+                                aid_str = str(aid)
+                                self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': sym, 'type': typ}
+                        else:
+                            warn_msg = (
+                                f"WARN: CRITICAL: Protection incomplete for {s1}-{s2} "
+                                f"(ok={len(successful_algo_ids)}/{max(1, expected_orders)}, failed={failed_count}). Force closing!"
+                            )
                             print(warn_msg)
                             reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                             await self._notify(warn_msg, reply_to)
                             
-                            # Cancel successfully placed orders using algoId from results
                             if successful_algo_ids:
                                 try:
                                     cancel_tasks = [self.client.cancel_algo_order(algoId=aid) for aid in successful_algo_ids]
                                     await asyncio.gather(*cancel_tasks, return_exceptions=True)
-                                    print(f"🗑️ Cancelled {len(successful_algo_ids)} partial algo orders")
+                                    print(f"INFO: Cancelled {len(successful_algo_ids)} partial algo orders")
                                 except Exception as ce:
-                                    print(f"⚠️ Could not cancel partial orders: {ce}")
+                                    print(f"WARN: Could not cancel partial orders: {ce}")
                             
-                            # Force close position
-                            pair_info.close_handled = True  # Prevent duplicate notification from WS handler
+                            pair_info.close_handled = True
                             pair_info.is_trading = True
                             await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                             
                     except Exception as e:
-                        warn_msg = f"⚠️ CRITICAL ERROR placing hardware SL for {s1}-{s2}: {e}. Force closing position!"
+                        warn_msg = f"WARN: CRITICAL ERROR placing hardware protection for {s1}-{s2}: {e}. Force closing position!"
                         print(warn_msg)
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(warn_msg, reply_to)
                         
-                        # Force close position (algo orders will be cancelled by _execute_trade)
-                        pair_info.close_handled = True  # Prevent duplicate notification from WS handler
+                        pair_info.close_handled = True
                         pair_info.is_trading = True
                         await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                     # === END HARDWARE SL/TP ===

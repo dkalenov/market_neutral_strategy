@@ -3,6 +3,7 @@ import configparser
 import binance
 import db
 import os
+import utils
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -22,6 +23,42 @@ close_ops_lock = asyncio.Lock()
 session = None
 client = None
 pairs_manager = None
+
+
+def _auto_window_size_for_timeframe(timeframe: str) -> int:
+    tf = str(timeframe or '1h').strip().lower()
+    if tf == '1m':
+        return 720
+    if tf == '5m':
+        return 576
+    if tf == '15m':
+        return 480
+    if tf == '1h':
+        return 336
+    if tf == '4h':
+        return 180
+    if tf == '1d':
+        return 90
+    return 336
+
+
+def _format_half_life_display(hl_bars: float, timeframe: str) -> str:
+    try:
+        hl_bars = float(hl_bars or 0.0)
+    except Exception:
+        hl_bars = 0.0
+    if hl_bars <= 0:
+        return 'N/A'
+    candles_per_day = float(utils.CANDLES_PER_DAY.get(str(timeframe or '1h'), 24) or 24)
+    bar_hours = 24.0 / candles_per_day if candles_per_day > 0 else 1.0
+    hl_hours = hl_bars * bar_hours
+    if hl_hours >= 24:
+        hl_d = int(hl_hours // 24)
+        hl_h = int(hl_hours % 24)
+        return f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
+    hl_h = int(hl_hours)
+    hl_m = int((hl_hours - hl_h) * 60)
+    return f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
 
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -365,17 +402,8 @@ async def open_trades(message: Message | CallbackQuery, state: FSMContext):
                     beta = getattr(pair_info, 'beta_btc', 0) or 0
                     pval = getattr(pair_info, 'last_pvalue', 0) or 0
                     hl = getattr(pair_info, 'half_life', 0) or 0
-                    if hl > 0:
-                        if hl >= 24:
-                            hl_d = int(hl // 24)
-                            hl_h = int(hl % 24)
-                            hl_str = f"{hl_d}d {hl_h}h" if hl_h > 0 else f"{hl_d}d"
-                        else:
-                            hl_h = int(hl)
-                            hl_m = int((hl - hl_h) * 60)
-                            hl_str = f"{hl_h}h {hl_m}m" if hl_m > 0 else f"{hl_h}h"
-                    else:
-                        hl_str = 'N/A'
+                    tf = getattr(getattr(pairs_manager, 'config', None), 'timeframe', None) or getattr(pairs_manager, 'timeframe', '1h')
+                    hl_str = _format_half_life_display(hl, tf)
                     hedge = getattr(pair_info, 'hedge_ratio', 0) or 0
                     
                     text += f"\n  📊 Z: {zscore:+.2f} | β: {beta:.3f} | p: {pval:.4f}"
@@ -440,7 +468,11 @@ async def settings(message: Message, state: FSMContext):
     ])
     # Secrets are loaded from .env, not from DB.
     tf = conf.timeframe if conf.timeframe else "1h (default)"
-    win = conf.window_size if conf.window_size else "200 (default)"
+    raw_win = getattr(conf, 'window_size', None)
+    if raw_win in (None, '', '0', 0, 'auto', 'default', 'none', 'None'):
+        win = f"auto ({_auto_window_size_for_timeframe(getattr(conf, 'timeframe', '1h'))})"
+    else:
+        win = str(raw_win)
     
     cap = conf.capital if conf.capital else "1000 (default)"
     lev = conf.leverage if conf.leverage else "20 (default)"
@@ -477,7 +509,10 @@ async def strategy_settings_menu(callback: CallbackQuery, state: FSMContext):
     conf = await db.load_config()
     tf = getattr(conf, 'timeframe', None) or '1h'
     win = getattr(conf, 'window_size', None)
-    win_txt = str(win) if win not in (None, '', 'none', 'None') else 'auto'
+    if win in (None, '', 'none', 'None', '0', 0, 'auto', 'default'):
+        win_txt = f"auto ({_auto_window_size_for_timeframe(tf)})"
+    else:
+        win_txt = str(win)
     hl_min = getattr(conf, 'hl_min_days', 2.0) or 2.0
     hl_max = getattr(conf, 'hl_max_days', 5.0) or 5.0
     hedge_min = getattr(conf, 'hedge_min', 0.3) or 0.3
@@ -503,7 +538,7 @@ async def set_timeframe(callback: CallbackQuery, state: FSMContext):
 async def set_window(callback: CallbackQuery, state: FSMContext):
     await state.set_state(States.settings)
     await state.update_data(waiting_for="window")
-    await answer(callback, "Enter new Window Size (e.g., 200, 300, 400):")
+    await answer(callback, "Enter new Window Size (e.g., 200, 300, 400) or 'auto' to use timeframe mapping:")
 
 @dp.callback_query(F.data == "set_half_life")
 async def set_half_life(callback: CallbackQuery, state: FSMContext):
@@ -962,11 +997,16 @@ async def process_strategy_settings(message: Message, state: FSMContext):
             await answer(message, f"Timeframe changed to <b>{value}</b>.")
             
         elif waiting_for == "window":
-            if not value.isdigit() or int(value) < 50:
-                await answer(message, "Value must be a number > 50.")
-                return
-            await db.config_update(window_size=int(value))
-            await answer(message, f"Window Size changed to <b>{value}</b>.")
+            if value.lower() in {"auto", "default", "0"}:
+                await db.config_update(window_size=0)
+                tf = getattr(await db.load_config(), 'timeframe', '1h') or '1h'
+                await answer(message, f"Window Size reset to <b>auto</b> (<b>{_auto_window_size_for_timeframe(tf)}</b> for {tf}).")
+            else:
+                if not value.isdigit() or int(value) < 50:
+                    await answer(message, "Value must be a number > 50, or 'auto'.")
+                    return
+                await db.config_update(window_size=int(value))
+                await answer(message, f"Window Size changed to <b>{value}</b>.")
 
         elif waiting_for == "capital":
             val = float(value)
