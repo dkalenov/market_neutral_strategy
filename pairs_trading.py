@@ -4517,7 +4517,7 @@ class PairsManager:
         left = int(self._symbol_block_until[symbol] - time.time())
         print(f"[COOLDOWN] Symbol {symbol} blocked for {left}s ({reason})")
 
-    def can_open_new_position(self, s1: str, s2: str, exclude_pair=None) -> bool:
+    def _can_open_new_position_reason(self, s1: str, s2: str, exclude_pair=None) -> tuple[bool, str]:
         """Check if we can open a new position for this pair.
         
         Args:
@@ -4527,15 +4527,15 @@ class PairsManager:
         # Check if trading is enabled
         trade_mode = getattr(self.config, 'trade_mode', True)
         if trade_mode is not None and str(trade_mode).lower() in ('false', '0', 'no'):
-            return False
+            return False, 'trade_mode_disabled'
 
         if not self._is_pair_trade_allowed(s1, s2):
-            return False
+            return False, 'pair_not_allowed'
         
         # Check max active pairs limit (local memory)
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         if self.count_active_positions(exclude_pair=exclude_pair) >= max_pairs:
-            return False
+            return False, 'local_max_pairs'
         
         # Keep scalar counter consistent with current symbol cache to avoid stale blocks.
         cached_positions = len(self._exchange_positions_cache or {})
@@ -4547,17 +4547,25 @@ class PairsManager:
         max_exchange_positions = max_pairs * 2
         if self._exchange_position_count >= max_exchange_positions:
             print(f"🚫 Exchange position limit: {self._exchange_position_count}/{max_exchange_positions} positions on exchange")
-            return False
+            return False, 'exchange_position_limit'
         
         # Symbol cooldown after insufficient margin/capital/order-limit failures
-        if self._is_symbol_temporarily_blocked(s1) or self._is_symbol_temporarily_blocked(s2):
-            return False
+        if self._is_symbol_temporarily_blocked(s1):
+            return False, f'symbol_cooldown:{s1}'
+        if self._is_symbol_temporarily_blocked(s2):
+            return False, f'symbol_cooldown:{s2}'
 
         # Check symbol lock - each symbol can only be in one active pair
-        if self.is_symbol_locked(s1, exclude_pair=exclude_pair) or self.is_symbol_locked(s2, exclude_pair=exclude_pair):
-            return False
+        if self.is_symbol_locked(s1, exclude_pair=exclude_pair):
+            return False, f'symbol_locked:{s1}'
+        if self.is_symbol_locked(s2, exclude_pair=exclude_pair):
+            return False, f'symbol_locked:{s2}'
         
-        return True
+        return True, 'ok'
+
+    def can_open_new_position(self, s1: str, s2: str, exclude_pair=None) -> bool:
+        allowed, _ = self._can_open_new_position_reason(s1, s2, exclude_pair=exclude_pair)
+        return allowed
 
     async def _execute_trade(self, pair_info: PairInfo, direction: int, close_reason: str = None):
         """
@@ -6506,8 +6514,9 @@ class PairsManager:
                     if not self._is_pair_trade_allowed(pair_info.symbol1, pair_info.symbol2):
                         print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: pair list filter")
                         continue
-                    if not self.can_open_new_position(pair_info.symbol1, pair_info.symbol2):
-                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: can_open_new_position=False")
+                    can_open, open_reason = self._can_open_new_position_reason(pair_info.symbol1, pair_info.symbol2)
+                    if not can_open:
+                        print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: {open_reason}")
                         continue
 
                     # Check cooldown from failed leverage/trade

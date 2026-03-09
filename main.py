@@ -8,6 +8,8 @@ import sys
 import builtins
 from collections import deque
 import aiohttp
+import csv
+import json
 from urllib.parse import urlsplit, parse_qs
 from dotenv import load_dotenv
 import binance
@@ -30,6 +32,8 @@ tg_channel_global = ''
 tg_admins_global = ''
 # Anti-spam cache for noisy untracked-close websocket events
 untracked_close_alerts: dict[str, float] = {}
+# Anti-spam cache for unknown/external open position websocket events
+untracked_open_alerts: dict[str, float] = {}
 # Short-lived suppression for symbols that were just handled by pair close logic.
 # Prevents false "UNTRACKED POSITION CLOSED" on the next ACCOUNT_UPDATE tick.
 recently_handled_close_symbols: dict[str, float] = {}
@@ -66,6 +70,58 @@ def _is_tradeable_usdt_symbol_name(symbol: str) -> bool:
     if any(pattern in s for pattern in _BAD_SYMBOL_PATTERNS):
         return False
     return True
+
+
+def _cfg_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _priority_file_path_from_config(conf) -> str:
+    path = getattr(conf, 'priority_pairs_file', '') or ''
+    if path and not os.path.isabs(path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, path)
+    return path
+
+
+def _extract_priority_symbols_from_file(path: str) -> set[str]:
+    symbols: set[str] = set()
+    if not path or not os.path.exists(path):
+        return symbols
+    try:
+        suffix = os.path.splitext(path)[1].lower()
+        raw_entries = []
+        if suffix == '.json':
+            with open(path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                raw_entries = payload.get('pairs', []) or payload.get('items', []) or []
+            elif isinstance(payload, list):
+                raw_entries = payload
+        elif suffix in ('.csv', '.tsv'):
+            with open(path, 'r', encoding='utf-8', newline='') as f:
+                reader = csv.DictReader(f, delimiter='\t' if suffix == '.tsv' else ',')
+                raw_entries = list(reader)
+        else:
+            with open(path, 'r', encoding='utf-8') as f:
+                raw_entries = [line.strip() for line in f if line.strip()]
+    except Exception:
+        return symbols
+
+    for item in raw_entries:
+        parsed = pairs_trading._parse_pair_text(item)
+        if not parsed:
+            continue
+        s1, s2 = parsed
+        if _is_tradeable_usdt_symbol_name(s1):
+            symbols.add(s1)
+        if _is_tradeable_usdt_symbol_name(s2):
+            symbols.add(s2)
+    return symbols
 
 
 def _configure_console_encoding():
@@ -434,33 +490,46 @@ async def main():
         print(f"Loaded {len(all_symbols)} symbols (raw: {loaded_raw_count}).")
         _mark('symbols_loaded')
         
-        # 1.5 VOLUME FILTER: Keep only top N symbols by 24h volume
+        # 1.5 Symbol universe selection
         max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
         blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
+        best_pairs_only = _cfg_bool(getattr(conf, 'best_pairs_only', False), False)
+        priority_file_path = _priority_file_path_from_config(conf)
         
         try:
-            print(f"📈 Filtering top {max_symbols} symbols by 24h volume...")
-            tickers = await client.ticker_24hr_price_change()
-            
-            # Filter to USDT pairs with volume, exclude blacklist
-            valid_tickers = []
-            for t in tickers:
-                sym = t.get('symbol', '')
-                if (
-                    _is_tradeable_usdt_symbol_name(sym)
-                    and sym not in blacklist
-                    and sym in all_symbols
-                ):
-                    try:
-                        vol = float(t.get('quoteVolume', 0))
-                        valid_tickers.append((sym, vol))
-                    except:
-                        continue
-            
-            # Sort by volume descending and keep top N
-            valid_tickers.sort(key=lambda x: x[1], reverse=True)
-            top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
-            # Always keep BTCUSDT for market-beta calculations, even if blacklisted or out of top-N.
+            top_symbols = set()
+
+            if best_pairs_only:
+                priority_symbols = _extract_priority_symbols_from_file(priority_file_path)
+                top_symbols.update(s for s in priority_symbols if s in all_symbols and s not in blacklist)
+                print(
+                    f"🎯 BEST-PAIRS-ONLY universe: {len(top_symbols)} symbols from priority file"
+                    f"{f' ({priority_file_path})' if priority_file_path else ''}"
+                )
+            else:
+                print(f"📈 Filtering top {max_symbols} symbols by 24h volume...")
+                tickers = await client.ticker_24hr_price_change()
+                
+                # Filter to USDT pairs with volume, exclude blacklist
+                valid_tickers = []
+                for t in tickers:
+                    sym = t.get('symbol', '')
+                    if (
+                        _is_tradeable_usdt_symbol_name(sym)
+                        and sym not in blacklist
+                        and sym in all_symbols
+                    ):
+                        try:
+                            vol = float(t.get('quoteVolume', 0))
+                            valid_tickers.append((sym, vol))
+                        except:
+                            continue
+                
+                # Sort by volume descending and keep top N
+                valid_tickers.sort(key=lambda x: x[1], reverse=True)
+                top_symbols.update(sym for sym, vol in valid_tickers[:max_symbols])
+
+            # Always keep BTCUSDT for market-beta calculations.
             if 'BTCUSDT' in all_symbols:
                 top_symbols.add('BTCUSDT')
             
@@ -489,12 +558,12 @@ async def main():
             
             top_symbols.update(s for s in protected_symbols if s in all_symbols)
             
-            # Filter all_symbols to only include top volume symbols
+            # Final symbol universe
             filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
             print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
             all_symbols = filtered_symbols
         except Exception as e:
-            print(f"⚠️ Volume filter failed ({e}). Using all symbols.")
+            print(f"⚠️ Symbol universe selection failed ({e}). Using all symbols.")
         _mark('volume_filter_done')
         
         # 2. Create pairs manager AFTER loading symbols
@@ -568,29 +637,41 @@ async def load_symbols_loop():
             if len(new_symbols) != raw_refresh_count:
                 print(f"⏭️ Refresh dropped {raw_refresh_count - len(new_symbols)} invalid symbols.")
             
-            # Apply volume filter + blacklist (same as initial load in main())
+            # Apply symbol universe selection (same as initial load in main())
             conf = await db.load_config()
             max_symbols = int(conf.max_symbols) if conf.max_symbols else 150
             blacklist = {s.strip().upper() for s in (conf.blacklist or '').split(',') if s.strip()}
+            best_pairs_only = _cfg_bool(getattr(conf, 'best_pairs_only', False), False)
+            priority_file_path = _priority_file_path_from_config(conf)
             
             try:
-                tickers = await client.ticker_24hr_price_change()
-                valid_tickers = []
-                for t in tickers:
-                    sym = t.get('symbol', '')
-                    if (
-                        _is_tradeable_usdt_symbol_name(sym)
-                        and sym not in blacklist
-                        and sym in new_symbols
-                    ):
-                        try:
-                            vol = float(t.get('quoteVolume', 0))
-                            valid_tickers.append((sym, vol))
-                        except Exception:
-                            continue
-                valid_tickers.sort(key=lambda x: x[1], reverse=True)
-                top_symbols = set(sym for sym, vol in valid_tickers[:max_symbols])
-                # Always keep BTCUSDT for market-beta calculations, even if blacklisted or out of top-N.
+                top_symbols = set()
+                if best_pairs_only:
+                    priority_symbols = _extract_priority_symbols_from_file(priority_file_path)
+                    top_symbols.update(s for s in priority_symbols if s in new_symbols and s not in blacklist)
+                    print(
+                        f"🎯 Refresh BEST-PAIRS-ONLY universe: {len(top_symbols)} symbols from priority file"
+                        f"{f' ({priority_file_path})' if priority_file_path else ''}"
+                    )
+                else:
+                    tickers = await client.ticker_24hr_price_change()
+                    valid_tickers = []
+                    for t in tickers:
+                        sym = t.get('symbol', '')
+                        if (
+                            _is_tradeable_usdt_symbol_name(sym)
+                            and sym not in blacklist
+                            and sym in new_symbols
+                        ):
+                            try:
+                                vol = float(t.get('quoteVolume', 0))
+                                valid_tickers.append((sym, vol))
+                            except Exception:
+                                continue
+                    valid_tickers.sort(key=lambda x: x[1], reverse=True)
+                    top_symbols.update(sym for sym, vol in valid_tickers[:max_symbols])
+
+                # Always keep BTCUSDT for market-beta calculations.
                 if 'BTCUSDT' in new_symbols:
                     top_symbols.add('BTCUSDT')
                 
@@ -619,7 +700,7 @@ async def load_symbols_loop():
                 print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
                 new_symbols = filtered_symbols
             except Exception as e:
-                print(f"⚠️ Volume filter failed during refresh ({e}). Using all symbols.")
+                print(f"⚠️ Symbol universe selection failed during refresh ({e}). Using all symbols.")
             
             # Update BOTH global and pairs_manager references
             all_symbols = new_symbols
@@ -1239,6 +1320,39 @@ async def ws_user_msg(ws, msg):
         
         # Note: Detailed notifications will be sent per-pair below
         # Skip simple "Position Changes" message - too noisy
+        for pos in positions:
+            symbol = pos.get('s')
+            position_amt = float(pos.get('pa', 0))
+            if position_amt == 0:
+                continue
+            if symbol in known_open_before:
+                continue
+            if pairs_manager and any(
+                symbol in (pi.symbol1, pi.symbol2) and (getattr(pi, 'position_status', 0) != 0 or getattr(pi, 'is_trading', False))
+                for pi in pairs_manager.active_pairs.values()
+            ):
+                continue
+            last_open_alert = untracked_open_alerts.get(symbol, 0)
+            now_open_ts = time_mod.time()
+            if now_open_ts - last_open_alert < 600:
+                continue
+            untracked_open_alerts[symbol] = now_open_ts
+            side = 'LONG' if position_amt > 0 else 'SHORT'
+            up = float(pos.get('up', 0) or 0.0)
+            try:
+                entry_price = float(pos.get('ep', 0) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            open_msg = (
+                f"⚡ <b>UNTRACKED POSITION OPENED</b>\n\n"
+                f"Symbol: <b>{symbol}</b>\n"
+                f"Side: <b>{side}</b>\n"
+                f"Qty: <b>{abs(position_amt)}</b>\n"
+                + (f"Entry: <b>{entry_price}</b>\n" if entry_price > 0 else "")
+                + f"Unrealized PnL: <b>{up:+.2f} USDT</b>\n"
+                f"Source: Exchange websocket reported a position not tracked by bot active_pairs."
+            )
+            await send_tg_notification(open_msg)
         
         processed_pairs = set()  # Track pairs we've already handled in this update
         

@@ -505,7 +505,7 @@ async def load_config():
             'hl_min_days': canonical_strategy.get('hl_min_days', '0.5'),   # Min 6 hours (1h=6 candles, 4h=1.5 candles)
             'hl_max_days': canonical_strategy.get('hl_max_days', '4.5'),    # Max 2 days (1h=48 candles, 4h=12 candles)
             'beta_threshold': canonical_strategy.get('beta_threshold', '0.2'),        # Max |beta_btc| for pair acceptance
-            'beta_alert_threshold': canonical_strategy.get('beta_alert_threshold', '0.3'),  # Alert if |beta| > this for open positions
+            'beta_alert_threshold': '0.5',  # Live safety margin above entry beta threshold
             'beta_critical': canonical_strategy.get('beta_critical', '1.0'),          # Force-close if |beta| > this regardless of PnL
             'signal_confirm_sec': canonical_strategy.get('signal_confirm_sec', '10'),      # Signal confirmation time in seconds
             'trade_mode': 'true',            # Allow opening new positions
@@ -570,6 +570,7 @@ async def load_config():
                 'hl_min_days': {'0.25'},
                 'hl_max_days': {'2.0'},
                 'beta_threshold': {'0.11'},
+                'beta_alert_threshold': {'0.15', '0.30', '0.3'},
                 'coint_stability_min_bars': {'2'},
                 'max_idle_pairs': {'150'},
                 'sl_atr_mult': {'2.5', '4.0'},
