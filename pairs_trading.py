@@ -423,6 +423,7 @@ class PairsManager:
             # STEP 2: Load pairs from DB and validate against exchange
             pairs = await db.get_all_pairs()
             restored_count = 0
+            restored_idle_count = 0
             closed_count = 0
             
             # Detailed logging for debugging
@@ -518,7 +519,6 @@ class PairsManager:
                             f"   └─ Unrealized PnL: {pnl_emoji} <b>{unrealized_pnl:.2f} USDT</b>",
                             reply_to_msg_id=tg_msg_id
                         )
-                        
                         # Close the remaining position
                         try:
                             # Re-verify position still exists before closing
@@ -610,8 +610,52 @@ class PairsManager:
                         except Exception as trade_close_err:
                             print(f"  ⚠️ Could not close stale OPEN trade for stale pair {p.symbol1}-{p.symbol2}: {trade_close_err}")
                         closed_count += 1
+                else:
+                    # DB idle pairs must also be restored into runtime state.
+                    # Otherwise they remain non-archived in DB, block duplicate checks,
+                    # but are never monitored after restart.
+                    close_anchor = int(getattr(p, 'last_close_candle_ts', 0) or 0)
+                    if close_anchor <= 0:
+                        close_time = int(getattr(p, 'close_time', 0) or 0)
+                        close_anchor = close_time if close_time > 1_000_000_000_000 else close_time * 1000
+
+                    discovered_at = time.time()
+                    if close_anchor > 0:
+                        discovered_at = close_anchor / 1000.0
+                    elif int(getattr(p, 'open_time', 0) or 0) > 0:
+                        discovered_at = int(getattr(p, 'open_time', 0) or 0)
+
+                    info = PairInfo(
+                        symbol1=p.symbol1,
+                        symbol2=p.symbol2,
+                        hedge_ratio=p.hedge_ratio,
+                        half_life=p.half_life,
+                        entry_half_life_bars=float(getattr(p, 'entry_half_life_bars', 0.0) or 0.0),
+                        entry_hold_limit_bars=int(getattr(p, 'entry_hold_limit_bars', 0) or 0),
+                        position_status=0,
+                        qty1=0.0,
+                        qty2=0.0,
+                        entry_price1=0.0,
+                        entry_price2=0.0,
+                        db_id=p.id,
+                        open_time=0,
+                        tg_message_id=getattr(p, 'tg_message_id', 0) or 0,
+                        discovered_at=discovered_at,
+                        reentry_block_candle_ts=close_anchor
+                    )
+                    info.beta_btc = getattr(p, 'beta_btc', 0.0) or 0.0
+                    info.last_pvalue = getattr(p, 'last_pvalue', 0.0) or 0.0
+                    info.entry_z_score = getattr(p, 'entry_z_score', 0.0) or 0.0
+                    self._update_quality_score_cache(info)
+
+                    self.active_pairs[pair_set] = info
+                    self._register_pair(info)
+                    restored_idle_count += 1
             
-            print(f"  Restored {restored_count} pairs, marked {closed_count} stale pairs as CLOSED")
+            print(
+                f"  Restored {restored_count} open pairs, {restored_idle_count} idle pairs, "
+                f"marked {closed_count} stale pairs as CLOSED"
+            )
             
             # Continue with full reconciliation (orphan handling, unknown positions, etc.)
             # MUST be inside try block - if DB load failed, we must NOT reconcile with empty active_pairs
@@ -2696,8 +2740,10 @@ class PairsManager:
         await self._check_signals_for_active_pairs(updated_symbol)
 
         # 2. Periodically run discovery (every 10 minutes)
+        #    Skip if background warmup still loading -- discovery would see incomplete ready_set.
         now = time.time()
-        if now - self._last_discovery_time > 600:
+        warmup_running = self._warmup_task is not None and not self._warmup_task.done()
+        if now - self._last_discovery_time > 600 and not warmup_running:
             if self._discovery_task is None or self._discovery_task.done():
                 self._last_discovery_time = now
                 self._discovery_task = self.loop.create_task(self._discover_new_pairs())
