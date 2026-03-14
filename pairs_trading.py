@@ -3279,10 +3279,7 @@ class PairsManager:
                         continue
 
                     if pair_set not in checked_pairs:
-                        blocked, _, _ = self._reject_block_info(pair_set, now_discovery_ts)
-                        if blocked:
-                            reject_cooldown_skipped += 1
-                            continue
+                        # Priority pairs skip anti-repeat cooldown — always check
                         priority_pairs.append((s1, s2))
                         checked_pairs.add(pair_set)
 
