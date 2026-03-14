@@ -2375,8 +2375,12 @@ class PairsManager:
         async def load_safe(symbol):
             nonlocal history_errors
             async with sem:
-                # Check if data exists
-                if symbol not in self.all_data:
+                # Check if data exists AND has enough candles for analysis
+                has_enough = (
+                    symbol in self.all_data
+                    and len(self.all_data[symbol].ts) >= self.min_data_points
+                )
+                if not has_enough:
                     self.all_data[symbol] = Data(maxlen=self.max_len)
                     sym_t0 = time.time()
                     await self._initialize_history(symbol)
