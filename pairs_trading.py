@@ -4477,6 +4477,99 @@ class PairsManager:
             self._exchange_positions_cache.pop(s2, None)
         self._exchange_position_count = len(self._exchange_positions_cache)
 
+    async def _recover_close_remaining_legs(
+        self,
+        pair_info: PairInfo,
+        close_reason_tag: str,
+        *,
+        initial_errors: list[str] | None = None,
+        retries: int = 2,
+        delay_sec: float = 0.8,
+    ) -> bool:
+        """
+        If close flow partially failed, re-check exchange and retry closing remaining legs.
+        Sends an explicit TG alert if at least one leg still cannot be flattened.
+        """
+        s1, s2 = pair_info.symbol1, pair_info.symbol2
+        last_errors = [str(x) for x in (initial_errors or []) if str(x).strip()]
+
+        for attempt in range(max(0, int(retries)) + 1):
+            live_amts = await self._fetch_pair_live_position_amts(s1, s2, retries=1, delay_sec=0.25)
+            if live_amts is None:
+                last_errors = (last_errors + ["exchange_verify_failed"])[:6]
+                if attempt < retries:
+                    await asyncio.sleep(max(0.2, float(delay_sec)))
+                    continue
+                break
+
+            self._sync_pair_exchange_cache(s1, s2, live_amts)
+            remaining = []
+            for sym in (s1, s2):
+                amt_signed = float(live_amts.get(sym, 0.0) or 0.0)
+                if abs(amt_signed) > 0:
+                    remaining.append((sym, amt_signed))
+
+            if not remaining:
+                return True
+
+            attempt_failures = []
+            print(
+                f"⚠️ Close recovery attempt {attempt + 1}/{max(1, int(retries) + 1)} "
+                f"for {s1}-{s2}: "
+                + ", ".join(f"{sym}:{amt:+.8f}" for sym, amt in remaining)
+            )
+            for sym, amt_signed in remaining:
+                close_side = 'SELL' if amt_signed > 0 else 'BUY'
+                try:
+                    await self.client.cancel_open_orders(symbol=sym)
+                except Exception:
+                    pass
+                try:
+                    await self._close_leg_reduce_only(
+                        symbol=sym,
+                        side=close_side,
+                        quantity=abs(amt_signed),
+                    )
+                except Exception as e:
+                    attempt_failures.append(f"{sym}: {type(e).__name__}: {str(e)[:120]}")
+
+            last_errors = attempt_failures or last_errors
+            if attempt < retries:
+                await asyncio.sleep(max(0.2, float(delay_sec)))
+
+        final_live_amts = await self._fetch_pair_live_position_amts(s1, s2, retries=1, delay_sec=0.25)
+        remaining_detail = "exchange_verify_failed"
+        if final_live_amts is not None:
+            self._sync_pair_exchange_cache(s1, s2, final_live_amts)
+            amt1_signed = float(final_live_amts.get(s1, 0.0) or 0.0)
+            amt2_signed = float(final_live_amts.get(s2, 0.0) or 0.0)
+            if abs(amt1_signed) <= 0 and abs(amt2_signed) <= 0:
+                return True
+
+            pair_info.qty1 = abs(amt1_signed)
+            pair_info.qty2 = abs(amt2_signed)
+            if pair_info.position_status == 0:
+                if amt1_signed > 0 and amt2_signed < 0:
+                    pair_info.position_status = 1
+                elif amt1_signed < 0 and amt2_signed > 0:
+                    pair_info.position_status = -1
+                elif abs(amt1_signed) > 0 or abs(amt2_signed) > 0:
+                    pair_info.position_status = 1
+            remaining_detail = f"{s1}:{amt1_signed:+.8f}, {s2}:{amt2_signed:+.8f}"
+
+        reason_detail = "; ".join(last_errors[:4]) if last_errors else "remaining leg close retry failed"
+        warn_msg = (
+            f"🚨 <b>Close recovery failed</b>\n"
+            f"Pair: <b>{s1}/{s2}</b>\n"
+            f"Tag: <code>{close_reason_tag}</code>\n"
+            f"Remaining: <code>{remaining_detail}</code>\n"
+            f"Reason: <code>{reason_detail}</code>\n"
+            f"Bot keeps pair OPEN and will continue sync/recovery."
+        )
+        reply_to = await self._resolve_reply_to_message_id(pair_info)
+        await self._notify(warn_msg, reply_to)
+        return False
+
     async def _confirm_pair_closed_on_exchange(self, pair_info: PairInfo, close_reason_tag: str) -> bool:
         """
         Final close gate: only allow DB/memory close when BOTH legs are actually zero on exchange.
@@ -4749,7 +4842,11 @@ class PairsManager:
 
                     # Exchange is source of truth: finalize close only after both legs are really zero.
                     if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
-                        return
+                        recovered = await self._recover_close_remaining_legs(pair_info, close_reason_tag)
+                        if not recovered:
+                            return
+                        if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                            return
                 
                     # === PnL CALCULATION & NOTIFICATION for hardware close ===
                     # Save values BEFORE zeroing state (needed for PnL calc & notification)
@@ -5031,258 +5128,272 @@ class PairsManager:
                     if errors:
                         err_msg = f"⚠️ Close {s1}-{s2}: {', '.join(errors)}"
                         print(err_msg)
-                        await self._notify(err_msg)
-                    else:
-                        # Exchange is source of truth: finalize close only after both legs are really zero.
+                        recovered = await self._recover_close_remaining_legs(
+                            pair_info,
+                            close_reason_tag,
+                            initial_errors=errors,
+                        )
+                        if not recovered:
+                            return
+
+                    # Exchange is source of truth: finalize close only after both legs are really zero.
+                    if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                        recovered = await self._recover_close_remaining_legs(
+                            pair_info,
+                            close_reason_tag,
+                            initial_errors=errors,
+                        )
+                        if not recovered:
+                            return
                         if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
                             return
 
-                        reason_text = CLOSE_REASONS.get(close_reason_tag, '\u2753 Unknown')
-                    
-                        def get_price(order):
-                            if not isinstance(order, dict):
-                                return 0.0
-                            if 'avgPrice' in order and float(order['avgPrice']) > 0:
-                                return float(order['avgPrice'])
-                            if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:
-                                return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
+                    reason_text = CLOSE_REASONS.get(close_reason_tag, '\u2753 Unknown')
+
+                    def get_price(order):
+                        if not isinstance(order, dict):
                             return 0.0
+                        if 'avgPrice' in order and float(order['avgPrice']) > 0:
+                            return float(order['avgPrice'])
+                        if 'cummulativeQuoteQty' in order and 'executedQty' in order and float(order['executedQty']) > 0:
+                            return float(order['cummulativeQuoteQty']) / float(order['executedQty'])
+                        return 0.0
 
-                        # Safely get prices - MAP by symbol (results array may not match s1/s2 order!)
-                        close_prices = {}
-                        for i, res in enumerate(results):
-                            if not isinstance(res, Exception) and i < len(close_symbols):
-                                close_prices[close_symbols[i]] = get_price(res)
-                        
-                        # For legs already closed by exchange (SL/TP trigger), fetch actual close price
-                        for sym in [s1, s2]:
-                            if sym not in close_prices:
-                                try:
-                                    start_ms = self._trade_window_start_ms(pair_info)
-                                    trades = await self._fetch_account_trades_window(sym, start_ms, max_records=1000)
-                                    if trades:
-                                        # Last trade price is the close price
-                                        close_prices[sym] = float(trades[-1].get('price', 0))
-                                        print(f"📊 Fetched close price for {sym} from trades: {close_prices[sym]}")
-                                    else:
-                                        close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
-                                except Exception as e:
-                                    print(f"⚠️ Could not fetch close price for {sym}: {e}")
-                                    close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
-                        
-                        close_price1 = close_prices.get(s1, pair_info.entry_price1)
-                        close_price2 = close_prices.get(s2, pair_info.entry_price2)
-                    
-                        # BUG-5 FIX: Use exchange realizedPnl for consistency with other close paths
-                        # Manual calc is kept as fallback only
-                        pnl1 = 0.0
-                        pnl2 = 0.0
-                        try:
-                            await asyncio.sleep(0.5)  # Brief delay for trade data availability
-                            start_ms_pnl = self._trade_window_start_ms(pair_info)
-                            trades_s1 = await self._fetch_account_trades_window(s1, start_ms_pnl, max_records=3000)
-                            trades_s2 = await self._fetch_account_trades_window(s2, start_ms_pnl, max_records=3000)
-                            if trades_s1 or trades_s2:
-                                pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades_s1)
-                                pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades_s2)
-                            else:
-                                raise ValueError("No trades found, using manual calc")
-                        except Exception as pnl_err:
-                            print(f"⚠️ Exchange PnL fetch failed ({pnl_err}), using manual calc")
-                            side1_dir = 1 if pair_info.position_status == 1 else -1
-                            side2_dir = -side1_dir
-                            pnl1 = (close_price1 - pair_info.entry_price1) * pair_info.qty1 * side1_dir
-                            pnl2 = (close_price2 - pair_info.entry_price2) * pair_info.qty2 * side2_dir
-                        total_pnl = pnl1 + pnl2
+                    # Safely get prices - MAP by symbol (results array may not match s1/s2 order!)
+                    close_prices = {}
+                    for i, res in enumerate(results):
+                        if not isinstance(res, Exception) and i < len(close_symbols):
+                            close_prices[close_symbols[i]] = get_price(res)
 
-
-                        # Calculate fees from recent trades (BEFORE trade record update)
-                        _norm_fee1, _norm_fee2 = 0.0, 0.0
-                        try:
-                            _norm_fee1 = sum(float(t.get('commission', 0)) for t in trades_s1) if trades_s1 else 0.0
-                            _norm_fee2 = sum(float(t.get('commission', 0)) for t in trades_s2) if trades_s2 else 0.0
-                        except Exception:
-                            pass
-                        net_pnl = total_pnl - (_norm_fee1 + _norm_fee2)
-                        pnl_emoji = "🟢" if net_pnl > 0 else "🔴"
-
-                        # Calculate real-time Z-score BEFORE DB update (was causing UnboundLocalError)
-                        close_zscore = 0.0
-                        try:
-                            p1 = self.last_prices.get(s1, 0)
-                            p2 = self.last_prices.get(s2, 0)
-                            if p1 > 0 and p2 > 0:
-                                close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
-                                import math
-                                if math.isnan(close_zscore):
-                                    close_zscore = pair_info.last_z_score or 0
-                            else:
-                                close_zscore = pair_info.last_z_score or 0
-                        except Exception:
-                            close_zscore = pair_info.last_z_score or 0
-
-                        if pair_info.current_trade_id:
-                            await db.close_trade_record(
-                                pair_info.current_trade_id,
-                                status='CLOSED',
-                                close_reason=close_reason_tag,
-                                close_price_1=close_price1,
-                                close_price_2=close_price2,
-                                pnl=net_pnl,
-                                close_z=close_zscore if close_zscore else 0.0,
-                                fee1=_norm_fee1,
-                                fee2=_norm_fee2,
-                            )
-                            await self._persist_pair_executions(
-                                pair_info, trades_s1, trades_s2, phase='CLOSE', trade_id=pair_info.current_trade_id
-                            )
-                    
-                        pair_info.current_trade_id = None
-                        pair_info.position_status = 0
-                        pair_info.qty1 = 0
-                        pair_info.qty2 = 0
-                        pair_info.close_handled = True  # Mark as handled to prevent duplicate notification
-                        pair_info.last_close_reason = close_reason_tag
-                        self._apply_close_cooldown(pair_info, close_reason_tag)
-                        pair_info.entry_price1 = 0
-                        pair_info.entry_price2 = 0
-                        
-                        # Update exchange position cache
-                        self._exchange_positions_cache.pop(s1, None)
-                        self._exchange_positions_cache.pop(s2, None)
-                        self._exchange_position_count = len(self._exchange_positions_cache)
-                    
-                        # Cancel all algo orders for this pair - track per symbol/type
-                        cleanup_status = []
-                        try:
-                            algo_orders = await self.client.get_algo_orders()
-                            if isinstance(algo_orders, dict):
-                                algo_orders = algo_orders.get('orders', [])
-                            if not isinstance(algo_orders, list):
-                                algo_orders = []
-
-                            # Track which orders exist for each symbol
-                            orders_by_sym = {s1: [], s2: []}
-                            for o in algo_orders:
-                                sym = o.get('symbol')
-                                if not sym:
-                                    continue
-                                if sym in orders_by_sym:
-                                    order_type = str(o.get('type') or o.get('orderType') or '')
-                                    order_type_up = order_type.upper()
-                                    if 'STOP' in order_type_up:
-                                        orders_by_sym[sym].append(('SL', o.get('algoId')))
-                                    elif 'TAKE_PROFIT' in order_type_up:
-                                        orders_by_sym[sym].append(('TP', o.get('algoId')))
-                                    else:
-                                        orders_by_sym[sym].append((order_type or 'ORDER', o.get('algoId')))
-                            
-                            # Cancel each order and track result
-                            for sym in [s1, s2]:
-                                for order_type, algo_id in orders_by_sym[sym]:
-                                    if algo_id is None:
-                                        cleanup_status.append(f"  ⚠️ {sym} {order_type} - missing algoId")
-                                        continue
-                                    try:
-                                        await self.client.cancel_algo_order(algoId=algo_id)
-                                        cleanup_status.append(f"  ✅ {sym} {order_type} cancelled")
-                                    except Exception as e:
-                                        cleanup_status.append(f"  ⚠️ {sym} {order_type} - {str(e)[:20]}")
-                            
-                            if not orders_by_sym[s1] and not orders_by_sym[s2]:
-                                cleanup_status.append("  ℹ️ No orders found")
-                                
-                        except Exception as e:
-                            cleanup_status.append(f"  ❌ Failed: {str(e)[:30]}")
-                        
-                        # Use beta_at_trigger if available (set by beta_drift/beta_critical close)
-                        # This prevents confusing TG messages showing current (already-changed) beta
-                        close_beta = getattr(pair_info, '_beta_at_trigger', None)
-                        if close_beta is None:
-                            close_beta = getattr(pair_info, 'beta_btc', 0) or 0
-                        else:
-                            pair_info._beta_at_trigger = None  # Reset after use
-                        
-                        # Per-position PnL with emoji
-                        e1 = '🟢' if pnl1 >= 0 else '🔴'
-                        e2 = '🟢' if pnl2 >= 0 else '🔴'
-                        
-                        # Build enhanced close message
-                        cleanup_msg = "\n".join(cleanup_status) if cleanup_status else "  ℹ️ No cleanup needed"
-                        close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
-                        
-                        # Recalculate beta & p-value fresh if they're 0 (stale after restart)
-                        if (close_beta == 0 or close_pval == 0) and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
+                    # For legs already closed by exchange (SL/TP trigger), fetch actual close price
+                    for sym in [s1, s2]:
+                        if sym not in close_prices:
                             try:
-                                _d1 = self.all_data[s1]
-                                _d2 = self.all_data[s2]
-                                if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
-                                    _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
-                                    _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
-                                    _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
-                                    if close_pval == 0 and not np.isnan(_pval):
-                                        close_pval = float(_pval)
-                                    if close_beta == 0 and isinstance(self.all_data, dict) and 'BTCUSDT' in self.all_data:
-                                        _btc = self.all_data['BTCUSDT']
-                                        if len(_btc.close) >= self.min_data_points:
-                                            _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
-                                            _sr = np.diff(_lp1) - pair_info.hedge_ratio * np.diff(_lp2)
-                                            _br = np.diff(_lbtc)
-                                            _beta = utils.calculate_pair_beta(_sr, _br)
-                                            if not np.isnan(_beta):
-                                                close_beta = float(_beta)
+                                start_ms = self._trade_window_start_ms(pair_info)
+                                trades = await self._fetch_account_trades_window(sym, start_ms, max_records=1000)
+                                if trades:
+                                    # Last trade price is the close price
+                                    close_prices[sym] = float(trades[-1].get('price', 0))
+                                    print(f"📊 Fetched close price for {sym} from trades: {close_prices[sym]}")
+                                else:
+                                    close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
                             except Exception as e:
-                                print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
-                        close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
-                        full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n"
-                        full_msg += f"🏷️ Tag: <code>{close_reason_tag}</code>\n\n"
-                        full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
-                        full_msg += f"⏳ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
-                        full_msg += f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
-                        full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
-                        full_msg += f"💸 Fees: {_norm_fee1 + _norm_fee2:.4f} USDT\n\n"
-                        full_msg += f"🛡️ Order Cleanup:\n{cleanup_msg}"
-                        
-                        print(full_msg.replace('<b>', '').replace('</b>', ''))
-                        # Reply to original open message if available
-                        reply_to = await self._resolve_reply_to_message_id(pair_info)
-                        await self._notify(full_msg, reply_to)
-                        
-                        # Update DB with close details + market neutrality metrics
-                        self._update_pair_quality_penalty_on_close(pair_info, close_reason_tag)
-                        self._update_quality_score_cache(pair_info)
-                        if pair_info.db_id:
-                            await db.update_pair({
-                                'id': pair_info.db_id,
-                                'position_status': 0,
-                                'qty1': 0,
-                                'qty2': 0,
-                                'entry_price1': 0,
-                                'entry_price2': 0,
-                                'close_time': int(time.time()),
-                                'close_pnl': net_pnl,
-                                'close_reason': close_reason_tag,
-                                'pnl1': pnl1,
-                                'pnl2': pnl2,
-                                'fee1': _norm_fee1,
-                                'fee2': _norm_fee2,
-                                'beta_btc': close_beta,
-                                'last_pvalue': close_pval,
-                            })
+                                print(f"⚠️ Could not fetch close price for {sym}: {e}")
+                                close_prices[sym] = self.last_prices.get(sym, 0) or (pair_info.entry_price1 if sym == s1 else pair_info.entry_price2)
 
-                        
-                        # AUTO-ADD to best_pairs.json on successful TP only
-                        # BUG-7 FIX: Don't add pairs from forced closes (circuit, beta_drift, etc.)
-                        if close_reason_tag in ('z_tp', 'hardware_tp'):
-                            self._add_to_best_pairs(s1, s2)
-                        
-                        # WAIT FOR CANDLE: re-entry block is ALWAYS pair-local.
-                        # Only this closed pair is blocked; other pairs may still open.
-                        self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
-                        
-                        # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
-                        print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
-                        self.loop.create_task(self._trigger_immediate_analysis())
+                    close_price1 = close_prices.get(s1, pair_info.entry_price1)
+                    close_price2 = close_prices.get(s2, pair_info.entry_price2)
+
+                    # BUG-5 FIX: Use exchange realizedPnl for consistency with other close paths
+                    # Manual calc is kept as fallback only
+                    pnl1 = 0.0
+                    pnl2 = 0.0
+                    trades_s1 = []
+                    trades_s2 = []
+                    try:
+                        await asyncio.sleep(0.5)  # Brief delay for trade data availability
+                        start_ms_pnl = self._trade_window_start_ms(pair_info)
+                        trades_s1 = await self._fetch_account_trades_window(s1, start_ms_pnl, max_records=3000)
+                        trades_s2 = await self._fetch_account_trades_window(s2, start_ms_pnl, max_records=3000)
+                        if trades_s1 or trades_s2:
+                            pnl1 = sum(float(t.get('realizedPnl', 0)) for t in trades_s1)
+                            pnl2 = sum(float(t.get('realizedPnl', 0)) for t in trades_s2)
+                        else:
+                            raise ValueError("No trades found, using manual calc")
+                    except Exception as pnl_err:
+                        print(f"⚠️ Exchange PnL fetch failed ({pnl_err}), using manual calc")
+                        side1_dir = 1 if pair_info.position_status == 1 else -1
+                        side2_dir = -side1_dir
+                        pnl1 = (close_price1 - pair_info.entry_price1) * pair_info.qty1 * side1_dir
+                        pnl2 = (close_price2 - pair_info.entry_price2) * pair_info.qty2 * side2_dir
+                    total_pnl = pnl1 + pnl2
+
+                    # Calculate fees from recent trades (BEFORE trade record update)
+                    _norm_fee1, _norm_fee2 = 0.0, 0.0
+                    try:
+                        _norm_fee1 = sum(float(t.get('commission', 0)) for t in trades_s1) if trades_s1 else 0.0
+                        _norm_fee2 = sum(float(t.get('commission', 0)) for t in trades_s2) if trades_s2 else 0.0
+                    except Exception:
+                        pass
+                    net_pnl = total_pnl - (_norm_fee1 + _norm_fee2)
+                    pnl_emoji = "🟢" if net_pnl > 0 else "🔴"
+
+                    # Calculate real-time Z-score BEFORE DB update (was causing UnboundLocalError)
+                    close_zscore = 0.0
+                    try:
+                        p1 = self.last_prices.get(s1, 0)
+                        p2 = self.last_prices.get(s2, 0)
+                        if p1 > 0 and p2 > 0:
+                            close_zscore = self._calc_realtime_zscore(pair_info, p1, p2)
+                            import math
+                            if math.isnan(close_zscore):
+                                close_zscore = pair_info.last_z_score or 0
+                        else:
+                            close_zscore = pair_info.last_z_score or 0
+                    except Exception:
+                        close_zscore = pair_info.last_z_score or 0
+
+                    if pair_info.current_trade_id:
+                        await db.close_trade_record(
+                            pair_info.current_trade_id,
+                            status='CLOSED',
+                            close_reason=close_reason_tag,
+                            close_price_1=close_price1,
+                            close_price_2=close_price2,
+                            pnl=net_pnl,
+                            close_z=close_zscore if close_zscore else 0.0,
+                            fee1=_norm_fee1,
+                            fee2=_norm_fee2,
+                        )
+                        await self._persist_pair_executions(
+                            pair_info, trades_s1, trades_s2, phase='CLOSE', trade_id=pair_info.current_trade_id
+                        )
+
+                    pair_info.current_trade_id = None
+                    pair_info.position_status = 0
+                    pair_info.qty1 = 0
+                    pair_info.qty2 = 0
+                    pair_info.close_handled = True  # Mark as handled to prevent duplicate notification
+                    pair_info.last_close_reason = close_reason_tag
+                    self._apply_close_cooldown(pair_info, close_reason_tag)
+                    pair_info.entry_price1 = 0
+                    pair_info.entry_price2 = 0
+
+                    # Update exchange position cache
+                    self._exchange_positions_cache.pop(s1, None)
+                    self._exchange_positions_cache.pop(s2, None)
+                    self._exchange_position_count = len(self._exchange_positions_cache)
+
+                    # Cancel all algo orders for this pair - track per symbol/type
+                    cleanup_status = []
+                    try:
+                        algo_orders = await self.client.get_algo_orders()
+                        if isinstance(algo_orders, dict):
+                            algo_orders = algo_orders.get('orders', [])
+                        if not isinstance(algo_orders, list):
+                            algo_orders = []
+
+                        # Track which orders exist for each symbol
+                        orders_by_sym = {s1: [], s2: []}
+                        for o in algo_orders:
+                            sym = o.get('symbol')
+                            if not sym:
+                                continue
+                            if sym in orders_by_sym:
+                                order_type = str(o.get('type') or o.get('orderType') or '')
+                                order_type_up = order_type.upper()
+                                if 'STOP' in order_type_up:
+                                    orders_by_sym[sym].append(('SL', o.get('algoId')))
+                                elif 'TAKE_PROFIT' in order_type_up:
+                                    orders_by_sym[sym].append(('TP', o.get('algoId')))
+                                else:
+                                    orders_by_sym[sym].append((order_type or 'ORDER', o.get('algoId')))
+
+                        # Cancel each order and track result
+                        for sym in [s1, s2]:
+                            for order_type, algo_id in orders_by_sym[sym]:
+                                if algo_id is None:
+                                    cleanup_status.append(f"  ⚠️ {sym} {order_type} - missing algoId")
+                                    continue
+                                try:
+                                    await self.client.cancel_algo_order(algoId=algo_id)
+                                    cleanup_status.append(f"  ✅ {sym} {order_type} cancelled")
+                                except Exception as e:
+                                    cleanup_status.append(f"  ⚠️ {sym} {order_type} - {str(e)[:20]}")
+
+                        if not orders_by_sym[s1] and not orders_by_sym[s2]:
+                            cleanup_status.append("  ℹ️ No orders found")
+
+                    except Exception as e:
+                        cleanup_status.append(f"  ❌ Failed: {str(e)[:30]}")
+
+                    # Use beta_at_trigger if available (set by beta_drift/beta_critical close)
+                    # This prevents confusing TG messages showing current (already-changed) beta
+                    close_beta = getattr(pair_info, '_beta_at_trigger', None)
+                    if close_beta is None:
+                        close_beta = getattr(pair_info, 'beta_btc', 0) or 0
+                    else:
+                        pair_info._beta_at_trigger = None  # Reset after use
+
+                    # Per-position PnL with emoji
+                    e1 = '🟢' if pnl1 >= 0 else '🔴'
+                    e2 = '🟢' if pnl2 >= 0 else '🔴'
+
+                    # Build enhanced close message
+                    cleanup_msg = "\n".join(cleanup_status) if cleanup_status else "  ℹ️ No cleanup needed"
+                    close_pval = getattr(pair_info, 'last_pvalue', 0) or 0
+
+                    # Recalculate beta & p-value fresh if they're 0 (stale after restart)
+                    if (close_beta == 0 or close_pval == 0) and isinstance(self.all_data, dict) and s1 in self.all_data and s2 in self.all_data:
+                        try:
+                            _d1 = self.all_data[s1]
+                            _d2 = self.all_data[s2]
+                            if len(_d1.close) >= self.min_data_points and len(_d2.close) >= self.min_data_points:
+                                _lp1 = np.log(list(_d1.close)[-self.min_data_points:])
+                                _lp2 = np.log(list(_d2.close)[-self.min_data_points:])
+                                _, _, _, _pval = utils.calculate_cointegration(_lp1, _lp2, strict_hl=False)
+                                if close_pval == 0 and not np.isnan(_pval):
+                                    close_pval = float(_pval)
+                                if close_beta == 0 and isinstance(self.all_data, dict) and 'BTCUSDT' in self.all_data:
+                                    _btc = self.all_data['BTCUSDT']
+                                    if len(_btc.close) >= self.min_data_points:
+                                        _lbtc = np.log(list(_btc.close)[-self.min_data_points:])
+                                        _sr = np.diff(_lp1) - pair_info.hedge_ratio * np.diff(_lp2)
+                                        _br = np.diff(_lbtc)
+                                        _beta = utils.calculate_pair_beta(_sr, _br)
+                                        if not np.isnan(_beta):
+                                            close_beta = float(_beta)
+                        except Exception as e:
+                            print(f"\u26a0\ufe0f Fresh beta/pval calc error at close: {e}")
+                    close_hl = self._format_half_life(pair_info.half_life) if pair_info.half_life and pair_info.half_life > 0 else 'N/A'
+                    full_msg = f"{reason_text}: <b>{s1}/{s2}</b>\n"
+                    full_msg += f"🏷️ Tag: <code>{close_reason_tag}</code>\n\n"
+                    full_msg += f"📊 Z: {close_zscore:+.2f} | β: {close_beta:.3f} | p: {close_pval:.4f}\n"
+                    full_msg += f"⏳ HL: {close_hl} | Hedge: {pair_info.hedge_ratio:.4f}\n"
+                    full_msg += f"💵 PnL: {pnl_emoji} <b>{net_pnl:+.2f} USDT</b>\n"
+                    full_msg += f"   {e1} {s1}: {pnl1:+.2f} | {e2} {s2}: {pnl2:+.2f}\n"
+                    full_msg += f"💸 Fees: {_norm_fee1 + _norm_fee2:.4f} USDT\n\n"
+                    full_msg += f"🛡️ Order Cleanup:\n{cleanup_msg}"
+
+                    print(full_msg.replace('<b>', '').replace('</b>', ''))
+                    # Reply to original open message if available
+                    reply_to = await self._resolve_reply_to_message_id(pair_info)
+                    await self._notify(full_msg, reply_to)
+
+                    # Update DB with close details + market neutrality metrics
+                    self._update_pair_quality_penalty_on_close(pair_info, close_reason_tag)
+                    self._update_quality_score_cache(pair_info)
+                    if pair_info.db_id:
+                        await db.update_pair({
+                            'id': pair_info.db_id,
+                            'position_status': 0,
+                            'qty1': 0,
+                            'qty2': 0,
+                            'entry_price1': 0,
+                            'entry_price2': 0,
+                            'close_time': int(time.time()),
+                            'close_pnl': net_pnl,
+                            'close_reason': close_reason_tag,
+                            'pnl1': pnl1,
+                            'pnl2': pnl2,
+                            'fee1': _norm_fee1,
+                            'fee2': _norm_fee2,
+                            'beta_btc': close_beta,
+                            'last_pvalue': close_pval,
+                        })
+
+                    # AUTO-ADD to best_pairs.json on successful TP only
+                    # BUG-7 FIX: Don't add pairs from forced closes (circuit, beta_drift, etc.)
+                    if close_reason_tag in ('z_tp', 'hardware_tp'):
+                        self._add_to_best_pairs(s1, s2)
+
+                    # WAIT FOR CANDLE: re-entry block is ALWAYS pair-local.
+                    # Only this closed pair is blocked; other pairs may still open.
+                    self.mark_pair_wait_for_next_candle(pair_info, reason=close_reason_tag)
+
+                    # IMMEDIATE RE-ANALYSIS: Trigger search for new trades now that slot is free
+                    print(f"🔄 Slot freed after closing {s1}-{s2}. Triggering immediate re-analysis...")
+                    self.loop.create_task(self._trigger_immediate_analysis())
                         
                 except Exception as e:
                     print(f"FATAL ERROR closing position for {s1}-{s2}: {e}")
