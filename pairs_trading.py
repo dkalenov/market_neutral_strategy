@@ -1694,11 +1694,35 @@ class PairsManager:
         while True:
             await asyncio.sleep(15)  # Backup check (15s — primary sync via userdata WS)
             try:
+                self._watchdog_is_trading()  # G-1b: auto-reset stuck is_trading flags
                 await self._check_leg_synchronization()
                 await self._cleanup_orphaned_algo_orders()
                 await self._cleanup_idle_pairs()  # Remove old idle pairs
             except Exception as e:
                 print(f"⚠️ Leg sync/cleanup error: {e}")
+
+    def _watchdog_is_trading(self):
+        """G-1b SAFETY NET: Auto-reset is_trading if stuck for > 120s.
+        Prevents permanent blocking of backup loops after failed recovery."""
+        now = time.time()
+        watchdog_timeout = 120  # seconds
+        for pair_info in list(self.active_pairs.values()):
+            if not pair_info.is_trading:
+                continue
+            started = float(getattr(pair_info, '_is_trading_since', 0) or 0)
+            if started <= 0:
+                # First time we see is_trading=True with no timestamp — mark it now
+                pair_info._is_trading_since = now
+                continue
+            elapsed = now - started
+            if elapsed > watchdog_timeout:
+                s1, s2 = pair_info.symbol1, pair_info.symbol2
+                print(
+                    f"🚨 WATCHDOG: is_trading stuck for {int(elapsed)}s on {s1}-{s2}. "
+                    f"Resetting to allow backup sync loops."
+                )
+                pair_info.is_trading = False
+                pair_info._is_trading_since = 0
 
     async def _cleanup_idle_pairs(self):
         """
@@ -1799,18 +1823,24 @@ class PairsManager:
         Close one futures leg with reduceOnly.
         Primary path: MARKET.
         Fallback for -4131 (PERCENT_PRICE): LIMIT IOC with safe bounded price.
+        G-5 FIX: All API calls are wrapped in asyncio.wait_for to prevent infinite hangs.
         """
         qty = abs(float(quantity or 0))
         if qty <= 0:
             return
 
+        _CLOSE_API_TIMEOUT = 15  # seconds — prevents infinite hang on testnet -1007 Timeout
+
         try:
-            return await self.client.new_order(
-                symbol=symbol,
-                side=side,
-                type='MARKET',
-                quantity=qty,
-                reduceOnly='true'
+            return await asyncio.wait_for(
+                self.client.new_order(
+                    symbol=symbol,
+                    side=side,
+                    type='MARKET',
+                    quantity=qty,
+                    reduceOnly='true'
+                ),
+                timeout=_CLOSE_API_TIMEOUT
             )
         except Exception as e:
             is_percent_price = getattr(e, 'error_code', None) == -4131 or 'PERCENT_PRICE' in str(e)
@@ -1854,15 +1884,18 @@ class PairsManager:
                 if price <= 0:
                     raise RuntimeError(f"Invalid fallback price for {symbol}: {price}")
 
-                result = await self.client.new_order(
-                    symbol=symbol,
-                    side=side,
-                    type='LIMIT',
-                    timeInForce='IOC',
-                    quantity=qty,
-                    price=price,
-                    reduceOnly='true',
-                    newOrderRespType='RESULT'
+                result = await asyncio.wait_for(
+                    self.client.new_order(
+                        symbol=symbol,
+                        side=side,
+                        type='LIMIT',
+                        timeInForce='IOC',
+                        quantity=qty,
+                        price=price,
+                        reduceOnly='true',
+                        newOrderRespType='RESULT'
+                    ),
+                    timeout=_CLOSE_API_TIMEOUT
                 )
                 print(f"✅ Closed {symbol} via LIMIT IOC fallback at {price}")
                 return result
@@ -4844,8 +4877,14 @@ class PairsManager:
                     if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
                         recovered = await self._recover_close_remaining_legs(pair_info, close_reason_tag)
                         if not recovered:
+                            # G-1 FIX: Reset is_trading so backup loops (leg sync, reconcile)
+                            # can detect and close orphan legs. Without this, pair was permanently stuck.
+                            pair_info.is_trading = False
+                            pair_info._is_trading_since = 0
                             return
                         if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                            pair_info.is_trading = False
+                            pair_info._is_trading_since = 0
                             return
                 
                     # === PnL CALCULATION & NOTIFICATION for hardware close ===
@@ -5134,6 +5173,9 @@ class PairsManager:
                             initial_errors=errors,
                         )
                         if not recovered:
+                            # G-1 FIX: Reset is_trading so backup loops can retry
+                            pair_info.is_trading = False
+                            pair_info._is_trading_since = 0
                             return
 
                     # Exchange is source of truth: finalize close only after both legs are really zero.
@@ -5144,8 +5186,14 @@ class PairsManager:
                             initial_errors=errors,
                         )
                         if not recovered:
+                            # G-1 FIX: Reset is_trading so backup loops can retry
+                            pair_info.is_trading = False
+                            pair_info._is_trading_since = 0
                             return
                         if not await self._confirm_pair_closed_on_exchange(pair_info, close_reason_tag):
+                            # G-1 FIX: Reset is_trading so backup loops can retry
+                            pair_info.is_trading = False
+                            pair_info._is_trading_since = 0
                             return
 
                     reason_text = CLOSE_REASONS.get(close_reason_tag, '\u2753 Unknown')
