@@ -117,9 +117,10 @@ def _extract_priority_symbols_from_file(path: str) -> set[str]:
         if not parsed:
             continue
         s1, s2 = parsed
-        if _is_tradeable_usdt_symbol_name(s1):
+        # Priority symbols are pre-vetted in backtest — skip _is_tradeable filter
+        if s1 and s1.endswith('USDT'):
             symbols.add(s1)
-        if _is_tradeable_usdt_symbol_name(s2):
+        if s2 and s2.endswith('USDT'):
             symbols.add(s2)
     return symbols
 
@@ -486,6 +487,7 @@ async def main():
                 except Exception:
                     continue  # Skip problematic symbols
         loaded_raw_count = len(all_symbols)
+        all_symbols_unfiltered = dict(all_symbols)  # Keep unfiltered copy for priority lookups
         all_symbols = {s: obj for s, obj in all_symbols.items() if _is_tradeable_usdt_symbol_name(s)}
         print(f"Loaded {len(all_symbols)} symbols (raw: {loaded_raw_count}).")
         _mark('symbols_loaded')
@@ -501,7 +503,8 @@ async def main():
 
             if best_pairs_only:
                 priority_symbols = _extract_priority_symbols_from_file(priority_file_path)
-                top_symbols.update(s for s in priority_symbols if s in all_symbols and s not in blacklist)
+                # Use unfiltered symbols — priority pairs are pre-vetted in backtest
+                top_symbols.update(s for s in priority_symbols if s in all_symbols_unfiltered and s not in blacklist)
                 print(
                     f"🎯 BEST-PAIRS-ONLY universe: {len(top_symbols)} symbols from priority file"
                     f"{f' ({priority_file_path})' if priority_file_path else ''}"
@@ -558,8 +561,12 @@ async def main():
             
             top_symbols.update(s for s in protected_symbols if s in all_symbols)
             
-            # Final symbol universe
+            # Final symbol universe: use filtered + unfiltered priority symbols
             filtered_symbols = {s: obj for s, obj in all_symbols.items() if s in top_symbols}
+            # Add priority symbols that passed best_pairs vetting but were dropped by pattern filter
+            for s in top_symbols:
+                if s not in filtered_symbols and s in all_symbols_unfiltered:
+                    filtered_symbols[s] = all_symbols_unfiltered[s]
             print(f"✅ Filtered to {len(filtered_symbols)} symbols (from {len(all_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
             all_symbols = filtered_symbols
         except Exception as e:
@@ -633,6 +640,7 @@ async def load_symbols_loop():
             print("Refreshing market symbols...")
             new_symbols = await client.load_symbols()
             raw_refresh_count = len(new_symbols)
+            new_symbols_unfiltered = dict(new_symbols)  # Keep unfiltered copy for priority lookups
             new_symbols = {s: obj for s, obj in new_symbols.items() if _is_tradeable_usdt_symbol_name(s)}
             if len(new_symbols) != raw_refresh_count:
                 print(f"⏭️ Refresh dropped {raw_refresh_count - len(new_symbols)} invalid symbols.")
@@ -648,7 +656,8 @@ async def load_symbols_loop():
                 top_symbols = set()
                 if best_pairs_only:
                     priority_symbols = _extract_priority_symbols_from_file(priority_file_path)
-                    top_symbols.update(s for s in priority_symbols if s in new_symbols and s not in blacklist)
+                    # Use unfiltered symbols — priority pairs are pre-vetted in backtest
+                    top_symbols.update(s for s in priority_symbols if s in new_symbols_unfiltered and s not in blacklist)
                     print(
                         f"🎯 Refresh BEST-PAIRS-ONLY universe: {len(top_symbols)} symbols from priority file"
                         f"{f' ({priority_file_path})' if priority_file_path else ''}"
@@ -697,6 +706,10 @@ async def load_symbols_loop():
                 
                 top_symbols.update(s for s in protected_symbols if s in new_symbols)
                 filtered_symbols = {s: obj for s, obj in new_symbols.items() if s in top_symbols}
+                # Add priority symbols that passed best_pairs vetting but were dropped by pattern filter
+                for s in top_symbols:
+                    if s not in filtered_symbols and s in new_symbols_unfiltered:
+                        filtered_symbols[s] = new_symbols_unfiltered[s]
                 print(f"✅ Refreshed {len(filtered_symbols)} symbols (from {len(new_symbols)}, blacklist: {len(blacklist)}, protected: {len(protected_symbols)})")
                 new_symbols = filtered_symbols
             except Exception as e:
@@ -1382,6 +1395,7 @@ async def ws_user_msg(ws, msg):
                         processed_pairs.add(pair_set)
                         # CRITICAL: Set is_trading NOW to prevent leg sync from racing
                         pair_info.is_trading = True
+                        pair_info._is_trading_since = time_mod.time()
                         
                         pairs_to_process.append((pair_set, pair_info, symbol, other_symbol, other_closed_in_batch))
                         break  # Found the pair for this symbol
@@ -1596,12 +1610,15 @@ async def ws_user_msg(ws, msg):
                     if other_amt != 0:
                         close_side = 'SELL' if other_amt > 0 else 'BUY'
                         try:
-                            await client.new_order(
-                                symbol=other_symbol,
-                                side=close_side,
-                                type='MARKET',
-                                quantity=abs(other_amt),
-                                reduceOnly='true'
+                            await asyncio.wait_for(
+                                client.new_order(
+                                    symbol=other_symbol,
+                                    side=close_side,
+                                    type='MARKET',
+                                    quantity=abs(other_amt),
+                                    reduceOnly='true'
+                                ),
+                                timeout=15
                             )
                             print(f"✅ Closed remaining leg {other_symbol} (qty={abs(other_amt)}, side={close_side}, reduceOnly=true)")
                         except Exception as close_err:
@@ -1617,11 +1634,15 @@ async def ws_user_msg(ws, msg):
                                     print(f"ℹ️ {other_symbol} already closed after reduceOnly reject (-2022).")
                                 else:
                                     verify_side = 'SELL' if verify_amt > 0 else 'BUY'
-                                    await client.new_order(
-                                        symbol=other_symbol,
-                                        side=verify_side,
-                                        type='MARKET',
-                                        quantity=abs(verify_amt)
+                                    await asyncio.wait_for(
+                                        client.new_order(
+                                            symbol=other_symbol,
+                                            side=verify_side,
+                                            type='MARKET',
+                                            quantity=abs(verify_amt),
+                                            reduceOnly='true'
+                                        ),
+                                        timeout=15
                                     )
                                     close_exec_note = "ℹ️ reduceOnly rejected, closed with fallback MARKET order."
                                     print(f"⚠️ reduceOnly rejected for {other_symbol}; fallback MARKET close succeeded.")

@@ -181,6 +181,7 @@ class PairInfo:
     db_id: int = None 
     current_trade_id: int = None 
     is_trading: bool = False
+    _is_trading_since: float = 0.0
     # TG message tracking
     tg_message_id: int = 0     # TG message ID for reply threading
     open_time: int = 0         # Unix timestamp when trade opened
@@ -214,6 +215,16 @@ class PairInfo:
     _wait_for_candle: bool = False  # True = pair just closed, wait for next candle before re-entry
     # Persisted/derived candle anchor: do not re-enter while latest closed candle <= this ts (ms).
     reentry_block_candle_ts: int = 0
+
+    def __setattr__(self, name, value):
+        # Keep watchdog timing aligned with every busy/idle transition, even if
+        # different code paths still use direct `pair_info.is_trading = ...`.
+        if name == 'is_trading':
+            busy = bool(value)
+            object.__setattr__(self, name, busy)
+            object.__setattr__(self, '_is_trading_since', time.time() if busy else 0.0)
+            return
+        object.__setattr__(self, name, value)
 
 class PairsManager:
     """
@@ -1929,7 +1940,14 @@ class PairsManager:
             externally_closed_now = []
             for pair_info in list(self.active_pairs.values()):
                 if pair_info.is_trading:
-                    continue
+                    # N-4 FIX: Watchdog — auto-reset is_trading after 120s
+                    _since = float(getattr(pair_info, '_is_trading_since', 0) or 0)
+                    if _since > 0 and time.time() - _since > 120:
+                        print(f"⚠️ is_trading watchdog: {pair_info.symbol1}-{pair_info.symbol2} stuck {time.time()-_since:.0f}s, resetting")
+                        pair_info.is_trading = False
+                        pair_info._is_trading_since = 0
+                    else:
+                        continue
 
                 leg1_open = pair_info.symbol1 in pos_by_symbol
                 leg2_open = pair_info.symbol2 in pos_by_symbol
@@ -2144,6 +2162,7 @@ class PairsManager:
                     
                     pair_info.close_handled = True  # Prevent WS handler from sending duplicate notification
                     pair_info.is_trading = True
+                    pair_info._is_trading_since = time.time()
                     
                     try:
                         # Cancel any remaining orders
