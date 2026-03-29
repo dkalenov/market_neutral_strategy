@@ -36,6 +36,8 @@ MAX_FFILL_GAP_BARS = 0
 CLOSE_REASONS = {
     "z_tp": "Z-Score Take Profit",
     "z_sl": "Z-Score Stop Loss",
+    "hardware_tp": "Hardware Take Profit",
+    "hardware_sl": "Hardware Stop Loss",
     "circuit": "Circuit Breaker",
     "broken_coint": "Broken Correlation",
     "beta_drift": "Beta Drift",
@@ -96,6 +98,18 @@ def parse_bool(x: Any) -> bool:
     return s in {"1", "true", "yes", "y", "on"}
 
 
+def parse_timestamp_utc(value: Any) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    ts = pd.to_datetime(text, utc=True, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Invalid UTC timestamp/date: {value}")
+    return ts
+
+
 def infer_timeframe_from_index(index: pd.DatetimeIndex) -> str:
     if len(index) < 3:
         return "1h"
@@ -116,6 +130,24 @@ def infer_timeframe_from_index(index: pd.DatetimeIndex) -> str:
     return mapping.get(best, "1h")
 
 
+def _filter_df_by_utc_window(
+    df: pd.DataFrame,
+    column: str,
+    start_ts: pd.Timestamp | None,
+    end_ts: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if df is None or df.empty or column not in df.columns:
+        return df.copy() if df is not None else pd.DataFrame()
+    out = df.copy()
+    out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
+    mask = out[column].notna()
+    if start_ts is not None:
+        mask &= out[column] >= start_ts
+    if end_ts is not None:
+        mask &= out[column] < end_ts
+    return out.loc[mask].reset_index(drop=True)
+
+
 @dataclass
 class BacktestParams:
     timeframe: str = "1h"
@@ -129,6 +161,15 @@ class BacktestParams:
     z_stop: float = 4.0
     commission_rate: float = 0.0004
     slippage_rate: float = 0.0005
+    hardware_sltp_mode: str = "off"  # off | monitor | exit
+    hardware_sl_enabled: bool = True
+    hardware_tp_enabled: bool = True
+    sl_atr_mult: float = 2.5
+    sl_min_pct: float = 0.10
+    sl_max_pct: float = 0.30
+    tp_atr_mult: float = 4.0
+    tp_min_pct: float = 0.15
+    tp_max_pct: float = 0.50
     p_value_threshold: float = 0.05
     hedge_min: float = 0.3
     hedge_max: float = 3.0
@@ -151,6 +192,7 @@ class BacktestParams:
     discovery_max_pairs_per_cycle: int = 12000
     max_symbols: int = 300
     top_pairs_limit: int = 300
+    funding_csv: str = ""
     progress_every_bars: int = 100
     hl_min_days: float = 0.25
     hl_max_days: float = 2.0
@@ -257,6 +299,20 @@ class Position:
     entry_half_life: float
     coint_streak_at_entry: int
     expected_reversion_hours: float
+    hardware_sl1: float = np.nan
+    hardware_tp1: float = np.nan
+    hardware_sl2: float = np.nan
+    hardware_tp2: float = np.nan
+    hardware_sl_touched: bool = False
+    hardware_tp_touched: bool = False
+    hardware_first_touch_reason: str = ""
+    hardware_first_touch_symbol: str = ""
+    hardware_first_touch_note: str = ""
+    hardware_first_touch_idx: int = -1
+    funding_leg1: float = 0.0
+    funding_leg2: float = 0.0
+    funding_total: float = 0.0
+    funding_events: int = 0
     min_unrealized_pnl: float = 0.0
     max_unrealized_pnl: float = 0.0
 
@@ -281,6 +337,15 @@ class BacktestResult:
     coint_phases: pd.DataFrame
     ledger: pd.DataFrame
     params: dict[str, Any]
+
+
+@dataclass
+class FundingData:
+    rate_arr: np.ndarray
+    source_path: str
+    loaded_records: int
+    matched_records: int
+    skipped_records: int
 
 
 def load_klines_market_data(csv_path: str, max_symbols: int) -> MarketData:
@@ -369,6 +434,55 @@ def load_klines_market_data(csv_path: str, max_symbols: int) -> MarketData:
         low_arr=pivots["Low"].to_numpy(dtype=float),
         close_arr=pivots["Close"].to_numpy(dtype=float),
         volume_arr=pivots["Volume"].to_numpy(dtype=float),
+    )
+
+
+def load_funding_data(csv_path: str | None, market: MarketData) -> FundingData | None:
+    path_text = str(csv_path or "").strip()
+    if not path_text:
+        return None
+    path = Path(path_text)
+    if not path.exists():
+        raise FileNotFoundError(f"Funding CSV not found: {csv_path}")
+
+    df = pd.read_csv(path)
+    required_cols = {"Symbol", "fundingTime", "fundingRate"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in funding CSV {csv_path}: {sorted(missing)}")
+
+    df["Symbol"] = df["Symbol"].astype(str).str.upper().str.strip()
+    # Binance funding timestamps can carry tiny millisecond offsets.
+    # Normalize them to second precision so they align with bar timestamps.
+    df["fundingTime"] = pd.to_datetime(df["fundingTime"], utc=True, errors="coerce").dt.round("s")
+    df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+    df = df.dropna(subset=["Symbol", "fundingTime", "fundingRate"]).copy()
+    if df.empty:
+        raise ValueError(f"Funding CSV has no valid rows: {csv_path}")
+
+    date_to_idx = {pd.Timestamp(ts).round("s"): i for i, ts in enumerate(market.dates)}
+    rate_arr = np.zeros((len(market.dates), len(market.symbols)), dtype=np.float64)
+    matched = 0
+    skipped = 0
+
+    for row in df.itertuples(index=False):
+        sym = str(row.Symbol).upper().strip()
+        ts = pd.Timestamp(row.fundingTime)
+        rate = float(row.fundingRate)
+        sym_idx = market.symbol_to_idx.get(sym)
+        bar_idx = date_to_idx.get(ts)
+        if sym_idx is None or bar_idx is None:
+            skipped += 1
+            continue
+        rate_arr[bar_idx, sym_idx] += rate
+        matched += 1
+
+    return FundingData(
+        rate_arr=rate_arr,
+        source_path=str(path.resolve()),
+        loaded_records=int(len(df)),
+        matched_records=int(matched),
+        skipped_records=int(skipped),
     )
 
 
@@ -699,6 +813,15 @@ class BotParityBacktester:
         self.periods_per_year = timeframe_to_periods_per_year(params.timeframe)
         self.confirm_bars = params.confirm_bars()
         self.max_hold_bars_days = max(1, int(round(params.max_hold_days * utils.CANDLES_PER_DAY.get(params.timeframe, 24))))
+        self.hardware_sltp_mode = str(getattr(params, "hardware_sltp_mode", "off") or "off").strip().lower()
+        if self.hardware_sltp_mode not in {"off", "monitor", "exit"}:
+            self.hardware_sltp_mode = "off"
+        self.hardware_sl_enabled = bool(getattr(params, "hardware_sl_enabled", True))
+        self.hardware_tp_enabled = bool(getattr(params, "hardware_tp_enabled", True))
+        self.hardware_sltp_active = (
+            self.hardware_sltp_mode != "off"
+            and (self.hardware_sl_enabled or self.hardware_tp_enabled)
+        )
 
         self.btc_idx = market.symbol_to_idx.get("BTCUSDT", None)
         self.primary_candidate_keys = [cp.key for cp in candidates if str(cp.source) != "supplemental_combo"]
@@ -747,6 +870,9 @@ class BotParityBacktester:
         self.equity_rows: list[dict[str, Any]] = []
         self.coint_phase_rows: list[dict[str, Any]] = []
         self.discovered_keys_seen: set[tuple[str, str]] = set()
+        self.funding_data = load_funding_data(getattr(params, "funding_csv", ""), market)
+        self.funding_enabled = self.funding_data is not None
+        self.total_funding_cash = 0.0
 
         # Build pool with market data baked into each worker at startup.
         # Workers receive close_arr ONCE (as raw bytes) — then per-task args
@@ -772,6 +898,195 @@ class BotParityBacktester:
             return (None, None)
         self.key_to_indices[key] = (ia, ib)
         return (ia, ib)
+
+    def _compute_atr_for_symbol(self, sym_idx: int, end_idx: int, lookback: int = 100) -> float:
+        end = max(0, int(end_idx))
+        if end <= 1:
+            return 0.0
+        start = max(0, end - max(20, int(lookback)))
+        high = self.market.high_arr[start:end, sym_idx]
+        low = self.market.low_arr[start:end, sym_idx]
+        close = self.market.close_arr[start:end, sym_idx]
+        mask = (
+            np.isfinite(high)
+            & np.isfinite(low)
+            & np.isfinite(close)
+            & (high > 0)
+            & (low > 0)
+            & (close > 0)
+        )
+        if int(mask.sum()) < 2:
+            return 0.0
+        return float(
+            utils.calculate_atr(
+                high[mask].astype(float).tolist(),
+                low[mask].astype(float).tolist(),
+                close[mask].astype(float).tolist(),
+            )
+        )
+
+    def _funding_price_for_bar(self, idx: int, sym_idx: int) -> float:
+        p = float(self.market.open_arr[idx, sym_idx])
+        if np.isfinite(p) and p > 0:
+            return p
+        p = float(self.market.close_arr[idx, sym_idx])
+        if np.isfinite(p) and p > 0:
+            return p
+        return 0.0
+
+    def _apply_funding_for_bar(self, idx: int) -> None:
+        if not self.funding_enabled or self.funding_data is None or not self.positions:
+            return
+        rate_row = self.funding_data.rate_arr[idx]
+        if rate_row is None or not np.any(rate_row):
+            return
+
+        ts = self.market.dates[idx]
+        for key, pos in list(self.positions.items()):
+            i1 = self.market.symbol_to_idx.get(pos.symbol1)
+            i2 = self.market.symbol_to_idx.get(pos.symbol2)
+            if i1 is None or i2 is None:
+                continue
+
+            rate1 = float(rate_row[i1])
+            rate2 = float(rate_row[i2])
+            if rate1 == 0.0 and rate2 == 0.0:
+                continue
+
+            price1 = self._funding_price_for_bar(idx, i1)
+            price2 = self._funding_price_for_bar(idx, i2)
+            notional1 = abs(float(pos.qty1_signed)) * price1 if price1 > 0 else 0.0
+            notional2 = abs(float(pos.qty2_signed)) * price2 if price2 > 0 else 0.0
+            sign1 = 1.0 if float(pos.qty1_signed) > 0 else (-1.0 if float(pos.qty1_signed) < 0 else 0.0)
+            sign2 = 1.0 if float(pos.qty2_signed) > 0 else (-1.0 if float(pos.qty2_signed) < 0 else 0.0)
+            funding1 = -sign1 * notional1 * rate1
+            funding2 = -sign2 * notional2 * rate2
+            funding_total = float(funding1 + funding2)
+            if funding_total == 0.0:
+                continue
+
+            pos.funding_leg1 += float(funding1)
+            pos.funding_leg2 += float(funding2)
+            pos.funding_total += funding_total
+            pos.funding_events += 1
+            self.cash += funding_total
+            self.total_funding_cash += funding_total
+            self.ledger.append(
+                {
+                    "time": ts,
+                    "pair": f"{pos.symbol1}-{pos.symbol2}",
+                    "type": "funding",
+                    "cash_change": funding_total,
+                    "note": (
+                        f"trade_id={pos.trade_id} "
+                        f"{pos.symbol1}:{rate1:+.8f} {funding1:+.6f} | "
+                        f"{pos.symbol2}:{rate2:+.8f} {funding2:+.6f}"
+                    ),
+                }
+            )
+
+    def _detect_leg_hardware_hits(
+        self,
+        qty_signed: float,
+        low_price: float,
+        high_price: float,
+        sl_price: float,
+        tp_price: float,
+    ) -> tuple[bool, bool]:
+        if not np.isfinite(low_price) or not np.isfinite(high_price) or low_price <= 0 or high_price <= 0:
+            return (False, False)
+        is_long = float(qty_signed) > 0
+        sl_hit = False
+        tp_hit = False
+        if self.hardware_sl_enabled and np.isfinite(sl_price) and sl_price > 0:
+            sl_hit = (low_price <= sl_price) if is_long else (high_price >= sl_price)
+        if self.hardware_tp_enabled and np.isfinite(tp_price) and tp_price > 0:
+            tp_hit = (high_price >= tp_price) if is_long else (low_price <= tp_price)
+        return (bool(sl_hit), bool(tp_hit))
+
+    def _check_hardware_sltp_for_bar(
+        self,
+        st: PairState,
+        pos: Position,
+        idx: int,
+    ) -> dict[str, Any] | None:
+        if not self.hardware_sltp_active:
+            return None
+
+        i1 = self.market.symbol_to_idx.get(pos.symbol1)
+        i2 = self.market.symbol_to_idx.get(pos.symbol2)
+        if i1 is None or i2 is None:
+            return None
+
+        low1 = float(self.market.low_arr[idx, i1])
+        high1 = float(self.market.high_arr[idx, i1])
+        low2 = float(self.market.low_arr[idx, i2])
+        high2 = float(self.market.high_arr[idx, i2])
+        close1 = float(self.market.close_arr[idx, i1])
+        close2 = float(self.market.close_arr[idx, i2])
+
+        sl1_hit, tp1_hit = self._detect_leg_hardware_hits(
+            pos.qty1_signed, low1, high1, float(pos.hardware_sl1), float(pos.hardware_tp1)
+        )
+        sl2_hit, tp2_hit = self._detect_leg_hardware_hits(
+            pos.qty2_signed, low2, high2, float(pos.hardware_sl2), float(pos.hardware_tp2)
+        )
+
+        if sl1_hit or sl2_hit:
+            pos.hardware_sl_touched = True
+        if tp1_hit or tp2_hit:
+            pos.hardware_tp_touched = True
+
+        any_sl = sl1_hit or sl2_hit
+        any_tp = tp1_hit or tp2_hit
+        if not any_sl and not any_tp:
+            return None
+
+        reason = "hardware_sl" if any_sl else "hardware_tp"
+        note = "ambiguous_same_bar" if any_sl and any_tp else ""
+        trigger_symbol = ""
+        if reason == "hardware_sl":
+            trigger_symbol = pos.symbol1 if sl1_hit else pos.symbol2
+        else:
+            trigger_symbol = pos.symbol1 if tp1_hit else pos.symbol2
+
+        if not pos.hardware_first_touch_reason:
+            pos.hardware_first_touch_reason = reason
+            pos.hardware_first_touch_symbol = trigger_symbol
+            pos.hardware_first_touch_note = note
+            pos.hardware_first_touch_idx = int(idx)
+
+        if self.hardware_sltp_mode != "exit":
+            return None
+
+        price1_base = close1
+        price2_base = close2
+        if reason == "hardware_sl":
+            if sl1_hit and np.isfinite(pos.hardware_sl1):
+                price1_base = float(pos.hardware_sl1)
+            if sl2_hit and np.isfinite(pos.hardware_sl2):
+                price2_base = float(pos.hardware_sl2)
+        else:
+            if tp1_hit and np.isfinite(pos.hardware_tp1):
+                price1_base = float(pos.hardware_tp1)
+            if tp2_hit and np.isfinite(pos.hardware_tp2):
+                price2_base = float(pos.hardware_tp2)
+
+        if not np.isfinite(price1_base) or price1_base <= 0:
+            price1_base = close1
+        if not np.isfinite(price2_base) or price2_base <= 0:
+            price2_base = close2
+
+        return {
+            "reason": reason,
+            "zscore": st.last_z_score,
+            "beta": st.beta_btc,
+            "pvalue": st.last_pvalue,
+            "price1_base": float(price1_base),
+            "price2_base": float(price2_base),
+            "hardware_trigger_symbol": trigger_symbol,
+            "hardware_note": note,
+        }
 
     def _shutdown_pool(self) -> None:
         pool = self._pool
@@ -1112,6 +1427,21 @@ class BotParityBacktester:
 
         self.trade_seq += 1
         trade_id = self.trade_seq
+        hardware_sl1 = np.nan
+        hardware_tp1 = np.nan
+        hardware_sl2 = np.nan
+        hardware_tp2 = np.nan
+        if self.hardware_sltp_active:
+            atr1 = self._compute_atr_for_symbol(i1, idx)
+            atr2 = self._compute_atr_for_symbol(i2, idx)
+            leg1_side = "LONG" if direction == 1 else "SHORT"
+            leg2_side = "SHORT" if direction == 1 else "LONG"
+            hardware_sl1, hardware_tp1, _, _ = utils.calculate_hardware_stops(
+                float(p1_exec), leg1_side, float(atr1), self.params
+            )
+            hardware_sl2, hardware_tp2, _, _ = utils.calculate_hardware_stops(
+                float(p2_exec), leg2_side, float(atr2), self.params
+            )
         pos = Position(
             trade_id=trade_id,
             pair_key=key,
@@ -1133,6 +1463,10 @@ class BotParityBacktester:
             entry_half_life=float(st.half_life),
             coint_streak_at_entry=int(st.coint_streak_bars),
             expected_reversion_hours=float(order["expected_hours"]),
+            hardware_sl1=float(hardware_sl1) if np.isfinite(hardware_sl1) else np.nan,
+            hardware_tp1=float(hardware_tp1) if np.isfinite(hardware_tp1) else np.nan,
+            hardware_sl2=float(hardware_sl2) if np.isfinite(hardware_sl2) else np.nan,
+            hardware_tp2=float(hardware_tp2) if np.isfinite(hardware_tp2) else np.nan,
         )
         self.positions[key] = pos
         self.symbol_owner[st.symbol1] = key
@@ -1171,6 +1505,18 @@ class BotParityBacktester:
             "entry_hedge_ratio": float(st.hedge_ratio),
             "entry_coint_streak_bars": int(st.coint_streak_bars),
             "expected_reversion_hours": float(order["expected_hours"]),
+            "hardware_sltp_mode": self.hardware_sltp_mode,
+            "hardware_sl1": float(pos.hardware_sl1) if np.isfinite(pos.hardware_sl1) else np.nan,
+            "hardware_tp1": float(pos.hardware_tp1) if np.isfinite(pos.hardware_tp1) else np.nan,
+            "hardware_sl2": float(pos.hardware_sl2) if np.isfinite(pos.hardware_sl2) else np.nan,
+            "hardware_tp2": float(pos.hardware_tp2) if np.isfinite(pos.hardware_tp2) else np.nan,
+            "hardware_sl_touched": False,
+            "hardware_tp_touched": False,
+            "hardware_first_touch_reason": None,
+            "hardware_first_touch_symbol": None,
+            "hardware_first_touch_note": None,
+            "hardware_first_touch_idx": None,
+            "hardware_first_touch_time": None,
             "exit_idx": None,
             "exit_time": None,
             "exit_price1": None,
@@ -1179,6 +1525,11 @@ class BotParityBacktester:
             "exit_reason_text": None,
             "exit_fee": None,
             "gross_pnl": None,
+            "funding_leg1": 0.0,
+            "funding_leg2": 0.0,
+            "funding_total": 0.0,
+            "funding_events": 0,
+            "net_pnl_before_funding": None,
             "net_pnl": None,
             "hold_bars": None,
             "hold_hours": None,
@@ -1198,24 +1549,29 @@ class BotParityBacktester:
         if pos is None or st is None:
             return
 
-        i1 = self.market.symbol_to_idx[pos.symbol1]
-        i2 = self.market.symbol_to_idx[pos.symbol2]
-        o1 = float(self.market.open_arr[idx, i1])
-        o2 = float(self.market.open_arr[idx, i2])
-        if not np.isfinite(o1) or not np.isfinite(o2) or o1 <= 0 or o2 <= 0:
+        if "price1_base" in order and "price2_base" in order:
+            p1_base = float(order["price1_base"])
+            p2_base = float(order["price2_base"])
+        else:
+            i1 = self.market.symbol_to_idx[pos.symbol1]
+            i2 = self.market.symbol_to_idx[pos.symbol2]
+            p1_base = float(self.market.open_arr[idx, i1])
+            p2_base = float(self.market.open_arr[idx, i2])
+        if not np.isfinite(p1_base) or not np.isfinite(p2_base) or p1_base <= 0 or p2_base <= 0:
             return
 
         slip = float(self.params.slippage_rate)
         # Close long qty by selling (price worse by -slip), close short qty by buying (+slip)
-        p1_exec = o1 * (1.0 - slip) if pos.qty1_signed > 0 else o1 * (1.0 + slip)
-        p2_exec = o2 * (1.0 - slip) if pos.qty2_signed > 0 else o2 * (1.0 + slip)
+        p1_exec = p1_base * (1.0 - slip) if pos.qty1_signed > 0 else p1_base * (1.0 + slip)
+        p2_exec = p2_base * (1.0 - slip) if pos.qty2_signed > 0 else p2_base * (1.0 + slip)
 
         pnl1 = (p1_exec - pos.entry_price1) * pos.qty1_signed
         pnl2 = (p2_exec - pos.entry_price2) * pos.qty2_signed
         gross = float(pnl1 + pnl2)
         exit_notional = abs(pos.qty1_signed * p1_exec) + abs(pos.qty2_signed * p2_exec)
         exit_fee = float(exit_notional * self.params.commission_rate)
-        net = float(gross - pos.entry_fee - exit_fee)
+        net_before_funding = float(gross - pos.entry_fee - exit_fee)
+        net = float(net_before_funding + float(pos.funding_total))
 
         self.cash += gross - exit_fee
         reason = str(order["reason"])
@@ -1243,6 +1599,11 @@ class BotParityBacktester:
                     "exit_reason_text": CLOSE_REASONS.get(reason, reason),
                     "exit_fee": float(exit_fee),
                     "gross_pnl": float(gross),
+                    "funding_leg1": float(pos.funding_leg1),
+                    "funding_leg2": float(pos.funding_leg2),
+                    "funding_total": float(pos.funding_total),
+                    "funding_events": int(pos.funding_events),
+                    "net_pnl_before_funding": float(net_before_funding),
                     "net_pnl": float(net),
                     "hold_bars": hold_bars,
                     "hold_hours": hold_hours,
@@ -1255,6 +1616,21 @@ class BotParityBacktester:
                     "close_pvalue": float(order.get("pvalue", np.nan)),
                     "pnl_leg1": float(pnl1),
                     "pnl_leg2": float(pnl2),
+                    "hardware_sl_touched": bool(pos.hardware_sl_touched),
+                    "hardware_tp_touched": bool(pos.hardware_tp_touched),
+                    "hardware_first_touch_reason": pos.hardware_first_touch_reason or None,
+                    "hardware_first_touch_symbol": pos.hardware_first_touch_symbol or None,
+                    "hardware_first_touch_note": pos.hardware_first_touch_note or None,
+                    "hardware_first_touch_idx": (
+                        int(pos.hardware_first_touch_idx)
+                        if int(pos.hardware_first_touch_idx) >= 0
+                        else None
+                    ),
+                    "hardware_first_touch_time": (
+                        self.market.dates[int(pos.hardware_first_touch_idx)]
+                        if int(pos.hardware_first_touch_idx) >= 0
+                        else None
+                    ),
                 }
             )
 
@@ -1539,6 +1915,13 @@ class BotParityBacktester:
             self._update_quality_score(st, idx)
 
             if key in self.positions:
+                pos = self.positions.get(key)
+                if pos is not None:
+                    hardware_order = self._check_hardware_sltp_for_bar(st, pos, idx)
+                    if hardware_order is not None and key in self.positions:
+                        self._execute_exit(key, hardware_order, idx)
+                if key not in self.positions:
+                    continue
                 self._check_open_position_exit(st, snap, idx)
                 continue
 
@@ -1758,6 +2141,7 @@ class BotParityBacktester:
 
         try:
             for idx in range(i0, i1 + 1):
+                self._apply_funding_for_bar(idx)
                 self._execute_orders_for_bar(idx)
                 self._discover_new_pairs(idx)
                 self._evaluate_pair_states(idx)
@@ -1852,8 +2236,10 @@ class BotParityBacktester:
         win_rate = float(wins / total_trades) if total_trades > 0 else np.nan
 
         total_net = float(closed["net_pnl"].sum()) if total_trades > 0 else 0.0
+        total_net_before_funding = float(closed["net_pnl_before_funding"].sum()) if total_trades > 0 and "net_pnl_before_funding" in closed.columns else total_net
         total_gross = float(closed["gross_pnl"].sum()) if total_trades > 0 else 0.0
         total_fees = float(closed["entry_fee"].sum() + closed["exit_fee"].sum()) if total_trades > 0 else 0.0
+        total_funding = float(closed["funding_total"].sum()) if total_trades > 0 and "funding_total" in closed.columns else 0.0
         avg_trade = float(closed["net_pnl"].mean()) if total_trades > 0 else np.nan
         med_trade = float(closed["net_pnl"].median()) if total_trades > 0 else np.nan
         best_trade = float(closed["net_pnl"].max()) if total_trades > 0 else np.nan
@@ -1875,6 +2261,23 @@ class BotParityBacktester:
         if total_trades > 0 and "exit_reason" in closed.columns:
             cnt = Counter(closed["exit_reason"].astype(str).tolist())
             close_reason_breakdown = dict(sorted(cnt.items(), key=lambda x: (-x[1], x[0])))
+
+        hardware_touch_trades = 0
+        hardware_sl_touch_trades = 0
+        hardware_tp_touch_trades = 0
+        hardware_first_touch_breakdown: dict[str, int] = {}
+        if total_trades > 0 and "hardware_sl_touched" in closed.columns:
+            sl_touched = closed["hardware_sl_touched"].fillna(False).astype(bool)
+            tp_touched = closed["hardware_tp_touched"].fillna(False).astype(bool) if "hardware_tp_touched" in closed.columns else pd.Series(False, index=closed.index)
+            hardware_sl_touch_trades = int(sl_touched.sum())
+            hardware_tp_touch_trades = int(tp_touched.sum())
+            hardware_touch_trades = int((sl_touched | tp_touched).sum())
+            if "hardware_first_touch_reason" in closed.columns:
+                first_touch = closed["hardware_first_touch_reason"].dropna().astype(str)
+                if not first_touch.empty:
+                    hardware_first_touch_breakdown = dict(
+                        sorted(Counter(first_touch.tolist()).items(), key=lambda x: (-x[1], x[0]))
+                    )
 
         if coint_df is not None and not coint_df.empty:
             avg_coint_bars = float(coint_df["duration_bars"].mean())
@@ -1908,8 +2311,10 @@ class BotParityBacktester:
                 "losses": losses,
                 "win_rate": win_rate,
                 "total_net_pnl": total_net,
+                "total_net_pnl_before_funding": total_net_before_funding,
                 "total_gross_pnl": total_gross,
                 "total_fees": total_fees,
+                "total_funding": total_funding,
                 "avg_trade_pnl": avg_trade,
                 "median_trade_pnl": med_trade,
                 "best_trade_pnl": best_trade,
@@ -1927,6 +2332,13 @@ class BotParityBacktester:
                 "avg_mfe_pct_notional": avg_mfe_pct,
                 "avg_exposure_pct": avg_exposure_pct,
                 "close_reason_breakdown": close_reason_breakdown,
+                "hardware_sltp_mode": self.hardware_sltp_mode,
+                "hardware_sl_enabled": bool(self.hardware_sl_enabled),
+                "hardware_tp_enabled": bool(self.hardware_tp_enabled),
+                "hardware_touch_trades": hardware_touch_trades,
+                "hardware_sl_touch_trades": hardware_sl_touch_trades,
+                "hardware_tp_touch_trades": hardware_tp_touch_trades,
+                "hardware_first_touch_breakdown": hardware_first_touch_breakdown,
                 "active_pairs_final": int(len(self.pair_states)),
                 "candidate_pairs_total": int(len(self.candidates)),
                 "candidate_pairs_primary": int(len(self.primary_candidate_keys)),
@@ -1934,6 +2346,12 @@ class BotParityBacktester:
                 "discovered_pairs_total": int(len(self.discovered_keys_seen)),
                 "unique_pairs_traded": unique_pairs_traded,
                 "universe_symbols_total": int(len(self.market.symbols)),
+                "funding_enabled": bool(self.funding_enabled),
+                "funding_records_loaded": int(self.funding_data.loaded_records) if self.funding_data is not None else 0,
+                "funding_records_matched": int(self.funding_data.matched_records) if self.funding_data is not None else 0,
+                "funding_records_skipped": int(self.funding_data.skipped_records) if self.funding_data is not None else 0,
+                "funding_cash_total": float(self.total_funding_cash),
+                "funding_source_path": self.funding_data.source_path if self.funding_data is not None else "",
             }
         )
 
@@ -1946,8 +2364,10 @@ class BotParityBacktester:
                 l = n - w
                 wr = w / n if n > 0 else np.nan
                 net = float(grp["net_pnl"].sum())
+                net_before_funding = float(grp["net_pnl_before_funding"].sum()) if "net_pnl_before_funding" in grp.columns else net
                 gross = float(grp["gross_pnl"].sum())
                 fees = float(grp["entry_fee"].sum() + grp["exit_fee"].sum())
+                funding = float(grp["funding_total"].sum()) if "funding_total" in grp.columns else 0.0
                 avg_pnl = float(grp["net_pnl"].mean())
                 std_pnl = float(grp["net_pnl"].std(ddof=1)) if n > 1 else np.nan
                 pair_sharpe = (avg_pnl / std_pnl) if std_pnl and std_pnl > 0 else np.nan
@@ -1958,16 +2378,24 @@ class BotParityBacktester:
                 avg_entry_z = float(grp["entry_z"].mean()) if "entry_z" in grp.columns else np.nan
                 avg_hedge = float(grp["entry_hedge_ratio"].mean()) if "entry_hedge_ratio" in grp.columns else np.nan
                 avg_hl = float(grp["entry_half_life"].mean()) if "entry_half_life" in grp.columns else np.nan
+                hw_touch = int(
+                    (
+                        grp.get("hardware_sl_touched", pd.Series(False, index=grp.index)).fillna(False).astype(bool)
+                        | grp.get("hardware_tp_touched", pd.Series(False, index=grp.index)).fillna(False).astype(bool)
+                    ).sum()
+                )
                 reasons = dict(Counter(grp["exit_reason"].astype(str).tolist())) if "exit_reason" in grp.columns else {}
                 pair_rows.append({
                     "pair": pair_name,
                     "trades": n, "wins": w, "losses": l, "win_rate": wr,
-                    "net_pnl": net, "gross_pnl": gross, "total_fees": fees,
+                    "net_pnl": net, "net_pnl_before_funding": net_before_funding,
+                    "gross_pnl": gross, "total_fees": fees, "total_funding": funding,
                     "avg_pnl": avg_pnl, "std_pnl": std_pnl,
                     "pair_sharpe": pair_sharpe, "profit_factor": pf,
                     "avg_hold_hours": avg_hold_h,
                     "avg_entry_z": avg_entry_z, "avg_hedge_ratio": avg_hedge,
                     "avg_half_life": avg_hl,
+                    "hardware_touch_trades": hw_touch,
                     "close_reasons": str(reasons),
                 })
             pair_rows.sort(key=lambda x: -x["net_pnl"])
@@ -2277,7 +2705,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", default=None, help="Path to klines CSV (Date,Open,High,Low,Close,Volume,Symbol).")
     parser.add_argument("--best-pairs", default=None, help="Path to best_pairs.json.")
     parser.add_argument("--pair-blacklist", default=None, help="Path to pair blacklist (.json/.csv/.txt).")
+    parser.add_argument("--funding-csv", default=None, help="Optional funding rates CSV from download_funding_rates.py.")
+    parser.add_argument(
+        "--disable-pair-blacklist",
+        action="store_true",
+        help="Disable the default pair blacklist unless an explicit --pair-blacklist path is passed.",
+    )
     parser.add_argument("--output-dir", default=None, help="Directory for output files.")
+    parser.add_argument("--report-start", default=None, help="Optional UTC report start, e.g. 2026-03-09 or 2026-03-09T00:00:00Z.")
+    parser.add_argument("--report-end", default=None, help="Optional UTC report end (exclusive).")
     # ── Timeframe ─────────────────────────────────────────────────────────────
     parser.add_argument("--timeframe", default=None, help='Force timeframe label, e.g. "1h", "4h", "30m".')
     parser.add_argument("--window-size", type=int, default=None, help="Rolling window; 0=auto.")
@@ -2288,6 +2724,15 @@ def parse_args() -> argparse.Namespace:
     # ── Costs ─────────────────────────────────────────────────────────────────
     parser.add_argument("--commission", type=float, default=None)
     parser.add_argument("--slippage", type=float, default=None)
+    parser.add_argument("--hardware-sltp-mode", default=None, help="off/monitor/exit: disabled, count touches, or simulate exits.")
+    parser.add_argument("--hardware-sl-enabled", default=None, help="true/false: include hardware SL levels in check.")
+    parser.add_argument("--hardware-tp-enabled", default=None, help="true/false: include hardware TP levels in check.")
+    parser.add_argument("--sl-atr-mult", type=float, default=None)
+    parser.add_argument("--sl-min-pct", type=float, default=None)
+    parser.add_argument("--sl-max-pct", type=float, default=None)
+    parser.add_argument("--tp-atr-mult", type=float, default=None)
+    parser.add_argument("--tp-min-pct", type=float, default=None)
+    parser.add_argument("--tp-max-pct", type=float, default=None)
     # ── Z-score thresholds ────────────────────────────────────────────────────
     parser.add_argument("--z-entry", type=float, default=None)
     parser.add_argument("--z-entry-max", type=float, default=None)
@@ -2377,6 +2822,43 @@ def save_result(result: BacktestResult, out_dir: str, prefix: str) -> None:
         json.dump(result.params, f, indent=2, ensure_ascii=False, default=str)
 
 
+def build_report_window_result(
+    backtester: "BotParityBacktester",
+    result: BacktestResult,
+    report_start: pd.Timestamp | None,
+    report_end: pd.Timestamp | None,
+) -> BacktestResult | None:
+    if report_start is None and report_end is None:
+        return None
+
+    trades_df = _filter_df_by_utc_window(result.trades, "entry_time", report_start, report_end)
+    equity_df = _filter_df_by_utc_window(result.equity, "Date", report_start, report_end)
+    coint_df = _filter_df_by_utc_window(result.coint_phases, "ended_time", report_start, report_end)
+    ledger_col = "Date" if "Date" in result.ledger.columns else None
+    ledger_df = (
+        _filter_df_by_utc_window(result.ledger, ledger_col, report_start, report_end)
+        if ledger_col
+        else result.ledger.copy()
+    )
+
+    if equity_df.empty:
+        return None
+
+    metrics = backtester._build_metrics(trades_df, equity_df, coint_df)
+    params = dict(result.params)
+    params["report_start"] = str(report_start) if report_start is not None else ""
+    params["report_end"] = str(report_end) if report_end is not None else ""
+
+    return BacktestResult(
+        trades=trades_df,
+        equity=equity_df,
+        metrics=metrics,
+        coint_phases=coint_df,
+        ledger=ledger_df,
+        params=params,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN — all tunable parameters are collected here for easy editing / testing.
 #  Modify the DEFAULT_PARAMS dict below, or override via CLI flags.
@@ -2388,6 +2870,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     #       You can still override it via --input CLI flag.
     "best_pairs":      os.path.join("market_neutral", "best_pairs.json"),
     "pair_blacklist":  os.path.join("market_neutral", "pair_blacklist.json"),
+    "funding_csv":     "",
     "output_dir":      os.path.join("market_neutral", "backtest_results"),
 
     # ── Timeframe & window ────────────────────────────────────────────────────
@@ -2409,6 +2892,15 @@ DEFAULT_PARAMS: dict[str, Any] = {
     # ── Costs ─────────────────────────────────────────────────────────────────
     "commission_rate":  0.0004,
     "slippage_rate":    0.0005,
+    "hardware_sltp_mode": "off",
+    "hardware_sl_enabled": True,
+    "hardware_tp_enabled": True,
+    "sl_atr_mult": 2.5,
+    "sl_min_pct": 0.10,
+    "sl_max_pct": 0.30,
+    "tp_atr_mult": 4.0,
+    "tp_min_pct": 0.15,
+    "tp_max_pct": 0.50,
 
     # ── Cointegration & beta ──────────────────────────────────────────────────
     "p_value_threshold":     0.03,
@@ -2468,6 +2960,10 @@ DEFAULT_PARAMS: dict[str, Any] = {
 
 def main() -> None:
     args = parse_args()
+    report_start = parse_timestamp_utc(args.report_start)
+    report_end = parse_timestamp_utc(args.report_end)
+    if report_start is not None and report_end is not None and report_end <= report_start:
+        raise ValueError("--report-end must be later than --report-start.")
 
     # CLI overrides DEFAULT_PARAMS
     # Mapping for CLI arg names that differ from DEFAULT_PARAMS keys
@@ -2478,6 +2974,8 @@ def main() -> None:
         mapped = _cli_aliases.get(k, k.replace("-", "_"))
         if mapped in cfg and v is not None:
             cfg[mapped] = v
+    if bool(getattr(args, "disable_pair_blacklist", False)):
+        cfg["pair_blacklist"] = ""
 
     # ── Auto-resolve klines file from timeframe ────────────────────────────────
     # If --input was not explicitly passed on CLI, pick the matching file
@@ -2538,12 +3036,22 @@ def main() -> None:
         capital=float(cfg["capital"]),
         leverage=int(cfg["leverage"]),
         max_notional_pct=float(cfg["max_notional_pct"]),
+        funding_csv=str(cfg.get("funding_csv", "") or ""),
         z_entry=float(cfg["z_entry"]),
         z_entry_max=float(cfg["z_entry_max"]),
         z_exit=float(cfg["z_exit"]),
         z_stop=float(cfg["z_stop"]),
         commission_rate=float(cfg["commission_rate"]),
         slippage_rate=float(cfg["slippage_rate"]),
+        hardware_sltp_mode=str(cfg["hardware_sltp_mode"]).strip().lower(),
+        hardware_sl_enabled=parse_bool(cfg["hardware_sl_enabled"]),
+        hardware_tp_enabled=parse_bool(cfg["hardware_tp_enabled"]),
+        sl_atr_mult=float(cfg["sl_atr_mult"]),
+        sl_min_pct=float(cfg["sl_min_pct"]),
+        sl_max_pct=float(cfg["sl_max_pct"]),
+        tp_atr_mult=float(cfg["tp_atr_mult"]),
+        tp_min_pct=float(cfg["tp_min_pct"]),
+        tp_max_pct=float(cfg["tp_max_pct"]),
         p_value_threshold=float(cfg["p_value_threshold"]),
         hedge_min=float(cfg["hedge_min"]),
         hedge_max=float(cfg["hedge_max"]),
@@ -2642,11 +3150,24 @@ def main() -> None:
                                      supplemental_when_no_primary_signal=parse_bool(
                                          cfg.get("supplemental_when_no_primary_signal", True)
                                      ))
+    if backtester.funding_enabled and backtester.funding_data is not None:
+        print(
+            f"[INFO] Funding loaded: matched={backtester.funding_data.matched_records}/"
+            f"{backtester.funding_data.loaded_records} skipped={backtester.funding_data.skipped_records}"
+        )
     result = backtester.run()
     elapsed = time.perf_counter() - t0
 
     prefix = f"bot_parity_{params.timeframe}"
     save_result(result=result, out_dir=cfg["output_dir"], prefix=prefix)
+    report_result = build_report_window_result(
+        backtester=backtester,
+        result=result,
+        report_start=report_start,
+        report_end=report_end,
+    )
+    if report_result is not None:
+        save_result(result=report_result, out_dir=cfg["output_dir"], prefix=f"{prefix}_report_window")
 
     if hyperopt_history:
         ho_path = Path(cfg["output_dir"]) / f"{prefix}_hyperopt_trials.csv"
@@ -2664,6 +3185,7 @@ def main() -> None:
     print(f"  Total trades    : {result.metrics.get('total_trades')}")
     print(f"  Win rate        : {result.metrics.get('win_rate')}")
     print(f"  Total net PnL   : {result.metrics.get('total_net_pnl')}")
+    print(f"  Funding total   : {result.metrics.get('total_funding')}")
     print(f"  Sharpe          : {result.metrics.get('sharpe')}")
     print(f"  Sortino         : {result.metrics.get('sortino')}")
     print(f"  Max drawdown    : {result.metrics.get('max_drawdown')}")
@@ -2675,9 +3197,29 @@ def main() -> None:
     print(f"  Final equity    : {result.metrics.get('final_equity')}")
     print(f"  Total return %  : {result.metrics.get('total_return_pct')}")
     print(f"  Close reasons   : {result.metrics.get('close_reason_breakdown')}")
+    if str(result.metrics.get("hardware_sltp_mode", "off")) != "off":
+        print(
+            f"  HW SL/TP        : mode={result.metrics.get('hardware_sltp_mode')} "
+            f"touches={result.metrics.get('hardware_touch_trades')} "
+            f"(SL={result.metrics.get('hardware_sl_touch_trades')}, TP={result.metrics.get('hardware_tp_touch_trades')})"
+        )
     print(f"  Unique pairs    : {result.metrics.get('unique_pairs_traded')}")
     print(f"  Output dir      : {cfg['output_dir']}")
     print("=" * 60)
+    if report_result is not None:
+        print("")
+        print("=" * 60)
+        print("  REPORT WINDOW")
+        print("=" * 60)
+        print(f"  Start           : {report_start}")
+        print(f"  End             : {report_end}")
+        print(f"  Total trades    : {report_result.metrics.get('total_trades')}")
+        print(f"  Total net PnL   : {report_result.metrics.get('total_net_pnl')}")
+        print(f"  Funding total   : {report_result.metrics.get('total_funding')}")
+        print(f"  Final equity    : {report_result.metrics.get('final_equity')}")
+        print(f"  Total return %  : {report_result.metrics.get('total_return_pct')}")
+        print(f"  Close reasons   : {report_result.metrics.get('close_reason_breakdown')}")
+        print("=" * 60)
 
     # Per-pair summary (top 15 + bottom 5)
     per_pair = result.metrics.get("per_pair_stats", [])
