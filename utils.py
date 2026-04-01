@@ -311,17 +311,27 @@ def calculate_atr(high: list, low: list, close: list, period: int = 14) -> float
     Returns:
         ATR value as float
     """
-    if len(close) < 2:
+    bars = min(len(high), len(low), len(close))
+    if bars < 2:
         return 0.0
     
     tr_list = []
-    for i in range(1, len(close)):
+    for i in range(1, bars):
+        try:
+            hi = float(high[i])
+            lo = float(low[i])
+            prev_close = float(close[i - 1])
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(hi) and math.isfinite(lo) and math.isfinite(prev_close)):
+            continue
         tr = max(
-            high[i] - low[i],
-            abs(high[i] - close[i-1]),
-            abs(low[i] - close[i-1])
+            hi - lo,
+            abs(hi - prev_close),
+            abs(lo - prev_close)
         )
-        tr_list.append(tr)
+        if math.isfinite(tr) and tr >= 0:
+            tr_list.append(tr)
     
     if len(tr_list) < period:
         return sum(tr_list) / len(tr_list) if tr_list else 0.0
@@ -349,6 +359,19 @@ def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) 
     tp_atr_mult = getattr(config, 'tp_atr_mult', 4.0) or 4.0
     tp_min_pct = getattr(config, 'tp_min_pct', 0.15) or 0.15
     tp_max_pct = getattr(config, 'tp_max_pct', 0.50) or 0.50
+
+    try:
+        entry_price = float(entry_price)
+    except (TypeError, ValueError):
+        entry_price = 0.0
+    try:
+        atr = float(atr)
+    except (TypeError, ValueError):
+        atr = 0.0
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        return 0.0, 0.0, sl_min_pct, tp_min_pct
+    if not math.isfinite(atr) or atr <= 0:
+        atr = 0.0
     
     # Calculate ATR-based percentages
     if entry_price > 0 and atr > 0:
@@ -359,6 +382,10 @@ def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) 
         atr_tp = tp_min_pct
     
     # Apply min/max bounds
+    if not math.isfinite(atr_sl):
+        atr_sl = sl_min_pct
+    if not math.isfinite(atr_tp):
+        atr_tp = tp_min_pct
     sl_pct = max(min(atr_sl, sl_max_pct), sl_min_pct)
     tp_pct = max(min(atr_tp, tp_max_pct), tp_min_pct)
     
@@ -374,6 +401,9 @@ def calculate_hardware_stops(entry_price: float, side: str, atr: float, config) 
     else:  # SHORT
         sl_price = entry_price * (1 + sl_pct)
         tp_price = entry_price * (1 - tp_pct)
+
+    if not (math.isfinite(sl_price) and math.isfinite(tp_price)):
+        return 0.0, 0.0, sl_pct, tp_pct
     
     return sl_price, tp_price, sl_pct, tp_pct
 

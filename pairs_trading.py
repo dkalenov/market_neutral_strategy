@@ -138,6 +138,28 @@ def _parse_pair_text(entry):
         return None
     return (s1, s2)
 
+
+def _utc_now_iso() -> str:
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, deque)):
+        return [_json_safe(v) for v in list(value)]
+    if hasattr(value, '__dict__'):
+        return _json_safe(vars(value))
+    return str(value)
+
 class Data:
     """
     Stores time series data in a deque for each symbol.
@@ -348,6 +370,299 @@ class PairsManager:
         # Pair-level anti-repeat reject cooldown:
         # {frozenset([s1,s2]): {'reason': str, 'count': int, 'updated_at': ts, 'blocked_until': ts}}
         self._pair_reject_state: dict[frozenset, dict] = {}
+        # Runtime parity artifacts for exact live replay/debugging.
+        self._runtime_parity_enabled = True
+        self._runtime_session_id = ''
+        self._runtime_log_dir = ''
+        self._runtime_events_path = ''
+        self._runtime_snapshots_dir = ''
+        self._runtime_snapshot_seq = 0
+        self._runtime_discovery_cycle = 0
+        self._init_runtime_parity_logging()
+
+    def _runtime_config_snapshot(self) -> dict:
+        cfg = {}
+        conf = self.config
+        if conf is None:
+            return cfg
+        for name in dir(conf):
+            if not name or name.startswith('_'):
+                continue
+            try:
+                value = getattr(conf, name)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                cfg[name] = _json_safe(value)
+        return cfg
+
+    def _pair_runtime_state(self, pair_info: PairInfo | None) -> dict:
+        if pair_info is None:
+            return {}
+        return {
+            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+            'symbols': [pair_info.symbol1, pair_info.symbol2],
+            'db_id': getattr(pair_info, 'db_id', None),
+            'trade_id': getattr(pair_info, 'current_trade_id', None),
+            'position_status': int(getattr(pair_info, 'position_status', 0) or 0),
+            'qty1': float(getattr(pair_info, 'qty1', 0.0) or 0.0),
+            'qty2': float(getattr(pair_info, 'qty2', 0.0) or 0.0),
+            'entry_price1': float(getattr(pair_info, 'entry_price1', 0.0) or 0.0),
+            'entry_price2': float(getattr(pair_info, 'entry_price2', 0.0) or 0.0),
+            'hedge_ratio': float(getattr(pair_info, 'hedge_ratio', 0.0) or 0.0),
+            'half_life': float(getattr(pair_info, 'half_life', 0.0) or 0.0),
+            'last_z_score': float(getattr(pair_info, 'last_z_score', 0.0) or 0.0),
+            'entry_z_score': float(getattr(pair_info, 'entry_z_score', 0.0) or 0.0),
+            'beta_btc': float(getattr(pair_info, 'beta_btc', 0.0) or 0.0),
+            'last_pvalue': float(getattr(pair_info, 'last_pvalue', 0.0) or 0.0),
+            'coint_streak_bars': int(getattr(pair_info, 'coint_streak_bars', 0) or 0),
+            'coint_broken_count': int(getattr(pair_info, 'coint_broken_count', 0) or 0),
+            'pending_signal': _json_safe(getattr(pair_info, 'pending_signal', None)),
+            'pending_since': _json_safe(getattr(pair_info, 'pending_since', None)),
+            'pending_source': str(getattr(pair_info, 'pending_source', '') or ''),
+            'quality_score': float(getattr(pair_info, 'quality_score', 0.0) or 0.0),
+            'quality_updated_at': float(getattr(pair_info, 'quality_updated_at', 0.0) or 0.0),
+            'entry_expected_hours': float(getattr(pair_info, 'entry_expected_hours', 0.0) or 0.0),
+            'entry_coint_streak_bars': int(getattr(pair_info, 'entry_coint_streak_bars', 0) or 0),
+            'open_time': int(getattr(pair_info, 'open_time', 0) or 0),
+            'tg_message_id': int(getattr(pair_info, 'tg_message_id', 0) or 0),
+            'close_handled': bool(getattr(pair_info, 'close_handled', False)),
+            'last_close_reason': str(getattr(pair_info, 'last_close_reason', '') or ''),
+            'is_trading': bool(getattr(pair_info, 'is_trading', False)),
+            'is_trading_since': float(getattr(pair_info, '_is_trading_since', 0.0) or 0.0),
+            'close_cooldown_until': float(getattr(pair_info, '_close_cooldown_until', 0.0) or 0.0),
+            'wait_for_candle': bool(getattr(pair_info, '_wait_for_candle', False)),
+            'reentry_block_candle_ts': int(getattr(pair_info, 'reentry_block_candle_ts', 0) or 0),
+            'discovered_at': float(getattr(pair_info, 'discovered_at', 0.0) or 0.0),
+        }
+
+    def _active_pairs_runtime_snapshot(self) -> dict:
+        open_pairs = []
+        idle_pairs = []
+        trading_pairs = []
+        for pair_info in self.active_pairs.values():
+            item = {
+                'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                'position_status': int(getattr(pair_info, 'position_status', 0) or 0),
+                'is_trading': bool(getattr(pair_info, 'is_trading', False)),
+                'pending_signal': _json_safe(getattr(pair_info, 'pending_signal', None)),
+                'quality_score': float(getattr(pair_info, 'quality_score', 0.0) or 0.0),
+            }
+            if item['position_status'] != 0:
+                open_pairs.append(item)
+            else:
+                idle_pairs.append(item)
+            if item['is_trading']:
+                trading_pairs.append(item['pair'])
+        return {
+            'active_pairs_total': int(len(self.active_pairs)),
+            'open_pairs_total': int(len(open_pairs)),
+            'idle_pairs_total': int(len(idle_pairs)),
+            'trading_pairs_total': int(len(trading_pairs)),
+            'open_pairs': open_pairs,
+            'idle_pairs': idle_pairs,
+            'trading_pairs': trading_pairs,
+            'exchange_position_count_cache': int(self._exchange_position_count or 0),
+            'exchange_position_symbols_cache': sorted(self._exchange_positions_cache.keys()),
+        }
+
+    def _write_runtime_json(self, path: str, payload) -> None:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Runtime parity snapshot write failed {path}: {e}")
+
+    def _write_runtime_snapshot(self, name: str, payload) -> str:
+        if not self._runtime_parity_enabled or not self._runtime_snapshots_dir:
+            return ''
+        safe_name = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in str(name or 'snapshot'))
+        self._runtime_snapshot_seq += 1
+        path = os.path.join(
+            self._runtime_snapshots_dir,
+            f"{self._runtime_snapshot_seq:06d}_{safe_name}.json",
+        )
+        self._write_runtime_json(path, payload)
+        return path
+
+    def _write_runtime_latest(self, name: str, payload) -> str:
+        if not self._runtime_parity_enabled or not self._runtime_log_dir:
+            return ''
+        safe_name = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in str(name or 'latest'))
+        path = os.path.join(self._runtime_log_dir, f"{safe_name}_latest.json")
+        self._write_runtime_json(path, payload)
+        return path
+
+    def _log_runtime_event(self, event_type: str, **payload) -> None:
+        if not self._runtime_parity_enabled or not self._runtime_events_path:
+            return
+        event = {
+            'ts': _utc_now_iso(),
+            'event_type': str(event_type or 'unknown'),
+            'session_id': self._runtime_session_id,
+        }
+        event.update(payload)
+        try:
+            with open(self._runtime_events_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(_json_safe(event), ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"⚠️ Runtime parity event write failed ({event_type}): {e}")
+
+    async def _capture_exchange_snapshot(self, symbols: list[str] | None = None) -> dict:
+        symbol_set = {str(s).strip().upper() for s in (symbols or []) if str(s).strip()}
+        snapshot = {
+            'ts': _utc_now_iso(),
+            'symbols': sorted(symbol_set),
+            'positions': [],
+            'open_orders': [],
+            'algo_orders': [],
+            'errors': [],
+        }
+
+        try:
+            positions = await self.client.get_position_risk()
+            for pos in positions or []:
+                sym = str(pos.get('symbol', '') or '').upper()
+                if symbol_set and sym not in symbol_set:
+                    continue
+                amt = float(pos.get('positionAmt', 0) or 0.0)
+                if amt == 0 and symbol_set and sym not in symbol_set:
+                    continue
+                snapshot['positions'].append({
+                    'symbol': sym,
+                    'positionAmt': amt,
+                    'entryPrice': float(pos.get('entryPrice', 0) or 0.0),
+                    'unRealizedProfit': float(pos.get('unRealizedProfit', 0) or 0.0),
+                })
+        except Exception as e:
+            snapshot['errors'].append(f"position_risk:{type(e).__name__}:{str(e)[:160]}")
+
+        try:
+            orders = await self.client.get_orders()
+            for order in orders or []:
+                sym = str(order.get('symbol', '') or '').upper()
+                if symbol_set and sym not in symbol_set:
+                    continue
+                snapshot['open_orders'].append({
+                    'symbol': sym,
+                    'orderId': order.get('orderId'),
+                    'clientOrderId': order.get('clientOrderId'),
+                    'status': order.get('status'),
+                    'side': order.get('side'),
+                    'type': order.get('type') or order.get('origType'),
+                    'origQty': _json_safe(order.get('origQty')),
+                    'executedQty': _json_safe(order.get('executedQty')),
+                    'price': _json_safe(order.get('price')),
+                    'stopPrice': _json_safe(order.get('stopPrice')),
+                    'reduceOnly': order.get('reduceOnly'),
+                    'updateTime': order.get('updateTime'),
+                })
+        except Exception as e:
+            snapshot['errors'].append(f"open_orders:{type(e).__name__}:{str(e)[:160]}")
+
+        try:
+            algo_orders = await self.client.get_algo_orders()
+            if isinstance(algo_orders, dict):
+                algo_orders = algo_orders.get('orders', [])
+            if not isinstance(algo_orders, list):
+                algo_orders = []
+            for order in algo_orders:
+                sym = str(order.get('symbol', '') or '').upper()
+                if symbol_set and sym not in symbol_set:
+                    continue
+                snapshot['algo_orders'].append({
+                    'symbol': sym,
+                    'algoId': order.get('algoId'),
+                    'algoStatus': order.get('algoStatus'),
+                    'side': order.get('side'),
+                    'type': order.get('type') or order.get('orderType'),
+                    'quantity': _json_safe(order.get('quantity') or order.get('origQty')),
+                    'triggerPrice': _json_safe(order.get('triggerPrice')),
+                    'reduceOnly': order.get('reduceOnly'),
+                })
+        except Exception as e:
+            snapshot['errors'].append(f"algo_orders:{type(e).__name__}:{str(e)[:160]}")
+
+        return snapshot
+
+    def _normalize_trigger_price(
+        self,
+        raw_price,
+        tick_digits,
+        symbol: str,
+        label: str,
+    ) -> tuple[float | None, dict]:
+        details = {
+            'symbol': str(symbol or ''),
+            'label': str(label or ''),
+            'raw_price': _json_safe(raw_price),
+            'tick_digits': int(tick_digits or 0),
+        }
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            details['reason'] = 'not_numeric'
+            return None, details
+        details['raw_price_float'] = price
+        if not math.isfinite(price):
+            details['reason'] = 'not_finite'
+            return None, details
+        normalized = round(price, int(tick_digits or 0))
+        details['normalized_price'] = normalized
+        if not math.isfinite(normalized):
+            details['reason'] = 'normalized_not_finite'
+            return None, details
+        if normalized <= 0:
+            details['reason'] = 'normalized_non_positive'
+            return None, details
+        return normalized, details
+
+    def _init_runtime_parity_logging(self) -> None:
+        if not self._runtime_parity_enabled:
+            return
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = os.path.join(script_dir, 'runtime_parity_logs')
+        session_id = f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_pid{os.getpid()}"
+        log_dir = os.path.join(root_dir, session_id)
+        snapshots_dir = os.path.join(log_dir, 'snapshots')
+        try:
+            os.makedirs(snapshots_dir, exist_ok=True)
+            self._runtime_session_id = session_id
+            self._runtime_log_dir = log_dir
+            self._runtime_events_path = os.path.join(log_dir, 'runtime_events.jsonl')
+            self._runtime_snapshots_dir = snapshots_dir
+
+            priority_entries, priority_keys = self._load_priority_pairs_cache()
+            blacklist_keys = self._load_pair_blacklist_keys() if self._pair_blacklist_enabled() else set()
+            meta = {
+                'session_id': session_id,
+                'started_at_utc': _utc_now_iso(),
+                'pid': os.getpid(),
+                'timeframe': self.timeframe,
+                'min_data_points': int(self.min_data_points),
+                'all_symbols_count': int(len(self.all_symbols or {})),
+                'priority_file_path': self._priority_file_path(),
+                'pair_blacklist_file_path': self._pair_blacklist_file_path(),
+                'priority_pairs_count': int(len(priority_keys)),
+                'priority_pairs_preview': [f"{a}-{b}" for a, b in priority_entries[:50]],
+                'pair_blacklist_count': int(len(blacklist_keys)),
+                'pair_blacklist_preview': [f"{a}-{b}" for a, b in list(sorted(blacklist_keys))[:50]],
+                'config': self._runtime_config_snapshot(),
+            }
+            self._write_runtime_json(os.path.join(log_dir, 'session_meta.json'), meta)
+            self._write_runtime_latest('session', meta)
+            self._log_runtime_event(
+                'session_started',
+                meta_path=os.path.join(log_dir, 'session_meta.json'),
+                priority_pairs_count=int(len(priority_keys)),
+                pair_blacklist_count=int(len(blacklist_keys)),
+            )
+        except Exception as e:
+            self._runtime_parity_enabled = False
+            print(f"⚠️ Runtime parity logging disabled: {e}")
 
     async def initialize(self):
         """
@@ -371,6 +686,20 @@ class PairsManager:
         max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
         print(f"✅ PairsManager initialized. Max active pairs: {max_pairs}")
         
+        self._log_runtime_event(
+            'manager_initialized',
+            max_active_pairs=int(max_pairs),
+            active_state=self._active_pairs_runtime_snapshot(),
+        )
+        self._write_runtime_latest(
+            'state',
+            {
+                'ts': _utc_now_iso(),
+                'reason': 'manager_initialized',
+                'active_state': self._active_pairs_runtime_snapshot(),
+            },
+        )
+
         # Start periodic leg sync loop (BACKUP only - primary sync is via WebSocket)
         self._leg_sync_task = self.loop.create_task(self._periodic_leg_sync_loop())
         print("🔄 Started backup leg sync loop (every 30s, primary via WebSocket)")
@@ -1526,14 +1855,35 @@ class PairsManager:
         close_side1 = 'SELL' if direction == 1 else 'BUY'
         close_side2 = 'BUY' if direction == 1 else 'SELL'
 
-        sl1, tp1, _, _ = utils.calculate_hardware_stops(pair_info.entry_price1, leg1_side, atr1, self.config)
-        sl2, tp2, _, _ = utils.calculate_hardware_stops(pair_info.entry_price2, leg2_side, atr2, self.config)
-        sl1 = round(sl1, s1_info.tick_size)
-        sl2 = round(sl2, s2_info.tick_size)
-        tp1 = round(tp1, s1_info.tick_size)
-        tp2 = round(tp2, s2_info.tick_size)
-        if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
-            print(f"WARN: Invalid restore prices for {s1}-{s2}: sl1={sl1}, tp1={tp1}, sl2={sl2}, tp2={tp2}")
+        sl1_raw, tp1_raw, _, _ = utils.calculate_hardware_stops(pair_info.entry_price1, leg1_side, atr1, self.config)
+        sl2_raw, tp2_raw, _, _ = utils.calculate_hardware_stops(pair_info.entry_price2, leg2_side, atr2, self.config)
+        sl1, sl1_details = self._normalize_trigger_price(sl1_raw, s1_info.tick_size, s1, 'restore_stop_leg1')
+        sl2, sl2_details = self._normalize_trigger_price(sl2_raw, s2_info.tick_size, s2, 'restore_stop_leg2')
+        tp1, tp1_details = self._normalize_trigger_price(tp1_raw, s1_info.tick_size, s1, 'restore_take_profit_leg1')
+        tp2, tp2_details = self._normalize_trigger_price(tp2_raw, s2_info.tick_size, s2, 'restore_take_profit_leg2')
+        price_debug = {
+            'atr1': float(atr1) if atr1 is not None else None,
+            'atr2': float(atr2) if atr2 is not None else None,
+            'details': [sl1_details, sl2_details, tp1_details, tp2_details],
+        }
+        if None in (sl1, sl2, tp1, tp2):
+            invalid_reasons = [
+                f"{item.get('label')}:{item.get('reason')}"
+                for item in price_debug['details']
+                if item.get('reason')
+            ]
+            print(
+                f"WARN: Invalid restore prices for {s1}-{s2}: "
+                f"{json.dumps(_json_safe(price_debug), ensure_ascii=False)}"
+            )
+            self._log_runtime_event(
+                'trade_protection_restore_invalid_prices',
+                pair=f"{s1}-{s2}",
+                trade_id=int(getattr(pair_info, 'current_trade_id', 0) or 0),
+                debug=price_debug,
+                invalid_reasons=invalid_reasons,
+                pair_state=self._pair_runtime_state(pair_info),
+            )
             return False
 
         pair_key = frozenset([s1, s2])
@@ -3039,6 +3389,13 @@ class PairsManager:
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(cb_msg, reply_to)
                         pair_info.close_handled = True
+                        self._log_runtime_event(
+                            'test_mode_entry_open',
+                            pair=f"{s1}-{s2}",
+                            direction=int(test_direction),
+                            z_score=float(z_score),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         pair_info.is_trading = True
                         await self._execute_trade(pair_info, 0, close_reason='circuit')
                         continue
@@ -3103,18 +3460,49 @@ class PairsManager:
                 if pair_info.position_status == 0:
                     # Pair-local same-candle guard.
                     if self._is_pair_reentry_blocked_same_candle(pair_info):
+                        if abs(z_score) >= z_entry:
+                            self._log_runtime_event(
+                                'candle_entry_skipped',
+                                pair=f"{s1}-{s2}",
+                                reason='same_candle_reentry_block',
+                                z_score=float(z_score),
+                                pair_state=self._pair_runtime_state(pair_info),
+                            )
                         continue
                     if getattr(pair_info, '_wait_for_candle', False):
                         pair_info._wait_for_candle = False
                         print(f"✅ {s1}-{s2}: New candle closed, pair eligible for re-entry")
                     
                     # Check position limits before opening
-                    if not self.can_open_new_position(s1, s2):
+                    can_open, open_reason = self._can_open_new_position_reason(s1, s2)
+                    if not can_open:
+                        ranking_decisions.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'blocked',
+                            'reason': open_reason,
+                            'quality_score': float(score),
+                            'current_z': float(current_z),
+                        })
+                        if abs(z_score) >= z_entry:
+                            self._log_runtime_event(
+                                'candle_entry_skipped',
+                                pair=f"{s1}-{s2}",
+                                reason=open_reason,
+                                z_score=float(z_score),
+                                pair_state=self._pair_runtime_state(pair_info),
+                            )
                         continue
                     
                     # Test mode: force open without strict signal window (for sandbox checks).
                     if test_mode:
                         test_direction = 1 if z_score <= 0 else -1
+                        self._log_runtime_event(
+                            'test_mode_entry_open',
+                            pair=f"{s1}-{s2}",
+                            direction=int(test_direction),
+                            z_score=float(z_score),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         print(f"🧪 TEST MODE: Force opening {s1}-{s2} (z={z_score:.2f}, dir={'LONG' if test_direction == 1 else 'SHORT'})")
                         pair_info.is_trading = True
                         self.loop.create_task(self._execute_trade(pair_info, test_direction))
@@ -3128,6 +3516,13 @@ class PairsManager:
                         # Make candle fallback eligible immediately in confirmation loop.
                         pair_info.pending_since = time.time() - max(1, int(getattr(self.config, 'signal_confirm_sec', 10) or 10))
                         pair_info.pending_source = 'candle'
+                        self._log_runtime_event(
+                            'pending_signal_started',
+                            pair=f"{s1}-{s2}",
+                            source='candle',
+                            z_score=float(z_score),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         print(f"⚡ CANDLE SIGNAL queued {s1}-{s2}: Z={z_score:.2f} (will be ranked against other candidates)")
                         continue
                 
@@ -3170,6 +3565,8 @@ class PairsManager:
         start_time = time.time()
         self._diag_discovery_runs += 1
         self._cleanup_reject_state(start_time)
+        self._runtime_discovery_cycle += 1
+        discovery_cycle_id = int(self._runtime_discovery_cycle)
         
         ready_symbols = []
         data_snapshot = {}
@@ -3414,6 +3811,50 @@ class PairsManager:
         if truncated_by_cap:
             print("⚡ Discovery non-priority list truncated by cap for this cycle.")
         
+        discovery_prep_payload = {
+            'cycle_id': discovery_cycle_id,
+            'ts': _utc_now_iso(),
+            'mode': mode,
+            'priority_only_requested': bool(priority_only),
+            'effective_priority_only': bool(effective_priority_only),
+            'force_full_scan': bool(force_full_scan),
+            'best_pairs_only': bool(best_pairs_only),
+            'priority_file_path': priority_file_path,
+            'pair_blacklist_path': self._pair_blacklist_file_path(),
+            'ready_symbols_count': int(len(ready_symbols)),
+            'ready_symbols': sorted(ready_symbols),
+            'occupied_symbols': sorted(occupied_symbols),
+            'priority_pairs_count': int(len(priority_pairs)),
+            'priority_pairs': [f"{a}-{b}" for a, b in priority_pairs],
+            'priority_existing_checked': int(priority_existing_checked),
+            'pair_blacklist_count': int(len(pair_blacklist_keys)),
+            'pair_blacklist_preview': [f"{a}-{b}" for a, b in list(sorted(pair_blacklist_keys))[:50]],
+            'existing_db_keys_count': int(len(existing_db_keys)),
+            'reject_cooldown_skipped': int(reject_cooldown_skipped),
+            'discovery_shards': int(getattr(self.config, 'discovery_shards', 1) or 1),
+            'discovery_round_idx': int(getattr(self, '_discovery_round_idx', 0) or 0),
+            'discovery_max_pairs_per_cycle': int(getattr(self.config, 'discovery_max_pairs_per_cycle', 0) or 0),
+            'truncated_by_cap': bool(truncated_by_cap),
+            'candidate_pairs_total': int(total_pairs),
+            'candidate_pairs': [f"{a}-{b}" for a, b in candidates_to_process],
+            'active_state': self._active_pairs_runtime_snapshot(),
+            'diag_reject_reason_counts': dict(self._diag_reject_reason_counts),
+        }
+        prep_path = self._write_runtime_snapshot(f"discovery_cycle_{discovery_cycle_id:04d}_prepared", discovery_prep_payload)
+        self._write_runtime_latest('discovery', discovery_prep_payload)
+        self._log_runtime_event(
+            'discovery_cycle_prepared',
+            cycle_id=discovery_cycle_id,
+            mode=mode,
+            snapshot_path=prep_path,
+            candidate_pairs_total=int(total_pairs),
+            ready_symbols_count=int(len(ready_symbols)),
+            priority_pairs_count=int(len(priority_pairs)),
+            pair_blacklist_count=int(len(pair_blacklist_keys)),
+            reject_cooldown_skipped=int(reject_cooldown_skipped),
+            truncated_by_cap=bool(truncated_by_cap),
+        )
+
         if total_pairs == 0:
             return
 
@@ -3458,6 +3899,7 @@ class PairsManager:
         
         existing_db_keys_canonical = set(existing_db_keys or set())
         new_pairs_count = 0
+        found_pairs_runtime = []
         batch_idx = 0
         for batch_results in results_list:
             batch_idx += 1
@@ -3596,6 +4038,14 @@ class PairsManager:
                     self.active_pairs[pair_set] = pair_info
                     self._register_pair(pair_info)
                     new_pairs_count += 1
+                    found_pairs_runtime.append({
+                        'pair': f"{s1}-{s2}",
+                        'db_id': new_pair.id,
+                        'hedge_ratio': float(hedge),
+                        'half_life': float(hl),
+                        'pvalue': float(pval) if not np.isnan(pval) else None,
+                        'beta_btc': float(beta_btc) if not np.isnan(beta_btc) else None,
+                    })
                     
                     # Subscribe to real-time markPrice for this new pair
                     await self._subscribe_new_pair_realtime(s1, s2)
@@ -3645,6 +4095,25 @@ class PairsManager:
         self._diag_discovery_new_pairs += int(new_pairs_count)
         if new_pairs_count > 0:
             self._last_pair_found_ts = time.time()
+        discovery_done_payload = {
+            'cycle_id': discovery_cycle_id,
+            'ts': _utc_now_iso(),
+            'elapsed_sec': float(elapsed),
+            'new_pairs_count': int(new_pairs_count),
+            'found_pairs': found_pairs_runtime,
+            'diag_reject_reason_counts': dict(self._diag_reject_reason_counts),
+            'active_state': self._active_pairs_runtime_snapshot(),
+        }
+        done_path = self._write_runtime_snapshot(f"discovery_cycle_{discovery_cycle_id:04d}_completed", discovery_done_payload)
+        self._write_runtime_latest('discovery_result', discovery_done_payload)
+        self._log_runtime_event(
+            'discovery_cycle_completed',
+            cycle_id=discovery_cycle_id,
+            snapshot_path=done_path,
+            elapsed_sec=float(elapsed),
+            new_pairs_count=int(new_pairs_count),
+            found_pairs=[item['pair'] for item in found_pairs_runtime],
+        )
         # Keep priority file fresh in background (throttled internally).
         self.loop.create_task(self._refresh_best_pairs(force=False, reason='post_discovery'))
 
@@ -4257,6 +4726,14 @@ class PairsManager:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(payload, f, indent=2)
                 os.replace(tmp_path, path)
+                self._log_runtime_event(
+                    'priority_pairs_refreshed',
+                    reason=reason or 'periodic',
+                    force=bool(force),
+                    path=path,
+                    payload_count=int(len(payload)),
+                    top_pairs=[str((x.get('pair', '') if isinstance(x, dict) else x) or '') for x in payload[:20]],
+                )
 
                 preview = ", ".join([(x.get('pair', '') if isinstance(x, dict) else str(x)) for x in payload[:5]]) if payload else "empty"
                 print(
@@ -4549,6 +5026,14 @@ class PairsManager:
             live_amts = await self._fetch_pair_live_position_amts(s1, s2, retries=1, delay_sec=0.25)
             if live_amts is None:
                 last_errors = (last_errors + ["exchange_verify_failed"])[:6]
+                self._log_runtime_event(
+                    'close_recovery_attempt',
+                    pair=f"{s1}-{s2}",
+                    close_reason=close_reason_tag,
+                    attempt=int(attempt + 1),
+                    remaining='exchange_verify_failed',
+                    success=False,
+                )
                 if attempt < retries:
                     await asyncio.sleep(max(0.2, float(delay_sec)))
                     continue
@@ -4562,6 +5047,14 @@ class PairsManager:
                     remaining.append((sym, amt_signed))
 
             if not remaining:
+                self._log_runtime_event(
+                    'close_recovery_attempt',
+                    pair=f"{s1}-{s2}",
+                    close_reason=close_reason_tag,
+                    attempt=int(attempt + 1),
+                    remaining=[],
+                    success=True,
+                )
                 return True
 
             attempt_failures = []
@@ -4585,6 +5078,15 @@ class PairsManager:
                 except Exception as e:
                     attempt_failures.append(f"{sym}: {type(e).__name__}: {str(e)[:120]}")
 
+            self._log_runtime_event(
+                'close_recovery_attempt',
+                pair=f"{s1}-{s2}",
+                close_reason=close_reason_tag,
+                attempt=int(attempt + 1),
+                remaining=[{'symbol': sym, 'positionAmt': float(amt)} for sym, amt in remaining],
+                failures=attempt_failures,
+                success=not bool(attempt_failures),
+            )
             last_errors = attempt_failures or last_errors
             if attempt < retries:
                 await asyncio.sleep(max(0.2, float(delay_sec)))
@@ -4618,6 +5120,14 @@ class PairsManager:
             f"Reason: <code>{reason_detail}</code>\n"
             f"Bot keeps pair OPEN and will continue sync/recovery."
         )
+        self._log_runtime_event(
+            'close_recovery_failed',
+            pair=f"{s1}-{s2}",
+            close_reason=close_reason_tag,
+            remaining=remaining_detail,
+            errors=last_errors,
+            pair_state=self._pair_runtime_state(pair_info),
+        )
         reply_to = await self._resolve_reply_to_message_id(pair_info)
         await self._notify(warn_msg, reply_to)
         return False
@@ -4648,6 +5158,13 @@ class PairsManager:
         amt1 = abs(amt1_signed)
         amt2 = abs(amt2_signed)
         if amt1 <= 0 and amt2 <= 0:
+            self._log_runtime_event(
+                'close_exchange_confirmed',
+                pair=f"{s1}-{s2}",
+                close_reason=close_reason_tag,
+                live_amts={s1: float(amt1_signed), s2: float(amt2_signed)},
+                success=True,
+            )
             return True
 
         # Keep pair OPEN in state if close did not fully complete.
@@ -4675,6 +5192,14 @@ class PairsManager:
             )
             reply_to = await self._resolve_reply_to_message_id(pair_info)
             await self._notify(warn_msg, reply_to)
+        self._log_runtime_event(
+            'close_exchange_confirmed',
+            pair=f"{s1}-{s2}",
+            close_reason=close_reason_tag,
+            live_amts={s1: float(amt1_signed), s2: float(amt2_signed)},
+            success=False,
+            pair_state=self._pair_runtime_state(pair_info),
+        )
         return False
 
     async def _refresh_exchange_position_count(self):
@@ -4768,6 +5293,7 @@ class PairsManager:
         s1 = pair_info.symbol1
         s2 = pair_info.symbol2
         leverage = self.config.leverage if self.config and self.config.leverage else 20
+        pair_label = f"{s1}-{s2}"
 
         # For OPENING trades: acquire lock and re-check limit
         if direction != 0:
@@ -4775,6 +5301,13 @@ class PairsManager:
                 # CRITICAL: Re-check limit inside lock to prevent race condition
                 # exclude_pair=pair_info: don't let the pair block itself (is_trading already True)
                 if not self.can_open_new_position(s1, s2, exclude_pair=pair_info):
+                    self._log_runtime_event(
+                        'trade_open_blocked',
+                        pair=pair_label,
+                        reason='trade_lock_limit_or_symbol_locked',
+                        direction=int(direction),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     print(f"🚫 Trade blocked by lock: {s1}-{s2} (limit reached or symbol locked)")
                     pair_info.is_trading = False
                     return
@@ -4784,6 +5317,15 @@ class PairsManager:
                 try:
                     live_count = await self._refresh_exchange_position_count()
                     if live_count >= max_pairs * 2:
+                        self._log_runtime_event(
+                            'trade_open_blocked',
+                            pair=pair_label,
+                            reason='exchange_position_limit',
+                            direction=int(direction),
+                            live_position_count=int(live_count),
+                            max_positions=int(max_pairs * 2),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         print(f"🚫 Trade blocked by EXCHANGE limit: {live_count}/{max_pairs * 2} positions on exchange for {s1}-{s2}")
                         pair_info.is_trading = False
                         return
@@ -4796,11 +5338,28 @@ class PairsManager:
                 # position_status is set AFTER successful order execution to prevent phantom state.
                 pair_info._pending_direction = direction  # Used by can_open_new_position check
             
+            pre_open_snapshot = await self._capture_exchange_snapshot([s1, s2])
+            self._log_runtime_event(
+                'trade_open_requested',
+                pair=pair_label,
+                direction=int(direction),
+                leverage=int(leverage),
+                pair_state=self._pair_runtime_state(pair_info),
+                exchange_snapshot=pre_open_snapshot,
+            )
+
             # Now proceed with actual execution (lock released for API calls)
             lev1_ok = await self._set_leverage(s1, leverage)
             lev2_ok = await self._set_leverage(s2, leverage)
             
             if not lev1_ok or not lev2_ok:
+                self._log_runtime_event(
+                    'trade_open_blocked',
+                    pair=pair_label,
+                    reason='leverage_setting_failed',
+                    direction=int(direction),
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 print(f"[X] Trade aborted for {s1}-{s2}: leverage setting failed")
                 pair_info.position_status = 0
                 pair_info.is_trading = False
@@ -4820,6 +5379,14 @@ class PairsManager:
                 if not close_reason_tag:
                     close_reason_tag = 'unknown'
                 print(f"EXECUTING CLOSE for {s1}-{s2} (reason: {close_reason_tag})")
+                pre_close_snapshot = await self._capture_exchange_snapshot([s1, s2])
+                self._log_runtime_event(
+                    'trade_close_requested',
+                    pair=pair_label,
+                    close_reason=close_reason_tag,
+                    pair_state=self._pair_runtime_state(pair_info),
+                    exchange_snapshot=pre_close_snapshot,
+                )
                 
                 # Store close reason IMMEDIATELY so external handlers can see it
                 pair_info.last_close_reason = close_reason_tag
@@ -5105,6 +5672,25 @@ class PairsManager:
                             'last_pvalue': close_pval,
                         })
                     
+                    post_close_snapshot = await self._capture_exchange_snapshot([s1, s2])
+                    self._log_runtime_event(
+                        'trade_close_finalized',
+                        pair=pair_label,
+                        close_reason=close_reason_tag,
+                        close_path='hardware',
+                        trade_id=saved_trade_id,
+                        net_pnl=float(net_pnl),
+                        gross_pnl=float(total_pnl),
+                        pnl1=float(pnl1),
+                        pnl2=float(pnl2),
+                        fee1=float(_hw_fee1),
+                        fee2=float(_hw_fee2),
+                        close_price1=float(close_price1),
+                        close_price2=float(close_price2),
+                        close_zscore=float(close_zscore),
+                        pair_state=self._pair_runtime_state(pair_info),
+                        exchange_snapshot=post_close_snapshot,
+                    )
                     # Trigger re-analysis for freed slot
                     self.loop.create_task(self._trigger_immediate_analysis())
                     return
@@ -5300,9 +5886,10 @@ class PairsManager:
                     except Exception:
                         close_zscore = pair_info.last_z_score or 0
 
-                    if pair_info.current_trade_id:
+                    closed_trade_id = pair_info.current_trade_id
+                    if closed_trade_id:
                         await db.close_trade_record(
-                            pair_info.current_trade_id,
+                            closed_trade_id,
                             status='CLOSED',
                             close_reason=close_reason_tag,
                             close_price_1=close_price1,
@@ -5313,7 +5900,7 @@ class PairsManager:
                             fee2=_norm_fee2,
                         )
                         await self._persist_pair_executions(
-                            pair_info, trades_s1, trades_s2, phase='CLOSE', trade_id=pair_info.current_trade_id
+                            pair_info, trades_s1, trades_s2, phase='CLOSE', trade_id=closed_trade_id
                         )
 
                     pair_info.current_trade_id = None
@@ -5449,6 +6036,25 @@ class PairsManager:
                             'last_pvalue': close_pval,
                         })
 
+                    post_close_snapshot = await self._capture_exchange_snapshot([s1, s2])
+                    self._log_runtime_event(
+                        'trade_close_finalized',
+                        pair=pair_label,
+                        close_reason=close_reason_tag,
+                        close_path='normal',
+                        trade_id=closed_trade_id,
+                        net_pnl=float(net_pnl),
+                        gross_pnl=float(total_pnl),
+                        pnl1=float(pnl1),
+                        pnl2=float(pnl2),
+                        fee1=float(_norm_fee1),
+                        fee2=float(_norm_fee2),
+                        close_price1=float(close_price1),
+                        close_price2=float(close_price2),
+                        close_zscore=float(close_zscore),
+                        pair_state=self._pair_runtime_state(pair_info),
+                        exchange_snapshot=post_close_snapshot,
+                    )
                     # AUTO-ADD to best_pairs.json on successful TP only
                     # BUG-7 FIX: Don't add pairs from forced closes (circuit, beta_drift, etc.)
                     if close_reason_tag in ('z_tp', 'hardware_tp'):
@@ -5503,6 +6109,15 @@ class PairsManager:
                             )
                         reply_to = await self._resolve_reply_to_message_id(pair_info)
                         await self._notify(err_msg, reply_to)
+                        self._log_runtime_event(
+                            'trade_close_error',
+                            pair=pair_label,
+                            close_reason=close_reason_tag,
+                            error_type=type(e).__name__,
+                            error=str(e),
+                            exchange_confirmed=bool(close_confirmed),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                     except Exception:
                         pass
                 return
@@ -5516,6 +6131,14 @@ class PairsManager:
                 print(
                     f"⛔ Symbol info not found for {missing} (not in all_symbols). "
                     f"Pair {s1}-{s2} skipped. Will retry after next symbol refresh."
+                )
+                self._log_runtime_event(
+                    'trade_open_aborted',
+                    pair=pair_label,
+                    reason='missing_symbol_info',
+                    missing_symbol=missing,
+                    direction=int(direction),
+                    pair_state=self._pair_runtime_state(pair_info),
                 )
                 # Do NOT touch position_status (pair is idle, not open).
                 # Apply a cooldown so the pair doesn't spam entry attempts
@@ -5532,6 +6155,14 @@ class PairsManager:
                 s2_price = float((await self.client.ticker_price(s2))['price'])
             except Exception as e:
                 print(f"ERROR: Could not fetch prices for {s1}/{s2}. E: {e}")
+                self._log_runtime_event(
+                    'trade_open_aborted',
+                    pair=pair_label,
+                    reason='price_fetch_failed',
+                    direction=int(direction),
+                    error=f"{type(e).__name__}: {e}",
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 pair_info.position_status = 0
                 return
             
@@ -5540,6 +6171,13 @@ class PairsManager:
         
             if data1 is None or data2 is None:
                 print(f"ERROR: Data not found for {s1} or {s2} during execution.")
+                self._log_runtime_event(
+                    'trade_open_aborted',
+                    pair=pair_label,
+                    reason='missing_klines_data',
+                    direction=int(direction),
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 pair_info.position_status = 0
                 return
 
@@ -5565,6 +6203,15 @@ class PairsManager:
                     pair_info.last_pvalue = fresh_pval
                 else:
                     print(f"⚠️ Fresh cointegration FAILED for {s1}-{s2} (flag={fresh_flag}, p={fresh_pval:.4f}). Aborting trade.")
+                    self._log_runtime_event(
+                        'trade_open_aborted',
+                        pair=pair_label,
+                        reason='fresh_cointegration_failed',
+                        direction=int(direction),
+                        fresh_flag=int(fresh_flag),
+                        fresh_pvalue=float(fresh_pval) if fresh_pval is not None else None,
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     pair_info.position_status = 0
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
@@ -5598,6 +6245,13 @@ class PairsManager:
                 if not btc_data_ready and not test_mode:
                     warn_msg = f"⛔ BETA CHECK SKIPPED: BTCUSDT data not ready for {s1}-{s2}. Aborting entry."
                     print(warn_msg)
+                    self._log_runtime_event(
+                        'trade_open_aborted',
+                        pair=pair_label,
+                        reason='beta_data_not_ready',
+                        direction=int(direction),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     pair_info.position_status = 0
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
@@ -5609,6 +6263,15 @@ class PairsManager:
                 if not np.isnan(current_beta) and abs(current_beta) >= beta_threshold:
                     warn_msg = f"⛔ BETA REJECT: {s1}-{s2} beta={current_beta:.3f} >= {beta_threshold}. Aborting entry."
                     print(warn_msg)
+                    self._log_runtime_event(
+                        'trade_open_aborted',
+                        pair=pair_label,
+                        reason='beta_reject',
+                        direction=int(direction),
+                        beta=float(current_beta),
+                        beta_threshold=float(beta_threshold),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     pair_info.position_status = 0
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
@@ -5629,6 +6292,16 @@ class PairsManager:
                 if abs_hedge < hedge_min or abs_hedge > hedge_max:
                     warn_msg = f"⛔ HEDGE REJECT: {s1}-{s2} |hedge|={abs_hedge:.4f} outside [{hedge_min}, {hedge_max}]. Positions would be unbalanced. Aborting entry."
                     print(warn_msg)
+                    self._log_runtime_event(
+                        'trade_open_aborted',
+                        pair=pair_label,
+                        reason='hedge_out_of_bounds',
+                        direction=int(direction),
+                        hedge=float(abs_hedge),
+                        hedge_min=float(hedge_min),
+                        hedge_max=float(hedge_max),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     pair_info.position_status = 0
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
@@ -5673,6 +6346,16 @@ class PairsManager:
             if utils.should_skip_trade(min_notional1, calculated_notional1, max_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s1} below min notional with excessive bump required")
                 cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
+                self._log_runtime_event(
+                    'trade_open_aborted',
+                    pair=pair_label,
+                    reason='min_notional_bump',
+                    direction=int(direction),
+                    symbol=s1,
+                    calculated_notional=float(calculated_notional1),
+                    min_notional=float(min_notional1),
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 pair_info.pending_signal = None
                 pair_info.pending_since = None
                 pair_info.pending_source = ''
@@ -5685,6 +6368,16 @@ class PairsManager:
             if utils.should_skip_trade(min_notional2, calculated_notional2, max_order_bump):
                 print(f"SKIP: Trade for {s1}-{s2} cancelled - {s2} below min notional with excessive bump required")
                 cooldown_sec = int(getattr(self.config, 'min_notional_skip_cooldown_sec', 900) or 900)
+                self._log_runtime_event(
+                    'trade_open_aborted',
+                    pair=pair_label,
+                    reason='min_notional_bump',
+                    direction=int(direction),
+                    symbol=s2,
+                    calculated_notional=float(calculated_notional2),
+                    min_notional=float(min_notional2),
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 pair_info.pending_signal = None
                 pair_info.pending_since = None
                 pair_info.pending_source = ''
@@ -5736,6 +6429,15 @@ class PairsManager:
                     pair_budget = capital * max_notional
                     if total_after > pair_budget * 3:
                         print(f"SKIP: Rebalanced total ${total_after:.2f} exceeds 3x pair budget ${pair_budget:.2f} for {s1}-{s2}")
+                        self._log_runtime_event(
+                            'trade_open_aborted',
+                            pair=pair_label,
+                            reason='rebalance_budget_exceeded',
+                            direction=int(direction),
+                            total_after=float(total_after),
+                            pair_budget=float(pair_budget),
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         pair_info.position_status = 0
                         pair_info.is_trading = False
                         return
@@ -5777,6 +6479,15 @@ class PairsManager:
                 
                 if not preflight_ok:
                     print(f"🚫 Trade aborted for {s1}-{s2}: pre-flight validation failed")
+                    self._log_runtime_event(
+                        'trade_open_aborted',
+                        pair=pair_label,
+                        reason='preflight_limit',
+                        direction=int(direction),
+                        failed_symbol=failed_preflight_symbol,
+                        leverage=int(leverage),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                     pair_info.position_status = 0
                     pair_info.is_trading = False
                     pair_info.pending_signal = None
@@ -5799,6 +6510,16 @@ class PairsManager:
                 )
             
                 results = await asyncio.gather(task1, task2, return_exceptions=True)
+                self._log_runtime_event(
+                    'trade_open_exchange_response',
+                    pair=pair_label,
+                    direction=int(direction),
+                    requested_orders=[
+                        {'symbol': s1, 'side': side1, 'quantity': float(qty1_rounded), 'price': float(s1_price)},
+                        {'symbol': s2, 'side': side2, 'quantity': float(qty2_rounded), 'price': float(s2_price)},
+                    ],
+                    exchange_results=_json_safe(results),
+                )
                 has_error = False
                 executed_orders = []
                 failed_symbols = []
@@ -5881,6 +6602,16 @@ class PairsManager:
                             f"Residual: <code>{details}</code>\n"
                             f"Bot will retry cleanup via sync loop."
                         )
+                    self._log_runtime_event(
+                        'trade_open_reverted',
+                        pair=pair_label,
+                        direction=int(direction),
+                        failed_symbols=failed_symbols,
+                        exchange_results=_json_safe(results),
+                        executed_orders=_json_safe(executed_orders),
+                        residual_legs=[{'symbol': sym, 'positionAmt': float(amt)} for sym, amt in residual_legs],
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
                 
                     pair_info.position_status = 0
                     pair_info.is_trading = False
@@ -5998,6 +6729,11 @@ class PairsManager:
                             await db.update_pair({'id': pair_info.db_id, 'tg_message_id': msg_id})
                 
                     # === HARDWARE SL/TP PLACEMENT ===
+                    protection_summary = {
+                        'status': 'not_started',
+                        'successful_algo_ids': [],
+                        'failed_count': 0,
+                    }
                     try:
                         # Calculate ATR for each symbol
                         atr1 = utils.calculate_atr(
@@ -6016,36 +6752,60 @@ class PairsManager:
                         leg2_side = 'SHORT' if direction == 1 else 'LONG'
                         
                         # Calculate SL prices
-                        sl1, tp1, sl1_pct, tp1_pct = utils.calculate_hardware_stops(
+                        sl1_raw, tp1_raw, sl1_pct, tp1_pct = utils.calculate_hardware_stops(
                             pair_info.entry_price1, leg1_side, atr1, self.config
                         )
-                        sl2, tp2, sl2_pct, tp2_pct = utils.calculate_hardware_stops(
+                        sl2_raw, tp2_raw, sl2_pct, tp2_pct = utils.calculate_hardware_stops(
                             pair_info.entry_price2, leg2_side, atr2, self.config
                         )
-                        
-                        # Round stop prices to tick_size (tick_size is int: digit count)
-                        sl1 = round(sl1, s1_info.tick_size)
-                        sl2 = round(sl2, s2_info.tick_size)
+
+                        sl1, sl1_details = self._normalize_trigger_price(sl1_raw, s1_info.tick_size, s1, 'open_stop_leg1')
+                        sl2, sl2_details = self._normalize_trigger_price(sl2_raw, s2_info.tick_size, s2, 'open_stop_leg2')
                         
                         # Determine close sides
                         sl_side1 = 'SELL' if direction == 1 else 'BUY'
                         sl_side2 = 'BUY' if direction == 1 else 'SELL'
                         
-                        # Round TP prices to tick_size
-                        tp1 = round(tp1, s1_info.tick_size)
-                        tp2 = round(tp2, s2_info.tick_size)
-                        
+                        tp1, tp1_details = self._normalize_trigger_price(tp1_raw, s1_info.tick_size, s1, 'open_take_profit_leg1')
+                        tp2, tp2_details = self._normalize_trigger_price(tp2_raw, s2_info.tick_size, s2, 'open_take_profit_leg2')
 
                         print(f"🛡️ Placing SL/TP (Algo): {s1} SL@{sl1} TP@{tp1}, {s2} SL@{sl2} TP@{tp2}")
 
-                        if sl1 <= 0 or sl2 <= 0 or tp1 <= 0 or tp2 <= 0:
+                        protection_price_debug = {
+                            'atr1': float(atr1) if atr1 is not None else None,
+                            'atr2': float(atr2) if atr2 is not None else None,
+                            'sl_pct1': float(sl1_pct),
+                            'sl_pct2': float(sl2_pct),
+                            'tp_pct1': float(tp1_pct),
+                            'tp_pct2': float(tp2_pct),
+                            'details': [sl1_details, sl2_details, tp1_details, tp2_details],
+                        }
+                        if None in (sl1, sl2, tp1, tp2):
+                            invalid_reasons = [
+                                f"{item.get('label')}:{item.get('reason')}"
+                                for item in protection_price_debug['details']
+                                if item.get('reason')
+                            ]
+                            protection_summary = {
+                                'status': 'invalid_prices',
+                                'invalid_reasons': invalid_reasons,
+                                'price_debug': protection_price_debug,
+                            }
                             warn_msg = (f"WARN: CRITICAL: Invalid protection prices for {s1}-{s2}! "
-                                       f"sl1={sl1}, tp1={tp1}, sl2={sl2}, tp2={tp2}. Force closing position.")
+                                       f"{', '.join(invalid_reasons) if invalid_reasons else 'unknown reason'}. "
+                                       f"Force closing position.")
                             print(warn_msg)
                             print(f"  Entry prices: {pair_info.entry_price1}, {pair_info.entry_price2}")
-                            print(f"  ATR values: {atr1}, {atr2}")
+                            print(f"  Protection price debug: {json.dumps(_json_safe(protection_price_debug), ensure_ascii=False)}")
                             reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                             await self._notify(warn_msg, reply_to)
+                            self._log_runtime_event(
+                                'trade_open_protection_failed',
+                                pair=pair_label,
+                                direction=int(direction),
+                                protection_summary=protection_summary,
+                                pair_state=self._pair_runtime_state(pair_info),
+                            )
                             pair_info.close_handled = True
                             pair_info.is_trading = True
                             await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
@@ -6081,7 +6841,24 @@ class PairsManager:
                             for aid, (sym, typ) in zip(successful_algo_ids, task_meta):
                                 aid_str = str(aid)
                                 self.algo_orders[aid_str] = {'pair_key': pair_key, 'symbol': sym, 'type': typ}
+                            protection_summary = {
+                                'status': 'ok',
+                                'successful_algo_ids': [str(aid) for aid in successful_algo_ids],
+                                'failed_count': 0,
+                                'expected_orders': int(expected_orders),
+                                'orders': [
+                                    {'symbol': sym, 'type': typ, 'algo_id': str(aid)}
+                                    for aid, (sym, typ) in zip(successful_algo_ids, task_meta)
+                                ],
+                            }
                         else:
+                            protection_summary = {
+                                'status': 'incomplete',
+                                'successful_algo_ids': [str(aid) for aid in successful_algo_ids],
+                                'failed_count': int(failed_count),
+                                'expected_orders': int(expected_orders),
+                                'exchange_results': _json_safe(results),
+                            }
                             warn_msg = (
                                 f"WARN: CRITICAL: Protection incomplete for {s1}-{s2} "
                                 f"(ok={len(successful_algo_ids)}/{max(1, expected_orders)}, failed={failed_count}). Force closing!"
@@ -6097,16 +6874,35 @@ class PairsManager:
                                     print(f"INFO: Cancelled {len(successful_algo_ids)} partial algo orders")
                                 except Exception as ce:
                                     print(f"WARN: Could not cancel partial orders: {ce}")
+                            self._log_runtime_event(
+                                'trade_open_protection_failed',
+                                pair=pair_label,
+                                direction=int(direction),
+                                protection_summary=protection_summary,
+                                pair_state=self._pair_runtime_state(pair_info),
+                            )
                             
                             pair_info.close_handled = True
                             pair_info.is_trading = True
                             await self._execute_trade(pair_info, 0, close_reason='hardware_sl')
                             
                     except Exception as e:
+                        protection_summary = {
+                            'status': 'error',
+                            'error_type': type(e).__name__,
+                            'error': str(e),
+                        }
                         warn_msg = f"WARN: CRITICAL ERROR placing hardware protection for {s1}-{s2}: {e}. Force closing position!"
                         print(warn_msg)
                         reply_to = pair_info.tg_message_id if pair_info.tg_message_id else None
                         await self._notify(warn_msg, reply_to)
+                        self._log_runtime_event(
+                            'trade_open_protection_failed',
+                            pair=pair_label,
+                            direction=int(direction),
+                            protection_summary=protection_summary,
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         
                         pair_info.close_handled = True
                         pair_info.is_trading = True
@@ -6115,6 +6911,14 @@ class PairsManager:
                     # If entry got auto-closed during protection placement, skip OPEN persistence.
                     if pair_info.position_status == 0:
                         print(f"⚠️ {s1}-{s2}: position already closed during protection flow, skipping OPEN trade persistence.")
+                        self._log_runtime_event(
+                            'trade_open_aborted',
+                            pair=pair_label,
+                            reason='closed_during_protection_flow',
+                            direction=int(direction),
+                            protection_summary=protection_summary,
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         return
                 
                     if pair_info.db_id:
@@ -6175,6 +6979,21 @@ class PairsManager:
                             )
                         except Exception as fill_err:
                             print(f"⚠️ Could not persist OPEN executions for {s1}-{s2}: {fill_err}")
+                        post_open_snapshot = await self._capture_exchange_snapshot([s1, s2])
+                        self._log_runtime_event(
+                            'trade_open_finalized',
+                            pair=pair_label,
+                            direction=int(direction),
+                            trade_id=pair_info.current_trade_id,
+                            quantities={'qty1': float(pair_info.qty1), 'qty2': float(pair_info.qty2)},
+                            entry_prices={'price1': float(pair_info.entry_price1), 'price2': float(pair_info.entry_price2)},
+                            hedge_ratio=float(pair_info.hedge_ratio),
+                            beta_btc=float(pair_info.beta_btc),
+                            pvalue=float(pair_info.last_pvalue),
+                            protection_summary=protection_summary,
+                            pair_state=self._pair_runtime_state(pair_info),
+                            exchange_snapshot=post_open_snapshot,
+                        )
                     except Exception as e:
                         # Do not keep live positions without a trade row: close immediately for audit safety.
                         print(f"CRITICAL: could not create OPEN trade record for {s1}-{s2}: {e}")
@@ -6187,6 +7006,15 @@ class PairsManager:
                             await self._notify(alert, reply_to)
                         except Exception:
                             pass
+                        self._log_runtime_event(
+                            'trade_open_audit_fail',
+                            pair=pair_label,
+                            direction=int(direction),
+                            error_type=type(e).__name__,
+                            error=str(e),
+                            protection_summary=protection_summary,
+                            pair_state=self._pair_runtime_state(pair_info),
+                        )
                         pair_info.close_handled = True
                         pair_info.is_trading = True
                         await self._execute_trade(pair_info, 0, close_reason='audit_fail')
@@ -6195,6 +7023,14 @@ class PairsManager:
             except Exception as e:
                 print(f"FATAL ERROR during trade execution for {s1}-{s2}: {e}")
                 traceback.print_exc()
+                self._log_runtime_event(
+                    'trade_execution_error',
+                    pair=pair_label,
+                    direction=int(direction),
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    pair_state=self._pair_runtime_state(pair_info),
+                )
                 pair_info.position_status = 0
         finally:
             pair_info.is_trading = False
@@ -6319,12 +7155,28 @@ class PairsManager:
                     pair_info.pending_signal = z_score
                     pair_info.pending_since = time.time()
                     pair_info.pending_source = 'realtime'
+                    self._log_runtime_event(
+                        'pending_signal_started',
+                        pair=f"{pair_info.symbol1}-{pair_info.symbol2}",
+                        source='realtime',
+                        z_score=float(z_score),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
             else:
                 # Signal went away - reset
                 if pair_info.pending_signal is not None:
+                    previous_signal = pair_info.pending_signal
                     pair_info.pending_signal = None
                     pair_info.pending_since = None
                     pair_info.pending_source = ''
+                    self._log_runtime_event(
+                        'pending_signal_reset',
+                        pair=f"{pair_info.symbol1}-{pair_info.symbol2}",
+                        source='realtime',
+                        previous_signal=_json_safe(previous_signal),
+                        z_score=float(z_score),
+                        pair_state=self._pair_runtime_state(pair_info),
+                    )
     
     async def _check_btc_shock(self):
         """
@@ -6630,6 +7482,7 @@ class PairsManager:
                 bar_hours = 24.0 / candles_per_day if candles_per_day > 0 else 1.0
                 ready_candidates = []
                 processed_pending = []
+                processed_pending_details = []
 
                 for pair_info in list(self.active_pairs.values()):
                     if pair_info.position_status != 0 or pair_info.is_trading:
@@ -6660,6 +7513,13 @@ class PairsManager:
 
                     processed_pending.append(pair_info)
                     if np.isnan(current_z):
+                        processed_pending_details.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'rejected',
+                            'reason': 'no_realtime_zscore',
+                            'pending_signal': _json_safe(pair_info.pending_signal),
+                            'current_z': None,
+                        })
                         _log_pending_reject("no realtime z-score")
                         continue
 
@@ -6690,6 +7550,15 @@ class PairsManager:
                             ts1 = int(self.all_data.get(pair_info.symbol1).ts[-1]) if self.all_data.get(pair_info.symbol1) and self.all_data.get(pair_info.symbol1).ts else 0
                             ts2 = int(self.all_data.get(pair_info.symbol2).ts[-1]) if self.all_data.get(pair_info.symbol2) and self.all_data.get(pair_info.symbol2).ts else 0
                             last_eval = int(getattr(pair_info, '_last_coint_eval_ts', 0) or 0)
+                            processed_pending_details.append({
+                                'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                                'status': 'rejected',
+                                'reason': 'coint_streak_too_low',
+                                'pending_signal': _json_safe(pair_info.pending_signal),
+                                'current_z': float(current_z),
+                                'coint_streak_bars': int(streak_bars),
+                                'coint_stability_min_bars': int(coint_stability_min_bars),
+                            })
                             _log_pending_reject(
                                 f"coint_streak={streak_bars} < min={coint_stability_min_bars} "
                                 f"(last_eval_ts={last_eval}, s1_ts={ts1}, s2_ts={ts2})"
@@ -6705,17 +7574,48 @@ class PairsManager:
                         score = float(getattr(pair_info, 'quality_score', 0.0) or 0.0)
                         updated_at = float(getattr(pair_info, 'quality_updated_at', 0.0) or 0.0)
                         ready_candidates.append((score, updated_at, pair_info, current_z))
+                        processed_pending_details.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'ready',
+                            'pending_signal': _json_safe(pair_info.pending_signal),
+                            'current_z': float(current_z),
+                            'quality_score': float(score),
+                            'quality_updated_at': float(updated_at),
+                            'coint_streak_bars': int(streak_bars),
+                            'entry_expected_hours': float(pair_info.entry_expected_hours),
+                            'source': str(getattr(pair_info, 'pending_source', '') or ''),
+                        })
                     elif abs(current_z) >= z_entry_max:
+                        processed_pending_details.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'rejected',
+                            'reason': 'z_exceeds_entry_max',
+                            'pending_signal': _json_safe(pair_info.pending_signal),
+                            'current_z': float(current_z),
+                            'z_entry_max': float(z_entry_max),
+                        })
                         print(f"⚠️ {pair_info.symbol1}-{pair_info.symbol2}: Z={current_z:.2f} exceeds z_entry_max={z_entry_max}. Skipping entry (spread may be broken).")
                     else:
+                        reject_reason = "outside_entry_window"
                         if current_z * pair_info.pending_signal <= 0:
+                            reject_reason = 'signal_direction_flipped'
                             _log_pending_reject(
                                 f"signal direction flipped (pending={pair_info.pending_signal:+.2f}, now={current_z:+.2f})"
                             )
                         elif abs(current_z) < z_entry:
+                            reject_reason = 'z_dropped_below_entry'
                             _log_pending_reject(f"|z| dropped below z_entry ({abs(current_z):.2f} < {z_entry:.2f})")
                         else:
                             _log_pending_reject("outside entry window")
+                        processed_pending_details.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'rejected',
+                            'reason': reject_reason,
+                            'pending_signal': _json_safe(pair_info.pending_signal),
+                            'current_z': float(current_z),
+                            'z_entry': float(z_entry),
+                            'z_entry_max': float(z_entry_max),
+                        })
 
                 # Reset matured pending signals after evaluation cycle.
                 for pair_info in processed_pending:
@@ -6724,6 +7624,15 @@ class PairsManager:
                     pair_info.pending_source = ''
 
                 if not ready_candidates:
+                    if processed_pending_details:
+                        self._log_runtime_event(
+                            'entry_ranking_cycle',
+                            processed_pending=processed_pending_details,
+                            ready_candidates=[],
+                            ranking_decisions=[],
+                            free_slots_initial=0,
+                            active_state=self._active_pairs_runtime_snapshot(),
+                        )
                     continue
 
                 # Rank by cached quality score (higher is better), then recency of metrics.
@@ -6731,12 +7640,38 @@ class PairsManager:
                 max_pairs = getattr(self.config, 'max_active_pairs', 5) or 5
                 free_slots = max(0, int(max_pairs - self.count_active_positions()))
                 if free_slots <= 0:
+                    self._log_runtime_event(
+                        'entry_ranking_cycle',
+                        processed_pending=processed_pending_details,
+                        ready_candidates=[
+                            {
+                                'pair': f"{pi.symbol1}-{pi.symbol2}",
+                                'quality_score': float(score),
+                                'quality_updated_at': float(updated_at),
+                                'current_z': float(current_z),
+                                'entry_expected_hours': float(getattr(pi, 'entry_expected_hours', 0.0) or 0.0),
+                            }
+                            for score, updated_at, pi, current_z in ready_candidates
+                        ],
+                        ranking_decisions=[],
+                        free_slots_initial=0,
+                        active_state=self._active_pairs_runtime_snapshot(),
+                    )
                     continue
 
+                free_slots_initial = int(free_slots)
+                ranking_decisions = []
                 for score, _, pair_info, current_z in ready_candidates:
                     if free_slots <= 0:
                         break
                     if not self._is_pair_trade_allowed(pair_info.symbol1, pair_info.symbol2):
+                        ranking_decisions.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'blocked',
+                            'reason': 'pair_list_filter',
+                            'quality_score': float(score),
+                            'current_z': float(current_z),
+                        })
                         print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: pair list filter")
                         continue
                     can_open, open_reason = self._can_open_new_position_reason(pair_info.symbol1, pair_info.symbol2)
@@ -6747,6 +7682,13 @@ class PairsManager:
                     # Check cooldown from failed leverage/trade
                     fail_until = getattr(pair_info, '_leverage_fail_until', 0)
                     if fail_until and time.time() < fail_until:
+                        ranking_decisions.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'blocked',
+                            'reason': 'leverage_fail_cooldown',
+                            'quality_score': float(score),
+                            'current_z': float(current_z),
+                        })
                         print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: leverage_fail_cooldown")
                         continue
 
@@ -6754,20 +7696,60 @@ class PairsManager:
                     close_cooldown = getattr(pair_info, '_close_cooldown_until', 0)
                     if close_cooldown and time.time() < close_cooldown:
                         remaining = int(close_cooldown - time.time())
+                        ranking_decisions.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'blocked',
+                            'reason': 'sl_close_cooldown',
+                            'remaining_sec': int(remaining),
+                            'quality_score': float(score),
+                            'current_z': float(current_z),
+                        })
                         print(f"⏸️ {pair_info.symbol1}-{pair_info.symbol2}: Entry blocked by SL cooldown ({remaining}s remaining)")
                         continue
 
                     # Check if pair is waiting for next candle close
                     if getattr(pair_info, '_wait_for_candle', False) or self._is_pair_reentry_blocked_same_candle(pair_info):
+                        ranking_decisions.append({
+                            'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                            'status': 'blocked',
+                            'reason': 'wait_for_next_candle',
+                            'quality_score': float(score),
+                            'current_z': float(current_z),
+                        })
                         print(f"⏭️ Ranked entry blocked {pair_info.symbol1}-{pair_info.symbol2}: wait_for_next_candle")
                         continue
 
                     direction = 1 if current_z < 0 else -1
+                    ranking_decisions.append({
+                        'pair': f"{pair_info.symbol1}-{pair_info.symbol2}",
+                        'status': 'open',
+                        'direction': int(direction),
+                        'quality_score': float(score),
+                        'current_z': float(current_z),
+                        'entry_expected_hours': float(getattr(pair_info, 'entry_expected_hours', 0.0) or 0.0),
+                    })
                     pair_info.entry_z_score = current_z
                     print(f"✅ Ranked entry: {pair_info.symbol1}-{pair_info.symbol2} | score={score:.3f} | Z={current_z:.2f}. Opening...")
                     pair_info.is_trading = True
                     self.loop.create_task(self._execute_trade(pair_info, direction))
                     free_slots -= 1
+                self._log_runtime_event(
+                    'entry_ranking_cycle',
+                    processed_pending=processed_pending_details,
+                    ready_candidates=[
+                        {
+                            'pair': f"{pi.symbol1}-{pi.symbol2}",
+                            'quality_score': float(score),
+                            'quality_updated_at': float(updated_at),
+                            'current_z': float(current_z),
+                            'entry_expected_hours': float(getattr(pi, 'entry_expected_hours', 0.0) or 0.0),
+                        }
+                        for score, updated_at, pi, current_z in ready_candidates
+                    ],
+                    ranking_decisions=ranking_decisions,
+                    free_slots_initial=int(free_slots_initial),
+                    active_state=self._active_pairs_runtime_snapshot(),
+                )
             except Exception as e:
                 print(f"⚠️ Signal confirmation loop error (continuing): {e}")
     
